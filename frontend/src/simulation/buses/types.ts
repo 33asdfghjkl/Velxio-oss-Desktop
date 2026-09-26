@@ -395,6 +395,129 @@ export interface I2cControllerPort {
   setRoutingChangeHandler?(handler: (() => void) | null): void;
 }
 
+// ── UART ────────────────────────────────────────────────────────────────────
+
+export interface UartEndpointDescriptor {
+  /** Identity, as for SPI and I2C: the component id, or 'builtin:<boardId>:<name>'. */
+  owner: string;
+  /** Component whose pin names `pins` refers to. Defaults to `owner`. */
+  componentId?: string;
+  /**
+   * The device's own RX and TX legs. Each one is placed on its own net: a
+   * GPS has only a TX, a display that takes commands only an RX, and a
+   * modem both. A leg that reaches no board pin is simply not on any wire.
+   */
+  pins: { rx?: DevicePin; tx?: DevicePin };
+  /**
+   * The rate the device talks at (a GPS: 9600). It is what the fabric checks
+   * a controller's rate against, what a byte it transmits is clocked at on a
+   * plain GPIO, and the bit time a bit-banged byte to it is decoded with.
+   * Leave it out for a device that takes whatever rate it is sent (a
+   * terminal): no mismatch is ever reported for it, and it cannot sit on a
+   * software UART, since a bit time needs a rate.
+   */
+  baud?: number;
+  /** Data bits, parity and stop bits, Arduino style: '8N1' (the default), '7E1', '8N2'. */
+  frame?: string;
+}
+
+/** A device on a UART line. The fabric hands it every byte that reaches its RX. */
+export interface UartEndpoint {
+  receive(byte: number): void;
+  /** The MCU was reset (Stop/Run, reset, reload). Protocol state, not data. */
+  boardReset?(): void;
+}
+
+/** The registration handle of a UART endpoint: transmit() puts a byte on its TX net. */
+export interface UartHandle extends BusHandle {
+  /** A byte the device sends out of its TX leg. Dropped when that leg reaches no board pin. */
+  transmit(byte: number): void;
+}
+
+/** What a UART controller is configured to, when the engine can say. */
+export interface UartConfig {
+  /** Baud rate the guest configured; undefined until it has (no invented default). */
+  baud?: number;
+  /** Frame the guest configured, Arduino style ('8N1'); undefined when the engine cannot say. */
+  frame?: string;
+}
+
+/** Pins a UART controller is routed to right now, when the engine knows it. */
+export interface UartRouting {
+  tx?: number;
+  rx?: number;
+}
+
+/**
+ * The engine's side of one UART controller. Like the SPI and I2C ports:
+ * created ONCE per board by the engine adapter and kept across every rebuild
+ * of the SoC. A byte the guest transmits reaches the fabric through the TX
+ * handler exactly once; a byte the fabric hands receive() lands in the
+ * guest's RX (its FIFO, its data register, its ring buffer) exactly once.
+ */
+export interface UartControllerPort {
+  readonly bus: 'uart';
+  /** The SoC's index for this controller (matches the pin function table). */
+  readonly unit: number;
+  /** Datasheet name, for diagnostics ('USART0', 'UART1', 'PL011'). */
+  readonly name: string;
+  /**
+   * True when the guest runs outside this tab (a QEMU worker). Bytes still
+   * flow both ways through this port, later than the guest clocked them; the
+   * bus map a worker is sent names the controller each endpoint sits on so a
+   * chip the worker hosts is answered there.
+   */
+  readonly remote?: boolean;
+  /**
+   * The fabric installs the TX handler here. The adapter calls it once per
+   * byte the controller shifts out, synchronously with the guest, and never
+   * for a byte it did not transmit (its own RX injections included).
+   */
+  setTxHandler(handler: ((byte: number) => void) | null): void;
+  /** A byte arriving at the controller's RX. */
+  receive(byte: number): void;
+  config(): UartConfig;
+  /** Live routing, or 'static' when the pins are fixed by the board table. */
+  routing(): UartRouting | 'static';
+  /** Routing changed (the sketch moved the pins): the fabric recomputes. */
+  setRoutingChangeHandler?(handler: (() => void) | null): void;
+}
+
+/**
+ * The guest's clock, for the lines the fabric has to time itself: a UART on
+ * plain GPIOs (SoftwareSerial, a bit-banged TX). Everything is in cycles of
+ * clockHz(), the same base the line contract (simulation/line) already uses,
+ * so an engine's LineHostPort serves as the first three members.
+ *
+ * It is the GUEST's time, never the browser's: an emulated board runs slower
+ * than real time under load, and a bit time measured on the wall clock is
+ * garbage to a sketch that samples on millis() (memory: parts run on the
+ * guest clock, not the wall clock).
+ */
+export interface GuestClock {
+  /**
+   * Guest cycles now. When a pin callback runs, this is the cycle the edge
+   * happened at: the decoder timestamps every edge with it.
+   */
+  now(): number;
+  /** Cycles per second of the guest's configured clock. */
+  clockHz(): number;
+  /**
+   * Put a level on a board pin, as an input to the MCU, at a guest instant.
+   * Edges must be applied in order, at their cycle, and the engine's idle
+   * skip must not jump over one (the same rule the line models rely on).
+   */
+  scheduleEdge(pin: number, level: boolean, atCycle: number): void;
+  /**
+   * Run `cb` when the guest reaches `atCycle`; returns a cancel. A decoder
+   * needs it because a byte whose last bits are ones ends with no edge at
+   * all: the only way to know the frame is over is the clock reaching its
+   * stop bit, and waiting for the next start bit instead would hold the last
+   * byte of every message until the next message.
+   */
+  at(atCycle: number, cb: () => void): () => void;
+}
+
 // ── Engine binding ──────────────────────────────────────────────────────────
 
 /** The minimal pin surface the fabric needs from a board. */
@@ -425,6 +548,18 @@ export interface EngineBinding {
    * and its I2C pins are served by the software decoder alone.
    */
   i2c?: I2cControllerPort[];
+  /**
+   * Every UART controller of the SoC. Optional only while the engines move
+   * over (F6): an engine that leaves it out has no hardware UART on the
+   * fabric, and its UART pins are served by the software decoder alone.
+   */
+  uart?: UartControllerPort[];
+  /**
+   * The guest's clock and edge scheduler, for the software UART. An engine
+   * that leaves it out cannot host one: an endpoint on plain GPIOs of that
+   * board is reported (`uart-no-clock`) instead of silently hearing nothing.
+   */
+  clock?: GuestClock;
   /** MCU reset notifications (Stop/Run, reset, reload). */
   setResetHandler?(handler: (() => void) | null): void;
 }
@@ -457,6 +592,9 @@ export type BusDiagnosticCode =
   | 'i2c-wiring'
   | 'uart-baud-mismatch'
   | 'uart-tx-contention'
+  | 'uart-wiring'
+  | 'uart-no-clock'
+  | 'uart-no-baud'
   | 'bus-remote-responder-missing';
 
 export interface BusDiagnostic {

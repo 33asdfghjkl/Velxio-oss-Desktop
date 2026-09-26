@@ -275,19 +275,10 @@ export function registerSerialSink(
 export function feedBoardSerialOut(boardId: string, ch: string, uart = 0): void {
   const subs = boards.get(boardId)?.serialFanout.get(uart);
   if (subs) for (const cb of subs) cb(ch);
-  // ...and so the PARTS on this board's own canvas hear it too. The fan-out
-  // above only ever reaches other boards, and an in-browser Linux engine has
-  // no bridge to fire `onUartTx`, so this call is the only announcement it
-  // makes: without the line below every UART module on a browser-engine Pi is
-  // deaf, while the same module on the QEMU guest answers. A board simulator
-  // has no such method and does not call this seam anyway, so only the Pi
-  // shim is served here.
-  if (uart === 0) {
-    const sim = runtime?.getBoardSimulator(boardId) as
-      | { noteHeaderUartTxTemporary?: (text: string) => void }
-      | undefined;
-    sim?.noteHeaderUartTxTemporary?.(ch);
-  }
+  // Only other BOARDS are served here. The parts on this board's own canvas
+  // hear it through the board's UART controller port on the bus fabric
+  // (project board-buses-2026-09, F6): an in-browser engine hands its bytes
+  // to the board simulator itself (PiBridgeShim.headerUartTx).
 }
 
 /** Push a UART byte into the receiving board's UART RX. */

@@ -14,6 +14,13 @@
  * circuit changes, removed by the identity of their handle. One more: an SDA
  * net that reaches two boards (their I2C pins wired to each other) puts the
  * target on both boards' buses, so either master finds it, as on the bench.
+ *
+ * UART endpoints too, with one difference that is the protocol's: a UART has
+ * no bus, so each LEG is placed on its own. The RX leg lands on the net of
+ * the board pin it reaches and the TX leg on the net of its own, each with
+ * whatever controller is routed there; a leg that reaches no board pin is on
+ * no wire. Nothing here picks a UART for a part (no boards[0], no default
+ * unit): the wire decides, or the guest's clock does on a plain GPIO.
  */
 
 import { BoardBusFabric } from './fabric';
@@ -32,8 +39,12 @@ import type {
   ResolvedPin,
   SpiDevice,
   SpiDeviceDescriptor,
+  UartEndpoint,
+  UartEndpointDescriptor,
+  UartHandle,
 } from './types';
 import { isBusCapable } from './types';
+import { uartMember, type UartMember, type UartNet } from './uartBus';
 
 /** Where a device's chip select comes from, once resolved. */
 type CsSource =
@@ -76,6 +87,23 @@ interface I2cEntry {
    */
   placements: I2cPlacement[];
   /** Identity of the placement set, to skip no-op recomputes. */
+  key: string;
+}
+
+/** One leg of a UART endpoint on one board's net. */
+interface UartLeg {
+  member: UartMember;
+  fabric: BoardBusFabric;
+  net: UartNet;
+}
+
+interface UartEntry {
+  desc: UartEndpointDescriptor;
+  endpoint: UartEndpoint;
+  /** Where the RX leg listens and where the TX leg drives; null = on no wire. */
+  rx: UartLeg | null;
+  tx: UartLeg | null;
+  /** Identity of the placement, to skip no-op recomputes. */
   key: string;
 }
 
@@ -125,6 +153,27 @@ export type SpiMapListener = (boardId: string) => void;
 /** The I2C membership of `boardId` may have changed (see onI2cMapChange). */
 export type I2cMapListener = (boardId: string) => void;
 
+/** The UART membership of `boardId` may have changed (see onUartMapChange). */
+export type UartMapListener = (boardId: string) => void;
+
+/**
+ * One endpoint of the UART map a remote worker is sent (`uart_map`): the
+ * controller unit that feeds its RX and the one that reads its TX, as the
+ * circuit wires them, or null for a leg on no controller (unwired, or on a
+ * plain GPIO). Field names are the wire's, which is Python's.
+ */
+export interface RemoteUartMapEntry {
+  owner: string;
+  /** Controller whose TX the endpoint's RX leg is wired to. */
+  rx_uart: number | null;
+  /** Controller whose RX the endpoint's TX leg is wired to. */
+  tx_uart: number | null;
+  rx_pin: number | null;
+  tx_pin: number | null;
+  baud: number | null;
+  frame: string | null;
+}
+
 /** A placed device's live inputs changed: `attrs` is the whole set, now. */
 export type SpiAttrsListener = (boardId: string, owner: string, attrs: Record<string, number>) => void;
 
@@ -140,6 +189,7 @@ export class BusRegistry {
   private readonly fabricHooks = new Map<string, Array<() => void>>();
   private readonly spi = new Map<string, SpiEntry>();
   private readonly i2c = new Map<string, I2cEntry>();
+  private readonly uart = new Map<string, UartEntry>();
   private readonly diagListeners = new Set<DiagnosticListener>();
   private readonly seenDiag = new Set<string>();
   private readonly mapListeners = new Set<SpiMapListener>();
@@ -147,6 +197,9 @@ export class BusRegistry {
   /** Boards whose I2C changed since the listeners last heard; see i2cMapChanged. */
   private readonly i2cDirty = new Set<string>();
   private i2cFlushQueued = false;
+  private readonly uartMapListeners = new Set<UartMapListener>();
+  private readonly uartDirty = new Set<string>();
+  private uartFlushQueued = false;
   private readonly attrListeners = new Set<SpiAttrsListener>();
   /**
    * What each remote host was last told a device's live inputs are, by owner,
@@ -173,6 +226,7 @@ export class BusRegistry {
     }
     for (const e of this.spi.values()) this.place(e);
     for (const e of this.i2c.values()) this.placeI2c(e);
+    for (const e of this.uart.values()) this.placeUart(e);
   }
 
   // ── Boards ────────────────────────────────────────────────────────────────
@@ -185,6 +239,7 @@ export class BusRegistry {
         () => this.resolver.boardKind(boardId),
         (d) => this.emit(d),
         () => this.i2cMapChanged(boardId),
+        () => this.uartMapChanged(boardId),
       );
       const fab = f;
       const hooks = [
@@ -222,6 +277,7 @@ export class BusRegistry {
     // A target on this board and on another loses this board's bus only,
     // and the next recompute places it again where the circuit says.
     for (const e of this.i2c.values()) if (e.placements.some((p) => p.fabric === f)) this.unplaceI2c(e);
+    for (const e of this.uart.values()) if (e.rx?.fabric === f || e.tx?.fabric === f) this.unplaceUart(e);
     for (const off of this.fabricHooks.get(boardId) ?? []) off();
     this.fabricHooks.delete(boardId);
     f.dispose();
@@ -575,6 +631,136 @@ export class BusRegistry {
     }
   }
 
+  // ── UART endpoints ────────────────────────────────────────────────────────
+
+  /**
+   * Put a UART endpoint on the wires its legs reach. As with SPI and I2C,
+   * registering an owner that already exists replaces it. The handle's
+   * transmit() puts a byte on the TX leg's wire; dispose() takes both legs
+   * off, by identity.
+   */
+  attachUart(desc: UartEndpointDescriptor, endpoint: UartEndpoint): UartHandle {
+    this.uart.get(desc.owner) && this.detachUart(desc.owner);
+    const entry: UartEntry = { desc, endpoint, rx: null, tx: null, key: '' };
+    this.uart.set(desc.owner, entry);
+    this.placeUart(entry);
+    let disposed = false;
+    return {
+      dispose: () => {
+        if (disposed) return;
+        disposed = true;
+        if (this.uart.get(desc.owner) === entry) this.detachUart(desc.owner);
+      },
+      transmit: (byte) => {
+        if (disposed || this.uart.get(desc.owner) !== entry) return;
+        // A TX leg on no wire transmits into the air.
+        entry.tx?.net.fromEndpoint(entry.tx.member, byte);
+      },
+      // UART endpoints carry no portable model (F6-SPEC, out of scope).
+      attrsChanged: () => {},
+    };
+  }
+
+  private detachUart(owner: string): void {
+    const e = this.uart.get(owner);
+    if (!e) return;
+    this.unplaceUart(e);
+    this.uart.delete(owner);
+  }
+
+  private placeUart(e: UartEntry): void {
+    const { desc } = e;
+    const land = (pin: DevicePin | undefined): { boardId: string; pin: number } | null => {
+      if (pin === undefined) return null;
+      const ref: PinRef =
+        typeof pin === 'string'
+          ? { kind: 'component', componentId: desc.componentId ?? desc.owner, pinName: pin }
+          : pin;
+      const r = this.resolver.resolve(ref);
+      // A leg on a rail, a chip net or nothing is on no wire of any board.
+      return r.kind === 'board' ? { boardId: r.boardId, pin: r.pin } : null;
+    };
+    const rx = land(desc.pins.rx);
+    const tx = land(desc.pins.tx);
+    const key = `${rx ? `${rx.boardId}|${rx.pin}` : ''};${tx ? `${tx.boardId}|${tx.pin}` : ''}`;
+    if (key === e.key) return;
+    this.unplaceUart(e);
+    const leg = (role: 'rx' | 'tx', at: { boardId: string; pin: number }): UartLeg => {
+      const fabric = this.fabric(at.boardId);
+      const net = fabric.uartNetFor(at.pin);
+      const member = uartMember(desc, e.endpoint, role);
+      net.add(member);
+      fabric.uartMembershipChanged(net);
+      return { member, fabric, net };
+    };
+    if (rx) e.rx = leg('rx', rx);
+    if (tx) e.tx = leg('tx', tx);
+    e.key = key;
+  }
+
+  private unplaceUart(e: UartEntry): void {
+    const legs = [e.rx, e.tx];
+    e.rx = null;
+    e.tx = null;
+    e.key = '';
+    for (const l of legs) {
+      if (!l) continue;
+      l.net.remove(l.member.owner, l.member.role);
+      l.fabric.uartMembershipChanged(l.net);
+    }
+  }
+
+  /**
+   * Every endpoint with a leg on `boardId`, with the controller each leg is
+   * wired to, for the map a remote worker is sent. Sorted by owner.
+   */
+  uartMap(boardId: string): RemoteUartMapEntry[] {
+    const out: RemoteUartMapEntry[] = [];
+    for (const [owner, e] of this.uart) {
+      const rx = e.rx?.fabric.boardId === boardId ? e.rx : null;
+      const tx = e.tx?.fabric.boardId === boardId ? e.tx : null;
+      if (!rx && !tx) continue;
+      const m = (rx ?? tx)!.member;
+      out.push({
+        owner,
+        rx_uart: rx?.net.controllerTx?.unit ?? null,
+        tx_uart: tx?.net.controllerRx?.unit ?? null,
+        rx_pin: rx?.net.pin ?? null,
+        tx_pin: tx?.net.pin ?? null,
+        baud: m.baud ?? null,
+        frame: `${m.spec.dataBits}${m.spec.parity}${m.spec.stopBits}`,
+      });
+    }
+    return out.sort((a, b) => (a.owner < b.owner ? -1 : a.owner > b.owner ? 1 : 0));
+  }
+
+  /** Coalesced like onI2cMapChange: once per task, per board whose UART membership may have changed. */
+  onUartMapChange(listener: UartMapListener): () => void {
+    this.uartMapListeners.add(listener);
+    return () => this.uartMapListeners.delete(listener);
+  }
+
+  private uartMapChanged(boardId: string): void {
+    if (this.uartMapListeners.size === 0) return;
+    this.uartDirty.add(boardId);
+    if (this.uartFlushQueued) return;
+    this.uartFlushQueued = true;
+    queueMicrotask(() => {
+      this.uartFlushQueued = false;
+      const boards = Array.from(this.uartDirty);
+      this.uartDirty.clear();
+      for (const id of boards) {
+        for (const l of this.uartMapListeners) {
+          try {
+            l(id);
+          } catch {
+            /* a broken listener must not break the bus */
+          }
+        }
+      }
+    });
+  }
+
   // ── The bus map a remote worker needs ─────────────────────────────────────
 
   /**
@@ -818,6 +1004,25 @@ export class BusRegistry {
   }
 
   /**
+   * Where a UART endpoint's legs sit right now: the board pin each one
+   * reaches, the controller on that wire (the one transmitting to an RX leg,
+   * the one listening to a TX leg) or null for a plain GPIO followed on the
+   * guest's clock. Null when the owner is not registered; a leg on no wire
+   * is null.
+   */
+  uartPlacement(owner: string): {
+    rx: { boardId: string; pin: number; controller: string | null } | null;
+    tx: { boardId: string; pin: number; controller: string | null } | null;
+  } | null {
+    const e = this.uart.get(owner);
+    if (!e) return null;
+    return {
+      rx: e.rx ? { boardId: e.rx.fabric.boardId, pin: e.rx.net.pin, controller: e.rx.net.controllerTx?.name ?? null } : null,
+      tx: e.tx ? { boardId: e.tx.fabric.boardId, pin: e.tx.net.pin, controller: e.tx.net.controllerRx?.name ?? null } : null,
+    };
+  }
+
+  /**
    * The I2C owners a remote worker for `boardId` must keep silent: every
    * registered target that is not on a bus of that board (wired to nothing,
    * half wired, or wired to another board). Without `boardId`, the targets
@@ -889,11 +1094,14 @@ export class BusRegistry {
   clear(): void {
     for (const owner of Array.from(this.spi.keys())) this.detachSpi(owner);
     for (const owner of Array.from(this.i2c.keys())) this.detachI2c(owner);
+    for (const owner of Array.from(this.uart.keys())) this.detachUart(owner);
     for (const id of Array.from(this.fabrics.keys())) this.dropFabric(id);
     this.seenDiag.clear();
     this.mapListeners.clear();
     this.i2cMapListeners.clear();
     this.i2cDirty.clear();
+    this.uartMapListeners.clear();
+    this.uartDirty.clear();
     this.attrListeners.clear();
     this.sentAttrs.clear();
     this.resolver = NO_RESOLVER;

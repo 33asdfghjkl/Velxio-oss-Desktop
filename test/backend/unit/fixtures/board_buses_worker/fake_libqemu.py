@@ -131,6 +131,11 @@ class FakeLibQemu:
             buf = (ctypes.c_uint8 * len(data))(*data)
             cbs.picsimlab_spi_event_batch(int(op.get('bus', 0)), buf, len(data))
             return {}
+        if kind == 'uart':
+            # One byte the guest's UART `uart` shifted out, as
+            # picsimlab_uart_tx_event reports it (F6: chips hear it here).
+            cbs.picsimlab_uart_tx_event(int(op['uart']), int(op['byte']) & 0xFF)
+            return {}
         if kind == 'i2c':
             bus, addr = int(op['bus']), int(op['addr'])
             return {'ret': [int(cbs.picsimlab_i2c_event(bus, addr, int(ev)))

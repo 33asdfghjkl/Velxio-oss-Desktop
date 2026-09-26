@@ -91,6 +91,7 @@ import {
   RemoteSpiLane,
 } from '../simulation/buses';
 import { RemoteI2cLane } from '../simulation/buses/remoteI2c';
+import { RemoteUartLane } from '../simulation/buses/remoteUart';
 import { i2cPartWorkerPin } from '../simulation/parts/i2cPart';
 import {
   loadSdBusChip,
@@ -214,18 +215,37 @@ export class Esp32BridgeShim {
    * each I2C target is on. It travels with the SPI half on the same message.
    */
   private readonly i2cLane: RemoteI2cLane;
+  /**
+   * The same board's UART, for the same worker (F6): its controllers as
+   * ports, fed with the bytes the worker relays and carrying what a part
+   * answers back, and the half of the map that says which controller each
+   * UART endpoint's legs are wired to.
+   */
+  private readonly uartLane: RemoteUartLane;
+  /**
+   * The owners of the sensor records this shim sent its worker, by the
+   * worker's pin. The UART half of the map names, among them, the ones the
+   * fabric put on no wire of this board, so the worker keeps those silent
+   * instead of leaving them on the UART their record alone named.
+   */
+  private readonly sensorOwners = new Map<number, string>();
 
   constructor(bridge: Esp32Bridge, pm: PinManager) {
     this.bridge = bridge;
     this.pinManager = pm;
     this.i2cLane = new RemoteI2cLane(bridge.boardId, bridge.boardKind);
+    this.uartLane = new RemoteUartLane(bridge.boardId, bridge.boardKind, (unit, bytes) =>
+      bridge.sendSerialBytes(bytes, unit),
+    );
     this.remoteLane = new RemoteSpiLane(
       bridge.boardId,
       bridge.boardKind,
       (spi) =>
         (
-          bridge as unknown as { sendBusMap?: (m: unknown[], i2c?: unknown[]) => void }
-        ).sendBusMap?.(spi, this.i2cLane.poll().i2c),
+          bridge as unknown as {
+            sendBusMap?: (m: unknown[], i2c?: unknown[], uart?: unknown[]) => void;
+          }
+        ).sendBusMap?.(spi, this.i2cLane.poll().i2c, this.uartLane.poll(this.sensorOwners.values()).uart),
       (owner, attrs) =>
         (
           bridge as unknown as {
@@ -243,12 +263,16 @@ export class Esp32BridgeShim {
     // span, because the worker keeps the bytes no sink here can see.
     bridge.onBusBlob = (owner, name, offset, data, blobId) =>
       this.remoteLane.applyBlob(owner, name, offset, data, blobId);
-    // The start config asks for the I2C half as it is when the socket opens:
-    // a first Run may come before any membership change pushed one.
+    // The bytes the guest transmitted on each UART, into that controller's
+    // port; what an endpoint here answers goes back through sendSerialBytes.
+    bridge.onUartTxBytes = (uart, bytes) => this.uartLane.deliver(uart, bytes);
+    // The start config asks for the I2C and UART halves as they are when the
+    // socket opens: a first Run may come before any membership change pushed
+    // one.
     (bridge as unknown as { onBusMapRequest?: unknown }).onBusMapRequest = () => ({
       i2c: this.i2cLane.poll().i2c,
+      uart: this.uartLane.poll(this.sensorOwners.values()).uart,
     });
-
   }
 
   setPinState(pin: number, state: boolean): void {
@@ -324,6 +348,17 @@ export class Esp32BridgeShim {
     const { i2c, changed } = this.i2cLane.poll();
     if (!changed) return;
     (this.bridge as unknown as { sendI2cBusMap?: (m: unknown[]) => void }).sendI2cBusMap?.(i2c);
+  }
+
+  /**
+   * The UART half of the map alone when it changed since the last one (F6):
+   * an endpoint placed, moved or gone, a controller rerouted, a sensor record
+   * sent or withdrawn. Same compare-then-send rule as the I2C half.
+   */
+  pushUartMap(): void {
+    const { uart, changed } = this.uartLane.poll(this.sensorOwners.values());
+    if (!changed) return;
+    (this.bridge as unknown as { sendUartBusMap?: (m: unknown[]) => void }).sendUartBusMap?.(uart);
   }
 
   /** A responder's live inputs, for the worker that hosts its model. Same
@@ -457,8 +492,9 @@ export class Esp32BridgeShim {
   private sdHandle: (() => void) | null = null;
   private sdImageBytes = 0;
 
-  /** One byte into the guest's UART RX; the custom-chip bridge (avrUartTx)
-   *  calls this for a browser-hosted chip's vx_uart_write on CHIP_UART. */
+  /** One byte into the guest's RX of UART `uart`. What a part on the fabric
+   *  answers arrives through its controller port; this is the byte-sized form
+   *  of sendSerialBytes for callers that already hold one byte. */
   sendSerialByte(byte: number, uart = 0): void {
     this.sendSerialBytes([byte & 0xff], uart);
   }
@@ -658,10 +694,21 @@ export class Esp32BridgeShim {
 
   registerSensor(type: string, pin: number, properties: Record<string, unknown>): boolean {
     this.bridge.sendSensorAttach(type, pin, properties);
-    // An I2C part registers its target with the fabric in the same attach,
+    this.noteSensorOwner(pin, properties);
+    // An I2C or UART part registers with the fabric in the same attach,
     // before or after this call: look once both are done.
-    queueMicrotask(() => this.pushI2cMap());
+    queueMicrotask(() => {
+      this.pushI2cMap();
+      this.pushUartMap();
+    });
     return true; // backend handles the protocol
+  }
+
+  /** The identity the worker's record carries for the bus map (uart_bus_table.owner_of). */
+  private noteSensorOwner(pin: number, properties: Record<string, unknown>): void {
+    const owner = properties['owner'] ?? properties['component_id'];
+    if (typeof owner === 'string' && owner) this.sensorOwners.set(pin, owner);
+    else this.sensorOwners.delete(pin);
   }
 
   /** Pins a backend-emulated single-wire sensor drives itself. The generic
@@ -715,7 +762,9 @@ export class Esp32BridgeShim {
       ) => import('../simulation/buses').EngineBinding | null;
     };
     const binding = typeof bridge.getBusBinding === 'function' ? bridge.getBusBinding(pins) : null;
-    if (!binding) return { ...this.remoteLane.binding(pins), i2c: this.i2cLane.ports };
+    if (!binding) {
+      return { ...this.remoteLane.binding(pins), i2c: this.i2cLane.ports, uart: this.uartLane.ports };
+    }
     return {
       ...binding,
       setResetHandler: (handler) =>
@@ -734,7 +783,11 @@ export class Esp32BridgeShim {
   }
   unregisterSensor(pin: number): void {
     this.bridge.sendSensorDetach(pin);
-    queueMicrotask(() => this.pushI2cMap());
+    this.sensorOwners.delete(pin);
+    queueMicrotask(() => {
+      this.pushI2cMap();
+      this.pushUartMap();
+    });
   }
 
   // ── I2C write-only device relay (SSD1306, PCF8574) ───────────────────────
@@ -947,19 +1000,32 @@ class Stm32BridgeShim {
   /** Its I2C controllers and the I2C half of the same map (F5); see
    *  Esp32BridgeShim.i2cLane. */
   private readonly i2cLane: RemoteI2cLane;
+  /** Its USARTs as ports and the UART half of the map (F6); see
+   *  Esp32BridgeShim.uartLane. */
+  private readonly uartLane: RemoteUartLane;
+  /** The owners of the records the worker holds, by pin; see Esp32BridgeShim.sensorOwners. */
+  private readonly sensorOwners = new Map<number, string>();
 
   constructor(bridge: Stm32Bridge, pm: PinManager) {
     this.bridge = bridge;
     this.pinManager = pm;
     this.i2cLane = new RemoteI2cLane(bridge.boardId, bridge.boardKind);
+    this.uartLane = new RemoteUartLane(bridge.boardId, bridge.boardKind, (unit, bytes) =>
+      bridge.sendSerialBytes(bytes, unit),
+    );
     this.remoteLane = new RemoteSpiLane(
       bridge.boardId,
       bridge.boardKind,
-      (spi) => bridge.sendBusMap(spi, this.i2cLane.poll().i2c),
+      (spi) =>
+        bridge.sendBusMap(spi, this.i2cLane.poll().i2c, this.uartLane.poll(this.sensorOwners.values()).uart),
       (owner, attrs) => bridge.sendBusAttrs(owner, attrs),
     );
     bridge.onSpiBatch = (mosi) => this.remoteLane.port?.deliver(mosi);
-    bridge.onBusMapRequest = () => ({ i2c: this.i2cLane.poll().i2c });
+    bridge.onUartTxBytes = (uart, bytes) => this.uartLane.deliver(uart, bytes);
+    bridge.onBusMapRequest = () => ({
+      i2c: this.i2cLane.poll().i2c,
+      uart: this.uartLane.poll(this.sensorOwners.values()).uart,
+    });
   }
 
   // ── Lifecycle stubs (the store drives the real bridge via getStm32Bridge) ──
@@ -1041,7 +1107,13 @@ class Stm32BridgeShim {
   registerSensor(type: string, pin: number, properties: Record<string, unknown>): boolean {
     this.bridge.sendSensorAttach(type, pin, properties);
     // See Esp32BridgeShim.registerSensor.
-    queueMicrotask(() => this.pushI2cMap());
+    const owner = properties['owner'] ?? properties['component_id'];
+    if (typeof owner === 'string' && owner) this.sensorOwners.set(pin, owner);
+    else this.sensorOwners.delete(pin);
+    queueMicrotask(() => {
+      this.pushI2cMap();
+      this.pushUartMap();
+    });
     return true;
   }
   updateSensor(pin: number, properties: Record<string, unknown>): void {
@@ -1049,7 +1121,11 @@ class Stm32BridgeShim {
   }
   unregisterSensor(pin: number): void {
     this.bridge.sendSensorDetach(pin);
-    queueMicrotask(() => this.pushI2cMap());
+    this.sensorOwners.delete(pin);
+    queueMicrotask(() => {
+      this.pushI2cMap();
+      this.pushUartMap();
+    });
   }
 
   /** Send the worker the board's SPI bus map (project board-buses-2026-09). */
@@ -1065,6 +1141,13 @@ class Stm32BridgeShim {
     // bridge, or a test double) must not turn into an uncaught exception there.
     if (changed)
       (this.bridge as unknown as { sendI2cBusMap?: (m: unknown[]) => void }).sendI2cBusMap?.(i2c);
+  }
+
+  /** The UART half alone, when it changed (F6); see Esp32BridgeShim.pushUartMap. */
+  pushUartMap(): void {
+    const { uart, changed } = this.uartLane.poll(this.sensorOwners.values());
+    if (changed)
+      (this.bridge as unknown as { sendUartBusMap?: (m: unknown[]) => void }).sendUartBusMap?.(uart);
   }
 
   /** A responder's live inputs, for the worker that hosts its model. */
@@ -1093,6 +1176,7 @@ class Stm32BridgeShim {
         driveInput: (pin, level) => this.setPinState(pin, level),
       }),
       i2c: this.i2cLane.ports,
+      uart: this.uartLane.ports,
     };
   }
 
@@ -4621,6 +4705,13 @@ busRegistry.onSpiMapChange((boardId) => {
 busRegistry.onI2cMapChange((boardId) => {
   const sim = simulatorMap.get(boardId) as { pushI2cMap?: () => void } | undefined;
   sim?.pushI2cMap?.();
+});
+// And for UART (F6): an endpoint placed, moved or gone, or a controller
+// rerouted, reaches a QEMU board's worker as a new UART half of its map. A
+// board with no worker has no pushUartMap.
+busRegistry.onUartMapChange((boardId) => {
+  const sim = simulatorMap.get(boardId) as { pushUartMap?: () => void } | undefined;
+  sim?.pushUartMap?.();
 });
 // Between maps, a hosted responder's live inputs (a finger, a slider, the
 // circuit solve) go to the same host on their own, keyed by owner. A board

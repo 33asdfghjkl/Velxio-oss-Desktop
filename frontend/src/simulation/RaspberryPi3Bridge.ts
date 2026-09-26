@@ -118,6 +118,13 @@ export class RaspberryPi3Bridge {
   /** Bytes the guest wrote to its HEADER UART (not the console): another
    * board wired to those pads is the destination. Decoded text. */
   onUartTx: ((text: string) => void) | null = null;
+  /**
+   * The same bytes, raw, for the board's UART controller port (the
+   * PiBridgeShim owns this slot; project board-buses-2026-09, F6). Its own
+   * slot rather than a chain on onUartTx: a byte above 0x7f does not survive
+   * the text decode, and a fingerprint reader's frames are made of them.
+   */
+  onUartTxBytes: ((bytes: Uint8Array) => void) | null = null;
   /** Guest PWM activity (PWM_START / PWM_CHANGE / PWM_STOP). Overlay boards
    * use it for built-in buzzers/speakers. */
   onGpioPwm:
@@ -268,11 +275,9 @@ export class RaspberryPi3Bridge {
           const b64 = (msg.data.data as string) ?? '';
           if (b64) {
             try {
-              this.onUartTx?.(
-                new TextDecoder().decode(
-                  Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0)),
-                ),
-              );
+              const raw = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+              this.onUartTxBytes?.(raw);
+              this.onUartTx?.(new TextDecoder().decode(raw));
             } catch {
               /* malformed payload — never kill the session over it */
             }

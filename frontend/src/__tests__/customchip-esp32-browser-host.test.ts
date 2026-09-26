@@ -1,7 +1,7 @@
 /**
  * A custom chip on an ESP32 board whose bridge does not host chips in a
- * backend worker takes the browser path: GPIO through the shim, UART through
- * the bridge below, and its buses through the fabric by its own pads.
+ * backend worker takes the browser path: GPIO through the shim, and its
+ * buses (UART included) through the fabric by its own pads.
  *
  * The OSS QEMU bridge hosts chips in its worker and has no opinion; an
  * overlay's in-browser engine answers `hostsCustomChips()` false. Before
@@ -16,26 +16,13 @@
  * board-buses/board-buses-repro-chips-spi.test.ts.
  */
 import { describe, it, expect } from 'vitest';
-import {
-  detectSimulatorKind,
-  hostsChipsInWorker,
-  ensureUartBridge,
-} from '../simulation/customChips/simulatorBridges';
+import { detectSimulatorKind, hostsChipsInWorker } from '../simulation/customChips/simulatorBridges';
 
 function esp32Shim(extra: Record<string, unknown> = {}) {
-  const spi = {
-    onByte: null as ((mosi: number) => void) | null,
-    completed: [] as number[],
-    completeTransfer(miso: number) {
-      this.completed.push(miso);
-    },
-  };
   return {
-    spi,
     sim: {
       sendPinEvent: () => {},
       registerSensor: () => true,
-      spi,
       ...extra,
     },
   };
@@ -68,15 +55,5 @@ describe('custom chips on an ESP32 shim', () => {
   it('never claims a worker for a simulator that is not there', () => {
     expect(hostsChipsInWorker(null)).toBe(false);
     expect(hostsChipsInWorker(undefined)).toBe(false);
-  });
-
-  // Issue #355: an ILI9488 touch panel went deaf the moment a Grove sensor
-  // model (a custom chip) sat on the same board, because the chip host took
-  // the board's SPI whatever the chip spoke. Nothing here touches SPI now.
-  it('leaves the shim SPI adapter alone when it hosts a chip', () => {
-    const { sim, spi } = esp32Shim({ hostsCustomChips: () => false });
-    ensureUartBridge(sim);
-    expect(spi.onByte).toBeNull();
-    expect(spi.completed).toEqual([]);
   });
 });

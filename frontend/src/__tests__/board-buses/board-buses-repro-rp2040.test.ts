@@ -675,11 +675,13 @@ describe('RP2040 I2C: a chip answers on the controller its SDA/SCL are wired to'
 
 // ── UART lumping ─────────────────────────────────────────────────────────────
 //
-// The finding's MicroPython half (a chip on machine.UART(0) is deaf, since
-// loadMicroPython never wires uart[0].onByte) has no test here: on rp2040js
-// the MicroPython v1.20 UART(0, 115200, tx=Pin(0), rx=Pin(1)) constructor never
-// returns, chip or no chip, with the CPU busy the whole time. It needs the
-// engine fixed first.
+// The chip is on UART1 because its pads are wired to GP8/GP9 (board-buses F6:
+// CustomChipPart puts it on the bus fabric, which follows the funcsel). The
+// finding's MicroPython half (a chip on machine.UART(0) is deaf, since
+// loadMicroPython never wired uart[0].onByte; both UARTs are wired now) has
+// no test here: on rp2040js the MicroPython v1.20 UART(0, 115200, tx=Pin(0),
+// rx=Pin(1)) constructor never returns, chip or no chip, with the CPU busy
+// the whole time. It needs the engine fixed first.
 
 describe('RP2040 UART: a chip hears and answers only on the UART it is wired to', () => {
   it('rp2040-uart-lumped-and-uart0-only-rx setup: the UART chip is alive and replies to a PING', async () => {
@@ -692,7 +694,7 @@ describe('RP2040 UART: a chip hears and answers only on the UART it is wired to'
     expect(board.out()).toMatch(/PONG\d/);
   });
 
-  it.fails(
+  it(
     'rp2040-uart-lumped-and-uart0-only-rx: a chip on UART1 (Serial2, GP8/GP9) hears only Serial2 and its reply arrives on Serial2',
     async () => {
       const board = boot('rp2040-uart-chip');

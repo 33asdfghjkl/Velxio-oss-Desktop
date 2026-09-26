@@ -152,6 +152,25 @@ except ImportError:
     _I2C_NOT_ROUTED = _mod.NOT_ROUTED      # type: ignore[assignment]
     _i2c_owner_of = _mod.owner_of          # type: ignore[assignment]
 
+# The UART chips this worker hosts, by the guest UART their wiring puts them
+# on (project board-buses-2026-09, F6). Shared with the STM32 worker.
+try:
+    from app.services.uart_bus_table import (
+        UartBusTable as _UartBusTable,
+        NOT_ROUTED as _UART_NOT_ROUTED,
+        owner_of as _uart_owner_of,
+    )
+except ImportError:
+    import importlib.util, pathlib, sys as _sys
+    _here = pathlib.Path(__file__).parent
+    _spec = importlib.util.spec_from_file_location('uart_bus_table', _here / 'uart_bus_table.py')
+    _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+    _sys.modules['uart_bus_table'] = _mod
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    _UartBusTable = _mod.UartBusTable      # type: ignore[assignment]
+    _UART_NOT_ROUTED = _mod.NOT_ROUTED     # type: ignore[assignment]
+    _uart_owner_of = _mod.owner_of         # type: ignore[assignment]
+
 # SPI slaves (Phase 1: SSD168x ePaper). Same fallback dance — when the worker
 # runs as a subprocess from backend/ the package import won't resolve.
 try:
@@ -875,11 +894,12 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
 
     # Custom-chip runtimes that registered their respective protocols at chip_setup.
     # Mutated when sensor_type=='custom-chip' is processed in initial_sensors.
-    # Must match wasm_chip_runtime.CHIP_UART; defined locally because that
-    # module is imported lazily (the worker may run without app.services on
-    # sys.path, see the ImportError fallback below).
-    CHIP_UART = 1
-    _chip_uart_runtimes: list = []          # runtimes that called vx_uart_attach
+    # The UART chips, by the guest UART each one is on (F6): a chip hears the
+    # controller whose TX its RX leg is wired to, from the tab's bus map and
+    # the live GPIO matrix, and answers into the same one. Before F6 every
+    # chip resolved its UART once, at vx_uart_attach, from a static table the
+    # frontend guessed, and landed on Serial1 when nothing resolved.
+    _uart_table = _UartBusTable(resolve_tx_pad=lambda pad: _resolve_uart_tx_pad(pad))
 
     _chip_spi_runtimes:  list = []          # runtimes that called vx_spi_attach
     _chip_timer_runtimes: list = []         # runtimes with active timers
@@ -937,6 +957,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             SIG_LEDC_LS_CH_LAST,
             rmt_signal_base,
             i2c_sda_signals,
+            uart_tx_signals,
         )
     except ImportError:
         import importlib.util as _ilu, pathlib as _pl
@@ -952,9 +973,35 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         SIG_LEDC_LS_CH_LAST = sys.modules['esp32_signals'].SIG_LEDC_LS_CH_LAST
         rmt_signal_base = sys.modules['esp32_signals'].rmt_signal_base
         i2c_sda_signals = sys.modules['esp32_signals'].i2c_sda_signals
+        uart_tx_signals = sys.modules['esp32_signals'].uart_tx_signals
     _signal_router = SignalRouter()
     _rmt_sig_base = rmt_signal_base(machine)
     _i2c_sda_sig = i2c_sda_signals(machine)
+    _uart_tx_sig = uart_tx_signals(machine)
+
+    def _resolve_uart_tx_pad(pad: int) -> int | None:
+        """Which UART the guest transmits on through pad `pad` right now.
+
+        Read off the matrix per byte, for the same reason _resolve_i2c_bus
+        reads it per address phase: `Serial1.begin(9600, SERIAL_8N1, 16, 17)`
+        can move a port at any time, and the tab's static table cannot know.
+        None when the matrix cannot be read (an older libqemu); NOT_ROUTED
+        when it can and no UART drives that pad, which the table treats as
+        "ask the tab": ESP-IDF 5 puts a port on its IO_MUX pins without the
+        matrix (uart_try_set_iomux_pin), so an unrouted pad may still be the
+        one UART0 talks on.
+        """
+        if not _uart_tx_sig or pad < 0 or pad >= _GPIO_COUNT:
+            return None
+        try:
+            out_sel_ptr = lib.qemu_picsimlab_get_internals(2)
+            if not out_sel_ptr:
+                return None
+            out_sel = (ctypes.c_uint32 * _GPIO_COUNT).from_address(out_sel_ptr)
+            unit = _uart_tx_sig.get(int(out_sel[pad]) & 0x1FF)
+        except Exception:  # noqa: BLE001 - an iothread callback never raises
+            return None
+        return _UART_NOT_ROUTED if unit is None else unit
 
     def _resolve_i2c_bus(sda: int) -> int | None:
         """Which I2C controller the guest routed to pad `sda` right now.
@@ -1651,15 +1698,13 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         if _stopped.is_set():
             return
         _emit({'type': 'uart_tx', 'uart': uart_id, 'byte': byte_val})
-        # Dispatch to the custom-chip runtimes bound to THIS UART. A chip binds
-        # to the UART whose TX/RX the diagram wires to it, and to CHIP_UART when
-        # nothing resolves: UART0 is the serial monitor, so a chip listening
-        # there by default would receive the sketch's own console output and its
-        # replies would land in the monitor as garbage.
-        # The chip's on_rx_byte callback runs synchronously in this thread.
-        for rt in _chip_uart_runtimes:
-            if getattr(rt, 'uart_id', CHIP_UART) != uart_id:
-                continue
+        # The custom chips whose RX leg is on the pad THIS controller drives,
+        # asked per byte because the guest can move a port to other pads at
+        # any time (F6). A chip on no controller hears nothing, as its silicon
+        # would on an unwired pad. The chip's on_rx_byte runs synchronously in
+        # this thread, so a reply through vx_uart_write lands before the
+        # guest's next instruction.
+        for rt in _uart_table.runtimes_on(uart_id):
             try:
                 rt.feed_uart_byte(byte_val)
             except Exception as e:
@@ -2582,11 +2627,21 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 # (typical case: the chip's vx_uart_write is fired from inside
                 # _on_uart_tx, which is already in the QEMU thread holding the
                 # lock — re-acquiring there triggers an assertion).
+                # `uart_id` is what the runtime resolved from the record alone;
+                # the table answers from the wiring the tab mapped and the live
+                # matrix, and a chip on no controller writes into the air (F6).
+                _rt_cell: list = [None]
+
                 def _chip_uart_writer(uart_id: int, data: bytes,
                                       _lib=lib,
                                       _lock=_lock_iothread,
                                       _unlock=_unlock_iothread,
-                                      _is_locked=_iothread_locked):
+                                      _is_locked=_iothread_locked,
+                                      _cell=_rt_cell):
+                    unit = _uart_table.unit_of(_cell[0], default=uart_id)
+                    if unit is None:
+                        return
+                    uart_id = int(unit)
                     buf = (ctypes.c_uint8 * len(data))(*data)
                     need_lock = bool(_lock) and (not _is_locked or not _is_locked())
                     if need_lock:
@@ -2617,6 +2672,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     component_id=comp_id,
                 )
                 runtime.run_chip_setup()
+                _rt_cell[0] = runtime
 
                 if runtime.has_framebuffer():
                     _chip_fb_runtimes.append(runtime)
@@ -2629,8 +2685,10 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     sensor_data['slave']    = slave
                     _log(f"[custom-chip] I2C slave registered at 0x{runtime.i2c_address:02x}")
                 if runtime.uart_config is not None:
-                    _chip_uart_runtimes.append(runtime)
-                    _log(f"[custom-chip] UART chip registered on UART{runtime.uart_id}")
+                    _uart_table.add(runtime, runtime, owner=_uart_owner_of(s),
+                                    legacy_unit=runtime.uart_id)
+                    _log(f"[custom-chip] UART chip registered "
+                         f"(owner={_uart_owner_of(s)!r}, record says UART{runtime.uart_id})")
                 if runtime.spi_config is not None:
                     _chip_spi_runtimes.append(runtime)
                     _spi_population_changed()
@@ -2656,7 +2714,8 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         rt = sensor_data.get('runtime')
         if rt is None:
             return
-        for lst in (_chip_uart_runtimes, _chip_spi_runtimes,
+        _uart_table.remove(rt)
+        for lst in (_chip_spi_runtimes,
                     _chip_pin_watch_runtimes, _chip_timer_runtimes,
                     _chip_fb_runtimes):
             while rt in lst:
@@ -2858,6 +2917,8 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     _apply_spi_bus_map((cfg.get('bus_map') or {}).get('spi') or [])
     # And which I2C controller each target the tab placed is on (F5).
     _i2c_table.apply_map((cfg.get('bus_map') or {}).get('i2c'))
+    # And which UART each endpoint's legs are wired to (F6).
+    _uart_table.apply_map((cfg.get('bus_map') or {}).get('uart'))
     _emit({'type': 'system', 'event': 'booted'})
     _log(f'QEMU started: machine={machine} firmware={firmware_path}')
     _log(f'QEMU args: {[a.decode() for a in args_list]}')
@@ -3074,6 +3135,9 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             # Same transport for I2C (F5): which controller each target the
             # fabric placed is on. A map with no `i2c` key leaves it as it was.
             _i2c_table.apply_map(cmd.get('i2c'))
+            # And for UART (F6): the controllers each endpoint's legs reach,
+            # or that it reaches none. No `uart` key leaves it as it was.
+            _uart_table.apply_map(cmd.get('uart'))
 
         elif c == 'bus_attrs':
             # Live inputs of one responder the map put here, between two maps.

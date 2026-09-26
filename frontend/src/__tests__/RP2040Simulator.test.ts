@@ -338,10 +338,12 @@ describe('RP2040Simulator — UART / Serial', () => {
     // After reset, onSerialData is still set (assigned on the simulator object)
     expect(sim.onSerialData).toBe(cb);
 
-    // And the new UART0 should fire through it
+    // And the new UART0 should fire through it, tagged with its unit (the
+    // Interconnect fans UART1 out to peer boards by that tag; the monitor
+    // keeps unit 0).
     const mcu = sim.getMCU()!;
     mcu.uart[0].onByte!(0x43); // 'C'
-    expect(cb).toHaveBeenCalledWith('C');
+    expect(cb).toHaveBeenCalledWith('C', 0);
   });
 });
 

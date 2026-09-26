@@ -34,7 +34,6 @@ import { AVRSimulator } from '../../simulation/AVRSimulator';
 import { PinManager } from '../../simulation/PinManager';
 import { PartSimulationRegistry } from '../../simulation/parts';
 import { ChipInstance } from '../../simulation/customChips/ChipRuntime';
-import { getSimulatorBridges } from '../../simulation/customChips/simulatorBridges';
 import { resetBusNets } from '../../simulation/customChips/busNets';
 import {
   setChipBusEnabledForTest,
@@ -111,13 +110,7 @@ afterEach(() => {
       /* already gone */
     }
   }
-  for (const sim of sims) {
-    sim.stop();
-    // The AVR chip-to-board FIFO re-arms a 1 ms timer while it holds bytes
-    // and the CPU is not stepping; empty it so no test leaves a timer chain
-    // running into the next one.
-    getSimulatorBridges(sim).uartRxQueue.length = 0;
-  }
+  for (const sim of sims) sim.stop();
   vi.useRealTimers();
   vi.restoreAllMocks();
   useSimulatorStore.setState((s) => ({ boards: s.boards.map((b) => ({ ...b, running: false })) }));
@@ -229,31 +222,61 @@ function setBoardsRunning(running: boolean): void {
   useSimulatorStore.setState((s) => ({ boards: s.boards.map((b) => ({ ...b, running })) }));
 }
 
-// ── 1. AVR chip UART bridge across the board lifecycle ──────────────────────
+// ── 1. AVR chip UART across the board lifecycle ─────────────────────────────
 //
 // Uno + the uart-probe chip on the hardware serial (chip RX on D1, TX on D0).
 // The sketch prints "ready\n" at boot; the chip logs every byte it hears.
 // D2 is held HIGH so the sketch does not ask for the chip's burst: only the
-// board-to-chip direction is under test here.
+// board-to-chip direction is under test here. The chip is on the board's
+// UART because its pads are wired to the USART pins (board-buses F6), so the
+// board is on the canvas and the wires are in the store, as for I2C below.
 
 const UART_PINS = ['RX', 'TX', 'GND', 'VCC'];
 const UART_WIRES = { RX: 1, TX: 0 };
 
-describe('AVR: chip UART bridge after recompile, Stop/Run and Reset', () => {
+/** The uart-probe chip wired to the Uno's USART0 pins, through the real CustomChipPart. */
+async function attachUartChip(board: Uno & { id: string }, id: string): Promise<() => void> {
+  useSimulatorStore.setState((s) => ({
+    wires: [
+      ...s.wires.filter((w) => !w.id.startsWith(`${id}-w`)),
+      ...Object.entries(UART_WIRES).map(([pinName, pin], i) => ({
+        id: `${id}-w${i}`,
+        start: { componentId: id, pinName, x: 0, y: 0 },
+        end: { componentId: board.id, pinName: String(pin), x: 0, y: 0 },
+        waypoints: [],
+        color: '#0a0',
+      })),
+    ] as never,
+  }));
+  return attachChip(board.sim, id, 'uart-probe', UART_PINS, UART_WIRES);
+}
+
+describe('AVR: chip UART after recompile, Stop/Run and Reset', () => {
   const IDS = 'avr-uart-dispatcher-lost-after-recompile-or-stop, avr-uart-dispatcher-lost-on-reload';
+  afterEach(leaveCanvas);
 
   async function firstRun() {
-    const board = uno(HEX.uartPing);
+    const board = unoOnCanvas(HEX.uartPing);
     board.sim.setPinState(2, true);
-    const detach = await attachChip(board.sim, 'uart1', 'uart-probe', UART_PINS, UART_WIRES);
+    const detach = await attachUartChip(board, 'uart1');
     runMs(board.sim, 20);
     return { board, detach };
   }
 
   it(`${IDS} setup: on the first Run the sketch's bytes reach the chip`, async () => {
-    const { board } = await firstRun();
+    const { board, detach } = await firstRun();
     expect(board.out()).toContain('ready\n');
     expect(chipHeard('uart1')).toBe('ready\n');
+    // The chip is on USART0 by its pads, at its own rate (vx_uart_config
+    // 9600, what the fabric checks the board's UART against), and off the
+    // wire once the part is gone.
+    expect(busRegistry.uartPlacement('uart1')).toEqual({
+      rx: { boardId: board.id, pin: 1, controller: 'USART0' },
+      tx: { boardId: board.id, pin: 0, controller: 'USART0' },
+    });
+    expect(busRegistry.uartMap(board.id).map((e) => [e.owner, e.baud, e.frame])).toEqual([['uart1', 9600, '8N1']]);
+    detach();
+    expect(busRegistry.uartPlacement('uart1')).toBeNull();
   });
 
   // The three it.fails below also check the monitor, but an it.fails passes on
@@ -269,28 +292,28 @@ describe('AVR: chip UART bridge after recompile, Stop/Run and Reset', () => {
         if (step === 'reset') detach();
       }
       board.sim.setPinState(2, true);
-      if (step !== 'stop-run') await attachChip(board.sim, 'uart1', 'uart-probe', UART_PINS, UART_WIRES);
+      if (step !== 'stop-run') await attachUartChip(board, 'uart1');
       board.clear();
       runMs(board.sim, 20);
       expect(board.out(), step).toBe('ready\n');
     }
   });
 
-  it.fails(`${IDS}: after a recompile (loadHex on the same simulator, part re-attached) the chip still hears the sketch`, async () => {
+  it(`${IDS}: after a recompile (loadHex on the same simulator, part re-attached) the chip still hears the sketch`, async () => {
     const { board, detach } = await firstRun();
     // compileBoardProgram: loadHex on the SAME AVRSimulator, then the hexEpoch
     // bump makes DynamicComponent run the part's cleanup and attach again.
     detach();
     board.sim.loadHex(HEX.uartPing);
     board.sim.setPinState(2, true);
-    await attachChip(board.sim, 'uart1', 'uart-probe', UART_PINS, UART_WIRES);
+    await attachUartChip(board, 'uart1');
     board.clear();
     runMs(board.sim, 20);
     expect(board.out()).toContain('ready\n');
     expect(chipHeard('uart1')).toBe('ready\nready\n');
   });
 
-  it.fails(`${IDS}: after Stop then Run (reset, no re-attach) the chip still hears the sketch`, async () => {
+  it(`${IDS}: after Stop then Run (reset, no re-attach) the chip still hears the sketch`, async () => {
     const { board } = await firstRun();
     // stopBoard on an AVR: sim.reset() (a new AVRUSART), no hexEpoch bump.
     board.sim.reset();
@@ -301,13 +324,13 @@ describe('AVR: chip UART bridge after recompile, Stop/Run and Reset', () => {
     expect(chipHeard('uart1')).toBe('ready\nready\n');
   });
 
-  it.fails(`${IDS}: after Reset (reset plus re-attach) the chip still hears the sketch`, async () => {
+  it(`${IDS}: after Reset (reset plus re-attach) the chip still hears the sketch`, async () => {
     const { board, detach } = await firstRun();
     // resetBoard: sim.reset() and a hexEpoch bump, so the part re-attaches.
     board.sim.reset();
     detach();
     board.sim.setPinState(2, true);
-    await attachChip(board.sim, 'uart1', 'uart-probe', UART_PINS, UART_WIRES);
+    await attachUartChip(board, 'uart1');
     board.clear();
     runMs(board.sim, 20);
     expect(board.out()).toContain('ready\n');
@@ -315,25 +338,29 @@ describe('AVR: chip UART bridge after recompile, Stop/Run and Reset', () => {
   });
 });
 
-// ── 2. AVR chip-to-board RX FIFO ────────────────────────────────────────────
+// ── 2. AVR chip-to-board RX pacing ──────────────────────────────────────────
 //
 // Same wiring, D2 LOW: the sketch sends 'G', the chip answers with 96 bytes
 // ("0123456789" repeated, 100 ms of line at 9600 baud), the sketch counts what
 // it receives and reports "n=<count> f=<first byte>" 300 ms after boot. These
 // run the real AVRSimulator.start() frame loop on fake rAF/timers/performance,
-// so the FIFO drainer interleaves with the CPU frames as it does in a browser.
+// so what paces the bytes into the USART (its own character time, on the
+// guest clock, from the port) is what a browser sees too, and never a wall
+// clock timer.
 
-describe('AVR: chip-to-board UART FIFO pacing and lifetime', () => {
+describe('AVR: chip-to-board UART pacing and lifetime', () => {
   const ID = 'avr-rx-queue-stale-and-throttled';
+  afterEach(leaveCanvas);
 
+  /** The sketch's report, once its line is complete (a poll between frames can catch a half-printed number). */
   function report(out: string): { n: number; f: number } | null {
-    const m = /n=(\d+) f=(-?\d+)/.exec(out);
+    const m = /n=(\d+) f=(-?\d+)\n/.exec(out);
     return m ? { n: Number(m[1]), f: Number(m[2]) } : null;
   }
 
   async function burstRun(ms: number) {
-    const board = uno(HEX.uartPing);
-    await attachChip(board.sim, 'uart2', 'uart-probe', UART_PINS, UART_WIRES);
+    const board = unoOnCanvas(HEX.uartPing);
+    await attachUartChip(board, 'uart2');
     vi.useFakeTimers({ toFake: [...FAKE_CLOCK] });
     board.sim.start();
     vi.advanceTimersByTime(ms);
@@ -350,7 +377,7 @@ describe('AVR: chip-to-board UART FIFO pacing and lifetime', () => {
     expect(r!.f).toBe('0'.charCodeAt(0));
   });
 
-  it.fails(`${ID}: a 96-byte answer at 9600 baud reaches the sketch within 300 ms of guest time`, async () => {
+  it(`${ID}: a 96-byte answer at 9600 baud reaches the sketch within 300 ms of guest time`, async () => {
     const board = await burstRun(400);
     board.sim.stop();
     expect(report(board.out())).toEqual({ n: 96, f: '0'.charCodeAt(0) });
@@ -372,7 +399,7 @@ describe('AVR: chip-to-board UART FIFO pacing and lifetime', () => {
     expect(report(board.out())).not.toBeNull();
   });
 
-  it.fails(`${ID}: after Stop, the next Run does not receive bytes the previous run never read`, async () => {
+  it(`${ID}: after Stop, the next Run does not receive bytes the previous run never read`, async () => {
     const board = await burstRun(32);
     board.sim.reset(); // Stop: on hardware, the power is cut and the line empties
     board.sim.setPinState(2, true);

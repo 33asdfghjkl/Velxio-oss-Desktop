@@ -67,6 +67,15 @@
  * `<bus>` picks the port, and the fabric answers from the targets whose SDA is
  * on that controller's net. The backend relay is told which addresses exist on
  * which bus from the same placement ({@link busTopology}).
+ *
+ * UART (F6) too: the header UART (UART0, the PL011 behind /dev/serial0) is one
+ * port on GPIO14/15. What the board transmits reaches it from either engine
+ * (the guest through `RaspberryPi3Bridge.onUartTxBytes`, the in-browser one
+ * through {@link headerUartTx}) and the fabric hands it to every part whose RX
+ * is wired to GPIO14; what such a part answers enters the port and goes to
+ * whichever engine is running ({@link sendSerialBytes}). Until F6 the board's
+ * outgoing bytes bypassed the parts entirely (velxio #358): a module that only
+ * speaks when spoken to never heard the question.
  */
 
 import type { PinManager } from './PinManager';
@@ -89,6 +98,9 @@ import type {
   SpiControllerPort,
   SpiMode,
   SpiRouting,
+  UartConfig,
+  UartControllerPort,
+  UartRouting,
 } from './buses/types';
 import { boardPinsFromPinManager } from './buses/boardPins';
 
@@ -367,6 +379,75 @@ class PiI2cPort implements I2cControllerPort {
   }
 }
 
+/**
+ * The header UART as the bus fabric sees it (project board-buses-2026-09,
+ * F6): UART0, the PL011 the guest image puts behind /dev/serial0 on
+ * GPIO14 (TXD) and GPIO15 (RXD), fixed by the board's pin table. Created
+ * once with the shim, like the SPI and I2C ports, and fed by whichever
+ * engine runs the script: the Linux guest's bytes arrive raw from the
+ * bridge, the in-browser engine's from PiBridgeShim.headerUartTx. A byte a
+ * part answers is queued and leaves for the engine per task, so a modem's
+ * "OK\r\n" is one relay frame and not four.
+ *
+ * The rate is not reported: a tty's termios never reaches the tab, and the
+ * in-browser engine's serial shim ignores the baudrate it is given, so the
+ * port says nothing rather than a guess. A part that declares its own rate
+ * is delivered to as-is.
+ */
+class PiUartPort implements UartControllerPort {
+  readonly bus = 'uart' as const;
+  readonly unit = 0;
+  readonly name = 'UART0 (PL011)';
+  private handler: ((byte: number) => void) | null = null;
+  private readonly send: (bytes: number[]) => void;
+  private pending: number[] = [];
+  private flushQueued = false;
+
+  constructor(send: (bytes: number[]) => void) {
+    this.send = send;
+  }
+
+  setTxHandler(handler: ((byte: number) => void) | null): void {
+    this.handler = handler;
+  }
+
+  /** Whether the fabric holds this port right now (tests, inspector). */
+  get bound(): boolean {
+    return this.handler !== null;
+  }
+
+  receive(byte: number): void {
+    this.pending.push(byte & 0xff);
+    if (this.flushQueued) return;
+    this.flushQueued = true;
+    queueMicrotask(() => this.flush());
+  }
+
+  /** Hand the engine what receive() queued, now. */
+  flush(): void {
+    this.flushQueued = false;
+    if (this.pending.length === 0) return;
+    const out = this.pending;
+    this.pending = [];
+    this.send(out);
+  }
+
+  config(): UartConfig {
+    return {};
+  }
+
+  routing(): UartRouting | 'static' {
+    return 'static';
+  }
+
+  /** Bytes the board wrote to the header UART, in order. */
+  transmitted(bytes: ArrayLike<number>): void {
+    const handler = this.handler;
+    if (!handler) return;
+    for (let i = 0; i < bytes.length; i++) handler(bytes[i] & 0xff);
+  }
+}
+
 /** Hardware PWM channels of `pwmchip0` on the 40-pin header. */
 const PWM_CHANNEL_PINS: Record<number, number> = { 0: 18, 1: 19 };
 
@@ -417,19 +498,6 @@ export class PiBridgeShim {
   readonly boardId: string;
   readonly boardKind: string;
   pinManager: PinManager;
-  /**
-   * One character the board just put on its HEADER UART, for the parts wired
-   * to it. Fed by {@link noteHeaderUartTxTemporary} and by nothing else.
-   *
-   * The slot carries the rp2040 name because `detectSimulatorKind` files this
-   * shim as rp2040 (it has `addI2CDevice` and `setSPIHandler`), so
-   * `ensureUartBridge` wraps exactly this one to fan bytes out to the UART
-   * parts. It is not the serial monitor: the Pi's console is fed from
-   * `RaspberryPi3Bridge.onSerialData`, which the store wires separately, so
-   * unlike the ESP32 and STM32 shims nothing ever assigns this property and
-   * the parts are its only consumer.
-   */
-  onSerialData: ((ch: string) => void) | null = null;
   onPinChangeWithTime: ((pin: number, state: boolean, timeMs: number) => void) | null = null;
   private _instantAdapter: PiInstantAdapter | null = null;
   /**
@@ -475,6 +543,8 @@ export class PiBridgeShim {
   private readonly spiPorts: PiSpiPort[];
   /** I2C0 and I2C1, by unit: the fabric's view of this board's I2C. */
   private readonly i2cPorts: PiI2cPort[];
+  /** UART0, the header UART: the fabric's view of this board's UART. */
+  private readonly uartPort: PiUartPort;
   private readonly busBinding: EngineBinding;
   /** Set while a fabric holds this board's binding (the store binds every board). */
   private resetHandler: (() => void) | null = null;
@@ -504,19 +574,23 @@ export class PiBridgeShim {
     // each port finds its pads in the board's pin function table.
     this.spiPorts = SPI_UNITS.map((unit) => new PiSpiPort(unit, opts.boardKind, unit === 0));
     this.i2cPorts = I2C_UNITS.map((unit) => new PiI2cPort(unit, opts.boardKind));
+    // What a part answers goes to whichever engine runs the script, through
+    // the same seam a peer board's bytes take.
+    this.uartPort = new PiUartPort((bytes) => this.sendSerialBytes(bytes));
     this.busBinding = {
       // A device answering on a GPIO (a bit-banged MISO) is a part driving
       // an input, exactly what setPinState carries to either engine.
       pins: boardPinsFromPinManager(this.pinManager, (pin, level) => this.setPinState(pin, level)),
       spi: this.spiPorts,
       i2c: this.i2cPorts,
+      uart: [this.uartPort],
       setResetHandler: (handler) => {
         this.resetHandler = handler;
       },
     };
-    // The header-UART tap is what lets a part wired to the Pi hear the board
-    // (velxio #358). Temporary by name: F6 replaces it with the UART fabric.
-    this.tapHeaderUartTx();
+    // The Linux guest's header-UART bytes, raw, into the port. Its own slot
+    // on the bridge: Interconnect chains the text one for the peer boards.
+    this.bridge.onUartTxBytes = (bytes) => this.uartPort.transmitted(bytes);
   }
 
   /** The board as the bus fabric sees it: the same object, and the same ports, for the board's life. */
@@ -952,66 +1026,14 @@ export class PiBridgeShim {
 
   // ── Header UART: what the board TRANSMITS ──────────────────────────────
   /**
-   * One chunk the board just wrote to its header UART, handed on to the
-   * parts wired to it.
-   *
-   * Until this existed the shim's whole UART surface was the RX direction
-   * below, and the board's outgoing bytes never passed through it in either
-   * engine: they went straight to the cross-board fan-out (Interconnect's
-   * `serialFanout`), which only ever reaches other BOARDS. So a part could
-   * talk to the Pi and the Pi could talk to a peer board, but a module that
-   * only answers when spoken to never heard the question. The two GPS bricks
-   * were the exception, and only because a GPS never listens: it just pushes
-   * NMEA.
-   *
-   * Both engines end here and nowhere else: the Linux guest through the
-   * bridge's `onUartTx` ({@link tapHeaderUartTx}), the in-browser engine
-   * through `feedBoardSerialOut`, which Interconnect hands on. Neither
-   * fan-out is rerouted, so board-to-board forwarding is untouched.
-   *
-   * TEMPORARY, and the name says so on purpose. board-buses-2026-09 phase F6
-   * replaces every per-engine UART hook with membership derived from the TX
-   * and RX nets, and deletes `ensureUartBridge` and its kind switch outright.
-   * When that lands, this method and both of its callers go with it. It is
-   * named this way so that project can find every caller without grepping for
-   * who else might depend on it: the answer is nobody outside this file and
-   * Interconnect.
+   * Bytes the board wrote to its header UART from an engine running the
+   * script in this tab. They enter the board's UART port and the fabric
+   * hands them to every part whose RX is on GPIO14. The Linux guest's bytes
+   * take the bridge's `onUartTxBytes` into the same port; the cross-board
+   * fan-out (Interconnect) is a separate path and is not served here.
    */
-  noteHeaderUartTxTemporary(text: string): void {
-    const sink = this.onSerialData;
-    if (!sink || !text) return;
-    for (const ch of text) sink(ch);
-  }
-
-  /**
-   * Chain onto the bridge's TX callback instead of owning it. Interconnect
-   * takes the same slot for the board-to-board wires and chains whatever it
-   * finds there (its `__icUartHook` branch), so whichever installs first the
-   * other still runs and each byte is delivered once on each path.
-   */
-  private tapHeaderUartTx(): void {
-    const bridge = this.bridge as unknown as { onUartTx?: ((text: string) => void) | null };
-    // Only tap a bridge that DECLARES the slot. Interconnect decides between
-    // the header UART and the console with the same `'onUartTx' in bridge`
-    // test, so creating the property on a bridge that has no header UART
-    // would move it off the console fallback and mute a wired peer board.
-    // RaspberryPi3Bridge declares it; the reduced doubles the suites use for
-    // other boards do not, and they are the ones that fallback is for.
-    if (!('onUartTx' in bridge)) return;
-    // Wrap once. Today a second wrap cannot happen (the store makes one shim
-    // per board and hands it a freshly constructed bridge), but the failure
-    // mode if that ever changes is silent doubling of every byte, which is
-    // far harder to notice than silence: an AT modem would see "ATAT". The
-    // marker is the same one Interconnect uses on the same object for the
-    // same reason.
-    const marked = bridge as unknown as { __piHeaderUartTap?: boolean };
-    if (marked.__piHeaderUartTap) return;
-    marked.__piHeaderUartTap = true;
-    const previous = bridge.onUartTx ?? null;
-    bridge.onUartTx = (text: string) => {
-      previous?.(text);
-      this.noteHeaderUartTxTemporary(text);
-    };
+  headerUartTx(bytes: ArrayLike<number>): void {
+    this.uartPort.transmitted(bytes);
   }
 
   // ── Header UART: what the board RECEIVES ───────────────────────────────
@@ -1024,10 +1046,9 @@ export class PiBridgeShim {
     }
     (this.bridge as Partial<RaspberryPi3Bridge>).sendUartBytes?.(bytes);
   }
-  /** One byte, the RP2040 name: the OSS custom-chip bridge (avrUartTx)
-   *  routes a browser-hosted chip's vx_uart_write through `serialWriteByte`
-   *  on an rp2040-kind simulator, which this shim is. Without it the board
-   *  heard the chip (onSerialData) but the chip's replies went nowhere. */
+  /** One byte, the RP2040 name: the monitor's byte seam, and the one the
+   *  custom-chip host fingerprints the RP family by (detectSimulatorKind).
+   *  A part on the fabric answers through the UART port, not through this. */
   serialWriteByte(byte: number): void {
     this.sendSerialBytes([byte & 0xff]);
   }

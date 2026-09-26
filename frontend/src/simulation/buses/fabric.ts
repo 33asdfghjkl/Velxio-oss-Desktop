@@ -15,21 +15,35 @@
  * I2C is the same shape keyed by the SDA net: a controller feeds the bus its
  * SDA is routed to, and a software decoder watches the bus's SDA and SCL. Wire
  * and Wire1 are two buses exactly when their pins are two nets.
+ *
+ * UART has no bus, only wires: one net per board pin, with whoever transmits
+ * onto it and whoever listens. A controller's TX feeds the net its TX pin is
+ * routed to and its RX takes bytes from the net its RX pin is on; an endpoint
+ * leg lands on the net of its own pin. A net with listeners and no controller
+ * TX is a wire the MCU bit-bangs, decoded on the guest's clock; a net with
+ * drivers and no controller RX is a wire the MCU reads as a GPIO, and bytes go
+ * out on it as timed edges.
  */
 
 import { I2cBus } from './i2cBus';
 import { controllerOf } from './pinFunctions';
 import { SoftI2cDecoder } from './softI2c';
 import { SoftSpiDecoder } from './softSpi';
+import { SoftUartDecoder, SoftUartEmitter } from './softUart';
 import { SpiBus, type DiagnosticSink } from './spiBus';
 import type {
   BoardPins,
   EngineBinding,
+  GuestClock,
   I2cControllerPort,
   I2cRouting,
   SpiControllerPort,
   SpiRouting,
+  UartControllerPort,
+  UartEndpoint,
+  UartRouting,
 } from './types';
+import { listenerKey, UartNet, type UartControllerRef, type UartMember } from './uartBus';
 
 interface PortSlot {
   port: SpiControllerPort;
@@ -47,6 +61,13 @@ interface I2cSlot {
   scl?: number;
 }
 
+interface UartSlot {
+  port: UartControllerPort;
+  ref: UartControllerRef;
+  tx?: number;
+  rx?: number;
+}
+
 const firstPin = (v: number | number[] | undefined): number | undefined =>
   Array.isArray(v) ? v[0] : v;
 
@@ -57,6 +78,11 @@ export class BoardBusFabric {
   readonly i2cBuses = new Map<number, I2cBus>();
   private readonly i2cDecoders = new Map<number, SoftI2cDecoder>();
   private i2cSlots: I2cSlot[] = [];
+  readonly uartNets = new Map<number, UartNet>();
+  /** Software decoders per pin, one per (baud, frame) its listeners use. */
+  private readonly uartDecoders = new Map<number, Map<string, SoftUartDecoder>>();
+  private readonly uartEmitters = new Map<number, SoftUartEmitter>();
+  private uartSlots: UartSlot[] = [];
   private binding: EngineBinding | null = null;
   /** Pin level forced by a controller's hardware chip select (true = high). */
   private readonly hwLevel = new Map<number, boolean>();
@@ -68,23 +94,28 @@ export class BoardBusFabric {
   private readonly kind: () => string | undefined;
   private readonly report: DiagnosticSink;
   private readonly i2cChanged: () => void;
+  private readonly uartChanged: () => void;
 
   /**
    * `onI2cChange` hears every change that can move what a remote worker must
    * be told about this board's I2C: a target on or off a bus, a clock line
    * decided again, a controller bound or rerouted. It may fire more often than
-   * the published map really changes; the listener compares.
+   * the published map really changes; the listener compares. `onUartChange`
+   * is the same for the UART map (an endpoint on or off a net, a controller
+   * bound or rerouted).
    */
   constructor(
     boardId: string,
     kind: () => string | undefined,
     report: DiagnosticSink,
     onI2cChange?: () => void,
+    onUartChange?: () => void,
   ) {
     this.boardId = boardId;
     this.kind = kind;
     this.report = report;
     this.i2cChanged = onI2cChange ?? (() => {});
+    this.uartChanged = onUartChange ?? (() => {});
   }
 
   get pins(): BoardPins | null {
@@ -93,6 +124,11 @@ export class BoardBusFabric {
 
   get bound(): boolean {
     return this.binding !== null;
+  }
+
+  /** The guest's clock, when the engine offers one (the software UART needs it). */
+  get clock(): GuestClock | null {
+    return this.binding?.clock ?? null;
   }
 
   // ── Engine binding ────────────────────────────────────────────────────────
@@ -128,6 +164,26 @@ export class BoardBusFabric {
         });
         slot.port.setRoutingChangeHandler?.(() => this.route());
       }
+      this.uartSlots = (binding.uart ?? []).map((port) => {
+        const slot: UartSlot = {
+          port,
+          ref: {
+            unit: port.unit,
+            name: port.name,
+            remote: port.remote === true,
+            config: () => port.config(),
+            receive: (byte) => port.receive(byte),
+          },
+        };
+        // Looked up per byte, like the I2C slot's bus: a controller the
+        // sketch moves to other pins is followed without re-installing.
+        port.setTxHandler((byte) => {
+          const net = slot.tx !== undefined ? this.uartNets.get(slot.tx) : undefined;
+          net?.fromController(slot.ref, byte);
+        });
+        port.setRoutingChangeHandler?.(() => this.route());
+        return slot;
+      });
     }
     this.route();
     // Chip-select watches live on the board's pins, which just changed.
@@ -151,18 +207,30 @@ export class BoardBusFabric {
       slot.port.setTransactionHandler(null);
       slot.port.setRoutingChangeHandler?.(null);
     }
+    for (const slot of this.uartSlots) {
+      slot.port.setTxHandler(null);
+      slot.port.setRoutingChangeHandler?.(null);
+    }
     this.binding?.setResetHandler?.(null);
     this.slots = [];
     this.i2cSlots = [];
+    this.uartSlots = [];
     for (const d of this.decoders.values()) d.dispose();
     this.decoders.clear();
     for (const d of this.i2cDecoders.values()) d.dispose();
     this.i2cDecoders.clear();
+    for (const pin of Array.from(this.uartDecoders.keys())) this.dropUartDecoders(pin);
+    for (const pin of Array.from(this.uartEmitters.keys())) this.dropUartEmitter(pin);
     this.hwLevel.clear();
     for (const bus of this.spiBuses.values()) bus.controller = null;
     for (const bus of this.i2cBuses.values()) {
       bus.controllerName = null;
       bus.controllerRemote = false;
+    }
+    for (const net of this.uartNets.values()) {
+      net.controllerTx = null;
+      net.controllerRx = null;
+      net.emit = null;
     }
   }
 
@@ -171,6 +239,7 @@ export class BoardBusFabric {
     this.binding = null;
     this.spiBuses.clear();
     this.i2cBuses.clear();
+    this.uartNets.clear();
     this.hwWatchers.clear();
     this.resetListeners.clear();
     this.bindListeners.clear();
@@ -296,6 +365,203 @@ export class BoardBusFabric {
     }
   }
 
+  // ── UART nets ─────────────────────────────────────────────────────────────
+
+  /** The UART net on this board pin, created on first use. */
+  uartNetFor(pin: number): UartNet {
+    let net = this.uartNets.get(pin);
+    if (!net) {
+      net = new UartNet(this.boardId, pin, this.report);
+      this.uartNets.set(pin, net);
+      this.routeUart();
+    }
+    return net;
+  }
+
+  /**
+   * The registry put a leg on `net` or took one off: the wire may now need
+   * a decoder or an emitter, or neither, and an empty net goes away.
+   */
+  uartMembershipChanged(net: UartNet): void {
+    if (this.uartNets.get(net.pin) !== net) return;
+    if (net.size === 0) {
+      this.uartNets.delete(net.pin);
+      this.dropUartDecoders(net.pin);
+      this.dropUartEmitter(net.pin);
+      this.uartChanged();
+      return;
+    }
+    this.refreshUart(net);
+    this.uartChanged();
+  }
+
+  /**
+   * Give the net what its members need from the board itself. A wire with
+   * listeners and no controller transmitting on it is one the MCU bit-bangs:
+   * a decoder per rate its listeners use. A wire with drivers and no
+   * controller listening is one the MCU reads as a GPIO: an emitter. Both
+   * need the guest's clock; a board without one says so per endpoint rather
+   * than staying silent.
+   */
+  private refreshUart(net: UartNet): void {
+    const pins = this.pins;
+    const clock = this.clock;
+    const pin = net.pin;
+    const soft = (m: UartMember): boolean => {
+      // No engine bound (the board is between simulators): nothing can serve
+      // the wire and there is nothing to say, as for SPI and I2C; the next
+      // bind decides. The diagnostic below is for an engine that IS here and
+      // cannot time its pads.
+      if (!pins) return false;
+      if (!clock) {
+        this.report({
+          code: 'uart-no-clock',
+          bus: 'uart',
+          boardId: this.boardId,
+          owners: [m.owner],
+          message:
+            `${m.owner} is on pin ${pin}, a plain GPIO of this board, and this board's emulator ` +
+            `does not time edges on its pads, so a UART on plain GPIOs (SoftwareSerial) cannot ` +
+            `be followed here. Wire the module to a hardware UART pin.`,
+        });
+        return false;
+      }
+      if (m.baud === undefined) {
+        this.report({
+          code: 'uart-no-baud',
+          bus: 'uart',
+          boardId: this.boardId,
+          owners: [m.owner],
+          message:
+            `${m.owner} is on pin ${pin}, a plain GPIO, but declares no baud rate, and a bit time ` +
+            `needs one; on a plain GPIO it neither hears nor is heard. Wire it to a hardware UART ` +
+            `pin, or give the part a rate.`,
+        });
+        return false;
+      }
+      return true;
+    };
+    // Decoders: the MCU may bit-bang this wire only if no controller drives it.
+    const wanted = new Map<string, UartMember>();
+    if (net.controllerTx === null) {
+      for (const m of net.listeners.values()) if (soft(m)) wanted.set(listenerKey(m), m);
+    }
+    let decoders = this.uartDecoders.get(pin);
+    if (decoders) {
+      for (const [key, d] of Array.from(decoders)) {
+        if (wanted.has(key)) continue;
+        d.dispose();
+        decoders.delete(key);
+      }
+    }
+    if (wanted.size > 0 && pins && clock) {
+      if (!decoders) this.uartDecoders.set(pin, (decoders = new Map()));
+      for (const [key, m] of wanted) {
+        if (decoders.has(key)) continue;
+        decoders.set(
+          key,
+          new SoftUartDecoder(pins, clock, pin, m.baud!, m.spec, (byte, errors) =>
+            net.fromWire(key, byte, errors),
+          ),
+        );
+      }
+    }
+    if (decoders && decoders.size === 0) this.uartDecoders.delete(pin);
+    // Emitter: an endpoint's bytes go out as edges only if no controller reads them.
+    let wantEmitter = false;
+    if (net.controllerRx === null) {
+      for (const m of net.drivers.values()) if (soft(m)) wantEmitter = true;
+    }
+    if (wantEmitter && pins && clock) {
+      let emitter = this.uartEmitters.get(pin);
+      if (!emitter) {
+        emitter = new SoftUartEmitter(pins, clock, pin);
+        this.uartEmitters.set(pin, emitter);
+        emitter.rest();
+      }
+      const e = emitter;
+      net.emit = (byte, baud, spec) => e.emit(byte, baud, spec);
+    } else {
+      this.dropUartEmitter(pin);
+      net.emit = null;
+    }
+    // The emitter's own edges come back as pin changes on engines that echo
+    // an injected input; a decoder on the same wire must not read them.
+    const emitter = this.uartEmitters.get(pin);
+    for (const d of this.uartDecoders.get(pin)?.values() ?? []) {
+      d.mutedUntil = emitter ? () => emitter.busyUntil : () => 0;
+    }
+    net.checkDrivers();
+    net.checkListeners();
+  }
+
+  private dropUartDecoders(pin: number): void {
+    for (const d of this.uartDecoders.get(pin)?.values() ?? []) d.dispose();
+    this.uartDecoders.delete(pin);
+  }
+
+  private dropUartEmitter(pin: number): void {
+    this.uartEmitters.delete(pin);
+  }
+
+  private uartRoutingOf(slot: UartSlot): void {
+    const r: UartRouting | 'static' = slot.port.routing();
+    if (r === 'static') {
+      const kind = this.kind();
+      const def = kind ? controllerOf(kind, 'uart', slot.port.unit) : undefined;
+      slot.tx = firstPin(def?.defaultPins.tx);
+      slot.rx = firstPin(def?.defaultPins.rx);
+    } else {
+      slot.tx = r.tx;
+      slot.rx = r.rx;
+    }
+  }
+
+  /** Point every UART controller at the nets its TX and RX pins are on. */
+  private routeUart(): void {
+    for (const net of this.uartNets.values()) {
+      net.controllerTx = null;
+      net.controllerRx = null;
+    }
+    for (const slot of this.uartSlots) {
+      this.uartRoutingOf(slot);
+      const txNet = slot.tx !== undefined ? this.uartNets.get(slot.tx) : undefined;
+      if (txNet) {
+        if (txNet.controllerTx) {
+          this.report({
+            code: 'uart-wiring',
+            bus: 'uart',
+            boardId: this.boardId,
+            owners: [],
+            message: `${txNet.controllerTx.name} and ${slot.port.name} are both routed to TX pin ${txNet.pin}.`,
+          });
+        }
+        txNet.controllerTx = slot.ref;
+      }
+      const rxNet = slot.rx !== undefined ? this.uartNets.get(slot.rx) : undefined;
+      // Two controllers listening on one pin is one TX to two RX: legal.
+      if (rxNet) rxNet.controllerRx = slot.ref;
+    }
+    for (const net of this.uartNets.values()) this.refreshUart(net);
+    this.uartChanged();
+  }
+
+  /**
+   * The controller whose TX feeds `pin` and the one whose RX reads it, for
+   * the bus map a remote worker is sent and for the inspector.
+   */
+  uartControllersOf(pin: number): { tx: UartControllerRef | null; rx: UartControllerRef | null } {
+    const net = this.uartNets.get(pin);
+    if (net) return { tx: net.controllerTx, rx: net.controllerRx };
+    let tx: UartControllerRef | null = null;
+    let rx: UartControllerRef | null = null;
+    for (const slot of this.uartSlots) {
+      if (slot.tx === pin && !tx) tx = slot.ref;
+      if (slot.rx === pin) rx = slot.ref;
+    }
+    return { tx, rx };
+  }
+
   // ── Controller routing ────────────────────────────────────────────────────
 
   private routingOf(slot: PortSlot): void {
@@ -350,6 +616,7 @@ export class BoardBusFabric {
       bus.reportRemoteGaps();
     }
     this.routeI2c();
+    this.routeUart();
   }
 
   private i2cRoutingOf(slot: I2cSlot): void {
@@ -542,6 +809,19 @@ export class BoardBusFabric {
     for (const bus of this.spiBuses.values()) bus.boardReset();
     for (const d of this.i2cDecoders.values()) d.restart();
     for (const bus of this.i2cBuses.values()) bus.boardReset();
+    for (const decoders of this.uartDecoders.values()) for (const d of decoders.values()) d.restart();
+    for (const e of this.uartEmitters.values()) e.reset();
+    // Once per endpoint, not per leg: a modem with both legs here is one chip.
+    const told = new Set<UartEndpoint>();
+    for (const net of this.uartNets.values()) {
+      for (const list of [net.listeners, net.drivers]) {
+        for (const m of list.values()) {
+          if (told.has(m.endpoint)) continue;
+          told.add(m.endpoint);
+          m.endpoint.boardReset?.();
+        }
+      }
+    }
     for (const cb of this.resetListeners) cb();
   }
 }

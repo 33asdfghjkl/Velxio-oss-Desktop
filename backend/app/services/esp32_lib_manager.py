@@ -151,6 +151,15 @@ class _UartBuffer:
 
     def feed(self, byte_val: int) -> str | None:
         """Add one byte. Returns decoded string when a flush occurs, else None."""
+        raw = self.feed_raw(byte_val)
+        return raw.decode('utf-8', errors='replace') if raw is not None else None
+
+    def feed_raw(self, byte_val: int) -> bytes | None:
+        """Add one byte. Returns the bytes of the chunk when a flush occurs,
+        else None. The chunk travels to the tab both decoded (the monitor) and
+        raw (`b64`, for the UART parts on the canvas: a byte >= 0x80 does not
+        survive a UTF-8 decode, and a framed reply with a 0xAA sync word is
+        exactly that; project board-buses-2026-09, F6)."""
         with self._lock:
             self._buf.append(byte_val)
             # Flush on newline, carriage return, period, EOT, or max size.
@@ -163,9 +172,9 @@ class _UartBuffer:
             # the uploader started waiting for the board instead of pasting
             # blind (see frontend simulation/micropythonSession.ts).
             if byte_val in (ord('\n'), ord('\r'), ord('.'), 0x04) or len(self._buf) >= self.flush_size:
-                text = self._buf.decode('utf-8', errors='replace')
+                raw = bytes(self._buf)
                 self._buf.clear()
-                return text
+                return raw
         return None
 
     def flush(self) -> str | None:
@@ -667,10 +676,12 @@ class EspLibManager:
                     byte_val = event.get('byte', 0)
                     buf = inst.uart_bufs.get(uart_id)
                     if buf:
-                        text = buf.feed(byte_val)
-                        if text:
+                        raw = buf.feed_raw(byte_val)
+                        if raw:
+                            text = raw.decode('utf-8', errors='replace')
                             self._dispatch(inst, 'serial_output', {
                                 'data': text, 'uart': uart_id,
+                                'b64': base64.b64encode(raw).decode('ascii'),
                             })
                             # Parse WiFi/BLE status from UART0 output
                             if uart_id == 0 and inst.wifi_enabled:

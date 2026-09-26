@@ -217,6 +217,15 @@ export class Esp32Bridge {
 
   // Callbacks wired up by useSimulatorStore
   onSerialData: ((char: string, uart?: number) => void) | null = null;
+  /**
+   * The bytes the guest transmitted on a UART, as they were on the pin, for
+   * the fabric's UART port of this board (project board-buses-2026-09, F6):
+   * the raw chunk when the backend relays it (`b64`), else the text's char
+   * codes, which is all an older backend gives. Separate from onSerialData,
+   * which is the monitor's, so a part wired to Serial2 never depends on what
+   * the console chose to show.
+   */
+  onUartTxBytes: ((uart: number, bytes: Uint8Array) => void) | null = null;
   onPinChange: ((gpioPin: number, state: boolean) => void) | null = null;
   /**
    * Timestamped version of onPinChange — wired to the oscilloscope so the
@@ -514,6 +523,14 @@ export class Esp32Bridge {
           // a MicroPython upload filters its own protocol out (see below). The
           // waveform below still gets every byte — they really were on the pin.
           let shown = text;
+          if (this.onUartTxBytes) {
+            const b64 = msg.data.b64;
+            const raw =
+              typeof b64 === 'string'
+                ? Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0))
+                : Uint8Array.from(text, (ch) => ch.charCodeAt(0) & 0xff);
+            this.onUartTxBytes(uart ?? 0, raw);
+          }
           // Synthesize the per-byte UART waveform on the TX GPIO so the
           // oscilloscope shows a real frame, matching how a real ESP32
           // drives the pin.  Falls back to UART0 when no uart index is
@@ -997,11 +1014,15 @@ export class Esp32Bridge {
    * for a byte the guest had already clocked: the worker applied it to
    * whatever byte it happened to be clocking when it arrived.
    */
-  sendBusMap(spi: unknown[], i2c?: unknown[]): void {
+  sendBusMap(spi: unknown[], i2c?: unknown[], uart?: unknown[]): void {
     this._busMap = spi;
     if (i2c) this._busMapI2c = i2c;
+    if (uart) this._busMapUart = uart;
     if (this._connected) {
-      this._send({ type: 'esp32_bus_map', data: i2c ? { spi, i2c } : { spi } });
+      this._send({
+        type: 'esp32_bus_map',
+        data: { spi, ...(i2c ? { i2c } : {}), ...(uart ? { uart } : {}) },
+      });
     }
   }
 
@@ -1018,28 +1039,47 @@ export class Esp32Bridge {
   }
 
   /**
+   * The UART half alone (project board-buses-2026-09, F6): which controller
+   * each UART endpoint's legs are wired to, and which endpoints are on no
+   * wire of this board. Sent by itself when only UART membership changed,
+   * for the same reason as the I2C half.
+   */
+  sendUartBusMap(uart: unknown[]): void {
+    this._busMapUart = uart;
+    if (this._connected) this._send({ type: 'esp32_bus_map', data: { uart } });
+  }
+
+  /**
    * Asked when the start config is built, for the I2C half as the fabric has
    * it NOW. The map is otherwise pushed on membership changes, and one may
    * never have happened before the first Run. An `on` name on purpose: the
    * overlay's delegating bridge forwards every `on*` field to the bridge it
    * builds per Run, so the question reaches the one that opens the socket.
    */
-  onBusMapRequest: (() => { i2c?: unknown[] } | null) | null = null;
+  onBusMapRequest: (() => { i2c?: unknown[]; uart?: unknown[] } | null) | null = null;
 
   /** The last map, replayed after a reconnect: the worker starts empty. */
   private _busMap: unknown[] = [];
   /** The last I2C half, or null when none was ever given (a worker then keeps
    *  every I2C target on every controller, as before F5). */
   private _busMapI2c: unknown[] | null = null;
+  /** The last UART half, or null when none was ever given (a worker then
+   *  leaves every chip on the UART its own record named, as before F6). */
+  private _busMapUart: unknown[] | null = null;
 
-  private startBusMap(): { spi: unknown[]; i2c?: unknown[] } {
+  private startBusMap(): { spi: unknown[]; i2c?: unknown[]; uart?: unknown[] } {
     try {
       const fresh = this.onBusMapRequest?.();
       if (fresh?.i2c) this._busMapI2c = fresh.i2c;
+      if (fresh?.uart) this._busMapUart = fresh.uart;
     } catch (e) {
-      console.warn(`[Esp32Bridge:${this.boardId}] the I2C map could not be built`, e);
+      console.warn(`[Esp32Bridge:${this.boardId}] the I2C and UART maps could not be built`, e);
     }
-    return this._busMapI2c ? { spi: this._busMap, i2c: this._busMapI2c } : { spi: this._busMap };
+    return {
+      spi: this._busMap,
+      ...(this._busMapI2c ? { i2c: this._busMapI2c } : {}),
+      ...(this._busMapUart ? { uart: this._busMapUart } : {}),
+    };
   }
 
   /**

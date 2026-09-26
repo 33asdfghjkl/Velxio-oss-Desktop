@@ -55,8 +55,7 @@ import { PartSimulationRegistry } from '../../simulation/parts/PartSimulationReg
 import '../../simulation/parts';
 import { traceDetailed } from '../../simulation/PinTrace';
 import { buildFat16Image } from '../../utils/fatImage';
-import { ensureUartBridge, getSimulatorBridges } from '../../simulation/customChips/simulatorBridges';
-import { busRegistry } from '../../simulation/buses';
+import { attachUartEndpoint, busRegistry } from '../../simulation/buses';
 
 const fixture = (name: string) =>
   readFileSync(fileURLToPath(new URL(`./fixtures/${name}/${name}.ino.hex`, import.meta.url)), 'utf-8');
@@ -654,17 +653,34 @@ describe('Uno + custom SPI chip + microSD on one bus', () => {
 
 const OLED_HEX = fixture('avr-oled-spi');
 
-/** A UART chip's receive side: what CustomChipPart installs (ensureUartBridge + a listener). */
+/**
+ * A UART chip's receive side: what CustomChipPart registers, an endpoint on
+ * the bus fabric whose RX pad is wired to the board's TX pin (board-buses F6).
+ * The dispatcher it replaced sat on the USART object a reset throws away.
+ */
+const uartTaps: Array<{ dispose(): void }> = [];
+afterEach(() => {
+  for (const h of uartTaps.splice(0)) h.dispose();
+});
+
 function chipUartTap(b: Bench): { heard: () => string } {
   let heard = '';
-  ensureUartBridge(b.sim);
-  getSimulatorBridges(b.sim).uartListeners.add((byte: number) => {
-    heard += String.fromCharCode(byte);
-  });
+  const owner = `${b.id}-uartchip`;
+  b.wire(owner, 'RX', '1');
+  b.wire(owner, 'TX', '0');
+  const handle = attachUartEndpoint(
+    { owner, pins: { rx: 'RX', tx: 'TX' } },
+    {
+      receive: (byte: number) => {
+        heard += String.fromCharCode(byte);
+      },
+    },
+  );
+  uartTaps.push(handle);
   return { heard: () => heard };
 }
 
-describe('Uno: the custom-chip UART dispatcher across Stop/Run', () => {
+describe('Uno: the custom-chip UART endpoint across Stop/Run', () => {
   it('avr-stop-recreates-spi-usart setup: a UART chip hears the sketch Serial on the first Run', () => {
     const b = new Bench('arduino-uno');
     b.load(OLED_HEX);
@@ -676,7 +692,7 @@ describe('Uno: the custom-chip UART dispatcher across Stop/Run', () => {
     expect(tap.heard()).toContain('F:2');
   });
 
-  it.fails('avr-stop-recreates-spi-usart: after Stop then Run the UART chip still hears the sketch Serial', () => {
+  it('avr-stop-recreates-spi-usart: after Stop then Run the UART chip still hears the sketch Serial', () => {
     const b = new Bench('arduino-uno');
     b.load(OLED_HEX);
     const tap = chipUartTap(b);

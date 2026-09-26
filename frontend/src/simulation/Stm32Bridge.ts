@@ -82,6 +82,9 @@ export class Stm32Bridge {
   readonly boardKind: BoardKind;
 
   onSerialData: ((char: string, uart?: number) => void) | null = null;
+  /** The bytes the guest transmitted on a USART, as they were on the pin, for
+   *  the fabric's UART port (F6); see Esp32Bridge.onUartTxBytes. */
+  onUartTxBytes: ((uart: number, bytes: Uint8Array) => void) | null = null;
   /** gpioPin is the linear pin (port*16+pin). */
   onPinChange: ((gpioPin: number, state: boolean) => void) | null = null;
   onPinChangeWithTime: ((gpioPin: number, state: boolean, timeMs: number) => void) | null = null;
@@ -166,6 +169,14 @@ export class Stm32Bridge {
         case 'serial_output': {
           const text = (msg.data.data as string) ?? '';
           const uart = msg.data.uart as number | undefined;
+          if (this.onUartTxBytes) {
+            const b64 = msg.data.b64;
+            const raw =
+              typeof b64 === 'string'
+                ? Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0))
+                : Uint8Array.from(text, (ch) => ch.charCodeAt(0) & 0xff);
+            this.onUartTxBytes(uart ?? 0, raw);
+          }
           if (this.onSerialData) for (const ch of text) this.onSerialData(ch, uart);
           break;
         }
@@ -382,11 +393,15 @@ export class Stm32Bridge {
    * the user deleted is gone by being absent; the last one is replayed at the
    * next start, because the worker begins with an empty bus.
    */
-  sendBusMap(spi: unknown[], i2c?: unknown[]): void {
+  sendBusMap(spi: unknown[], i2c?: unknown[], uart?: unknown[]): void {
     this._busMap = spi;
     if (i2c) this._busMapI2c = i2c;
+    if (uart) this._busMapUart = uart;
     if (this._connected) {
-      this._send({ type: 'stm32_bus_map', data: i2c ? { spi, i2c } : { spi } });
+      this._send({
+        type: 'stm32_bus_map',
+        data: { spi, ...(i2c ? { i2c } : {}), ...(uart ? { uart } : {}) },
+      });
     }
   }
 
@@ -396,21 +411,33 @@ export class Stm32Bridge {
     if (this._connected) this._send({ type: 'stm32_bus_map', data: { i2c } });
   }
 
-  /** Asked for the I2C half as the fabric has it when the start config is
-   *  built; see Esp32Bridge.onBusMapRequest. */
-  onBusMapRequest: (() => { i2c?: unknown[] } | null) | null = null;
+  /** The UART half alone (F6); see Esp32Bridge.sendUartBusMap. */
+  sendUartBusMap(uart: unknown[]): void {
+    this._busMapUart = uart;
+    if (this._connected) this._send({ type: 'stm32_bus_map', data: { uart } });
+  }
+
+  /** Asked for the I2C and UART halves as the fabric has them when the start
+   *  config is built; see Esp32Bridge.onBusMapRequest. */
+  onBusMapRequest: (() => { i2c?: unknown[]; uart?: unknown[] } | null) | null = null;
 
   private _busMap: unknown[] = [];
   private _busMapI2c: unknown[] | null = null;
+  private _busMapUart: unknown[] | null = null;
 
-  private startBusMap(): { spi: unknown[]; i2c?: unknown[] } {
+  private startBusMap(): { spi: unknown[]; i2c?: unknown[]; uart?: unknown[] } {
     try {
       const fresh = this.onBusMapRequest?.();
       if (fresh?.i2c) this._busMapI2c = fresh.i2c;
+      if (fresh?.uart) this._busMapUart = fresh.uart;
     } catch (e) {
-      console.warn(`[Stm32Bridge:${this.boardId}] the I2C map could not be built`, e);
+      console.warn(`[Stm32Bridge:${this.boardId}] the I2C and UART maps could not be built`, e);
     }
-    return this._busMapI2c ? { spi: this._busMap, i2c: this._busMapI2c } : { spi: this._busMap };
+    return {
+      spi: this._busMap,
+      ...(this._busMapI2c ? { i2c: this._busMapI2c } : {}),
+      ...(this._busMapUart ? { uart: this._busMapUart } : {}),
+    };
   }
 
   /**

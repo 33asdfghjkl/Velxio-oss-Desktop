@@ -8,14 +8,7 @@
  * Arduino pin numbers based on the diagram's wire connections.
  */
 import { PartSimulationRegistry } from './PartSimulationRegistry';
-import {
-  ChipInstance,
-  decodeWasmBase64,
-  ensureUartBridge,
-  getSimulatorBridges,
-  avrUartTx,
-  detectSimulatorKind,
-} from '../customChips';
+import { ChipInstance, decodeWasmBase64, detectSimulatorKind } from '../customChips';
 import { hostsChipsInWorker } from '../customChips/simulatorBridges';
 import { b64ToBytes, inflateZlib, spliceFramebufferRows } from '../customChips/inflateZlib';
 import type { ChipFramebufferFrame } from '../Esp32Bridge';
@@ -29,8 +22,9 @@ import { resolveChipNetMembers, resolveChipOwnerBoardId } from '../customChips/c
 import { classifyPin } from '../../utils/boardProtocols';
 import { requestElectricalResolve } from '../spice/electricalResolveHook';
 import { runChipAttachExtensions } from '../customChips/chipAttachExtensions';
-import { createUartBitBanger, type UartBitBanger } from '../customChips/uartBitBang';
 import { setAdcVoltage, analogRailVolts } from './partUtils';
+import { attachUartEndpoint } from '../buses';
+import type { UartHandle } from '../buses/types';
 
 // Physical-key (KeyboardEvent.code) -> Galaksija keyboard matrix offset, from
 // the libretro Galaksija core's keyMap. The chip's set_key takes this offset;
@@ -338,19 +332,15 @@ PartSimulationRegistry.register('custom-chip', {
     const attrs = new Map<string, number>(Object.entries(attrsObj));
     const strAttrs = new Map<string, string>(Object.entries(strAttrsObj));
 
-    // Lazily install the per-simulator UART bridge. Idempotent — safe to call
-    // even if other custom chips have already wired it up. SPI and I2C need
-    // nothing here: the chip joins the board's buses from vx_spi_attach and
-    // vx_i2c_attach, with the pins of its own config, and a chip that never
-    // calls them stays off those buses entirely.
-    ensureUartBridge(sim);
-    const bridges = getSimulatorBridges(sim);
+    // Nothing to install on the simulator for any bus: the chip joins the
+    // board's SPI and I2C from vx_spi_attach and vx_i2c_attach, with the pins
+    // of its own config, and its UART is put on the bus fabric below by its
+    // own RX and TX pads. A chip that never calls them stays off those buses.
 
     // Async create — wrap so we can dispose even if create is still in-flight
     // when the user stops the simulation.
     let instance: ChipInstance | null = null;
-    let uartListener: ((byte: number) => void) | null = null;
-    let uartBitBanger: UartBitBanger | null = null;
+    let uartHandle: UartHandle | null = null;
     let rafHandle = 0;
     let disposed = false;
     let keyboardCleanup: (() => void) | undefined;
@@ -413,40 +403,37 @@ PartSimulationRegistry.register('custom-chip', {
           wires,
         });
 
-        // Bridge UART: AVR Serial.write(byte) → chip.feedUart(byte).
-        // Chip's vx_uart_write(byte) → the board:
-        //   - TX wired to the hardware RX (pin 0) or unwired → USART inject
-        //     (Serial.read / the monitor), the historical path.
-        //   - TX wired to any other GPIO on an AVR board → bit-banged 8N1 on
-        //     that pin, so SoftwareSerial(rx=that pin) actually receives.
-        //     Before this, GPIO-wired chip streams (the NMEA GPS scenario)
-        //     delivered nothing at all.
+        // UART: the chip is on the bus fabric by its own pads (project
+        // board-buses-2026-09, F6). Its RX pad hears whatever transmits on the
+        // board pin it is wired to and its TX pad drives the wire it is wired
+        // to; the fabric decides from the nets which of the board's UARTs, if
+        // any, is on each, or follows a plain GPIO on the guest's clock
+        // (SoftwareSerial). An unwired pad is on no wire, and there is no
+        // USART0 to fall back to. The rate is the chip's own
+        // (vx_uart_config.baud_rate): what the fabric checks the board's UART
+        // against, and the bit time a pad on a plain GPIO is decoded and
+        // driven at. What stood here hung a dispatcher on the simulator's
+        // USART0 (rebuilt and lost on every reset, deaf to the Mega's other
+        // USARTs) and injected replies into USART0 whatever the wiring.
         //
-        // An ESP32-kind simulator hosting the chip in the browser (an
-        // overlay's in-browser engine) is left to the attach extensions: the
-        // engine publishes its UART bytes on the overlay's own bus, and the
-        // shim's onSerialData is never invoked, so there is nothing here to
-        // listen on. Pure OSS never reaches this branch with kind esp32.
+        // The overlay's in-browser ESP32 engines are left to the attach
+        // extensions, which put the chip on the same fabric from the overlay.
         if (inst.hasUart && detectSimulatorKind(sim) !== 'esp32') {
-          uartListener = (byte: number) => inst.feedUart(byte);
-          bridges.uartListeners.add(uartListener);
+          const pads = inst.getUartPads();
           const route = inst.getUartTxRoute();
-          const gpioTarget =
-            detectSimulatorKind(sim) === 'avr' &&
-            route?.txArduinoPin != null &&
-            !isSyntheticChipPin(route.txArduinoPin) &&
-            route.txArduinoPin !== 0;
-          if (gpioTarget && route) {
-            uartBitBanger = createUartBitBanger(
-              sim as never,
-              route.txArduinoPin as number,
-              route.baud,
-              `chip:${componentId}`,
-            );
-            inst.onUartTx((byte) => uartBitBanger?.write(byte));
-          } else {
-            inst.onUartTx((byte) => avrUartTx(sim, byte));
-          }
+          const handle = attachUartEndpoint(
+            {
+              owner: componentId,
+              pins: {
+                ...(pads?.rxPad ? { rx: pads.rxPad } : {}),
+                ...(pads?.txPad ? { tx: pads.txPad } : {}),
+              },
+              ...(route ? { baud: route.baud } : {}),
+            },
+            { receive: (byte) => inst.feedUart(byte) },
+          );
+          uartHandle = handle;
+          inst.onUartTx((byte) => handle.transmit(byte));
         }
 
         // Bridge framebuffer → chip's web component canvas (when chip has display).
@@ -561,10 +548,9 @@ PartSimulationRegistry.register('custom-chip', {
       if (extensionCleanup) extensionCleanup();
       if (rafHandle) cancelAnimationFrame(rafHandle);
       rafHandle = 0;
-      if (uartListener) bridges.uartListeners.delete(uartListener);
-      if (uartBitBanger) {
-        uartBitBanger.dispose();
-        uartBitBanger = null;
+      if (uartHandle) {
+        uartHandle.dispose();
+        uartHandle = null;
       }
       if (keyboardCleanup) keyboardCleanup();
       if (instance) instance.dispose();

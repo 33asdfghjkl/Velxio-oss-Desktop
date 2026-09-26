@@ -16,8 +16,10 @@ export {
   type I2cMapListener,
   type RemoteSpiMapEntry,
   type RemoteSpiSinksEntry,
+  type RemoteUartMapEntry,
   type SpiAttrsListener,
   type SpiMapListener,
+  type UartMapListener,
 } from './registry';
 export {
   busChipB64,
@@ -34,6 +36,26 @@ export { SpiBus, reverseBits, type SpiMember } from './spiBus';
 export { SoftSpiDecoder } from './softSpi';
 export { I2cBus, type I2cMember } from './i2cBus';
 export { SoftI2cDecoder } from './softI2c';
+export { UartNet, uartMember, listenerKey, type UartMember, type UartControllerRef } from './uartBus';
+export { SoftUartDecoder, SoftUartEmitter } from './softUart';
+export {
+  DEFAULT_UART_FRAME,
+  UartBitDecoder,
+  baudsMatch,
+  frameBitCount,
+  frameBits,
+  frameName,
+  frameTransitions,
+  parseUartFrame,
+  resampleUartFrame,
+  sameFrame,
+  validBaud,
+  type FrameTransition,
+  type UartByteSink,
+  type UartFrameErrors,
+  type UartFrameSpec,
+  type UartParity,
+} from './uartFrame';
 export { createStoreNetResolver, railOf } from './storeResolver';
 export { boardPinsFromPinManager } from './boardPins';
 
@@ -48,6 +70,9 @@ import type {
   I2cTargetDescriptor,
   SpiDevice,
   SpiDeviceDescriptor,
+  UartEndpoint,
+  UartEndpointDescriptor,
+  UartHandle,
 } from './types';
 
 // A model's artifact is fetched, so the map a remote board published on the
@@ -73,4 +98,16 @@ export function attachSpiDevice(desc: SpiDeviceDescriptor, device: SpiDevice): B
  */
 export function attachI2cTarget(desc: I2cTargetDescriptor, target: I2cTarget): BusHandle {
   return busRegistry.attachI2c(desc, target);
+}
+
+/**
+ * Put a UART endpoint on the wires its legs reach. Its RX leg hears whatever
+ * transmits on the board pin it is wired to (a controller's TX, or the MCU
+ * bit-banging that pin), and the handle's transmit() puts a byte on the
+ * wire of its TX leg (into a controller's RX, or as edges on a GPIO the
+ * sketch samples). No default UART: a leg wired to nothing is on no wire.
+ * The handle's dispose() takes both legs off, by identity.
+ */
+export function attachUartEndpoint(desc: UartEndpointDescriptor, endpoint: UartEndpoint): UartHandle {
+  return busRegistry.attachUart(desc, endpoint);
 }

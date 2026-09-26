@@ -40,10 +40,14 @@ import { PinManager } from './PinManager';
 import type {
   BusCapableSimulator,
   EngineBinding,
+  GuestClock,
   SpiControllerConfig,
   SpiControllerPort,
   SpiMode,
   SpiRouting,
+  UartConfig,
+  UartControllerPort,
+  UartRouting,
 } from './buses/types';
 import { ExternalPinScopeFeed } from './externalPinScope';
 import type { LineCapable, LineHostPort, LineSupport } from './line/LineHost';
@@ -507,11 +511,24 @@ const AVR_CPU_HZ = 16_000_000;
  * every interrupt landed in the wrong slot: millis() stopped, Serial and Wire
  * hung, and a transfer-complete restarted the sketch.
  */
+type USARTConfig = typeof usart0Config;
+
+/**
+ * One USART of the chip, with the board pins its TXD/RXD sit on (the scope
+ * draws the frame there) and how it is reached from the rest of the app.
+ */
+interface UsartDef {
+  config: USARTConfig;
+  txPin: number;
+  rxPin: number;
+}
+
 interface AtmegaPeripheralConfigs {
   timer0: AVRTimerConfig;
   timer1: AVRTimerConfig;
   timer2: AVRTimerConfig;
-  usart0: typeof usart0Config;
+  /** USART0 first; the ATmega2560 has USART1..3 after it. */
+  usarts: UsartDef[];
   spi: SPIConfig;
   twi: TWIConfig;
   adc: ADCConfig;
@@ -522,11 +539,58 @@ const ATMEGA328P_PERIPHERALS: AtmegaPeripheralConfigs = {
   timer0: timer0Config,
   timer1: timer1Config,
   timer2: timer2Config,
-  usart0: usart0Config,
+  // PD1 TXD / PD0 RXD: Arduino pins 1 and 0.
+  usarts: [{ config: usart0Config, txPin: 1, rxPin: 0 }],
   spi: spiConfig,
   twi: twiConfig,
   adc: adcConfig,
   eeprom: eepromConfig,
+};
+
+/**
+ * The ATmega2560's USART1..3 (iomxx0_1.h). avr8js ships only usart0Config;
+ * the other three are the same peripheral at their own registers and vectors:
+ *
+ *   USART1_RX _V(36) 0x48  USART1_UDRE _V(37) 0x4A  USART1_TX _V(38) 0x4C
+ *   USART2_RX _V(51) 0x66  USART2_UDRE _V(52) 0x68  USART2_TX _V(53) 0x6A
+ *   USART3_RX _V(54) 0x6C  USART3_UDRE _V(55) 0x6E  USART3_TX _V(56) 0x70
+ *
+ * Without them a sketch's Serial1.begin() wrote into plain SRAM and a module
+ * on TX1/RX1 (18/19) never heard the board (finding
+ * grove-uart-softwareserial-and-mega-uarts).
+ */
+const MEGA_USART1: USARTConfig = {
+  rxCompleteInterrupt: 0x48,
+  dataRegisterEmptyInterrupt: 0x4a,
+  txCompleteInterrupt: 0x4c,
+  UCSRA: 0xc8,
+  UCSRB: 0xc9,
+  UCSRC: 0xca,
+  UBRRL: 0xcc,
+  UBRRH: 0xcd,
+  UDR: 0xce,
+};
+const MEGA_USART2: USARTConfig = {
+  rxCompleteInterrupt: 0x66,
+  dataRegisterEmptyInterrupt: 0x68,
+  txCompleteInterrupt: 0x6a,
+  UCSRA: 0xd0,
+  UCSRB: 0xd1,
+  UCSRC: 0xd2,
+  UBRRL: 0xd4,
+  UBRRH: 0xd5,
+  UDR: 0xd6,
+};
+const MEGA_USART3: USARTConfig = {
+  rxCompleteInterrupt: 0x6c,
+  dataRegisterEmptyInterrupt: 0x6e,
+  txCompleteInterrupt: 0x70,
+  UCSRA: 0x130,
+  UCSRB: 0x131,
+  UCSRC: 0x132,
+  UBRRL: 0x134,
+  UBRRH: 0x135,
+  UDR: 0x136,
 };
 
 const ATMEGA2560_PERIPHERALS: AtmegaPeripheralConfigs = {
@@ -555,17 +619,135 @@ const ATMEGA2560_PERIPHERALS: AtmegaPeripheralConfigs = {
     ovfInterrupt: 0x1e,
     ...MEGA_TIMER2_PINS,
   },
-  usart0: {
-    ...usart0Config,
-    rxCompleteInterrupt: 0x32,
-    dataRegisterEmptyInterrupt: 0x34,
-    txCompleteInterrupt: 0x36,
-  },
+  usarts: [
+    // PE1 TXD0 / PE0 RXD0 (1 / 0), PD3 TXD1 / PD2 RXD1 (18 / 19),
+    // PH1 TXD2 / PH0 RXD2 (16 / 17), PJ1 TXD3 / PJ0 RXD3 (14 / 15).
+    {
+      config: {
+        ...usart0Config,
+        rxCompleteInterrupt: 0x32,
+        dataRegisterEmptyInterrupt: 0x34,
+        txCompleteInterrupt: 0x36,
+      },
+      txPin: 1,
+      rxPin: 0,
+    },
+    { config: MEGA_USART1, txPin: 18, rxPin: 19 },
+    { config: MEGA_USART2, txPin: 16, rxPin: 17 },
+    { config: MEGA_USART3, txPin: 14, rxPin: 15 },
+  ],
   spi: { ...spiConfig, spiInterrupt: 0x30 },
   twi: { ...twiConfig, twiInterrupt: 0x4e },
   adc: { ...adcConfig, adcInterrupt: 0x3a },
   eeprom: { ...eepromConfig, eepromReadyInterrupt: 0x3c },
 };
+
+/** What the simulator itself does with a USART's traffic (console, scope). */
+interface UsartHooks {
+  /** The guest shifted a byte out of this USART. */
+  transmitted(byte: number): void;
+  /** The guest wrote UCSRA/UCSRB/UCSRC/UBRR: the line settings may have changed. */
+  configured(): void;
+}
+
+/**
+ * One USART of the ATmega as the bus fabric sees it (project
+ * board-buses-2026-09, F6). Made once per simulator, like the SPI port: avr8js
+ * builds a new AVRUSART with every CPU (firmware load, Reset, Stop), and
+ * attach() points this same port at the new one, so a handler installed
+ * before any of those keeps hearing the guest afterwards, and a byte handed
+ * to receive() lands in whichever USART is live.
+ *
+ * Receiving: avr8js has no RX FIFO. writeByte() refuses a byte while the
+ * previous one is still on the wire (rxBusy, one character time) or while the
+ * receiver is off, so bytes wait here and go in one at a time, re-armed from
+ * onRxComplete, which paces them at the configured rate exactly as the wire
+ * would. The queue is this port's, per USART, and a rebuild empties it: on a
+ * reset the line is quiet, and what the previous run never read is gone
+ * (finding avr-rx-queue-stale-and-throttled).
+ */
+class AvrUartPort implements UartControllerPort {
+  readonly bus = 'uart' as const;
+  readonly unit: number;
+  readonly name: string;
+  private usart: AVRUSART | null = null;
+  private handler: ((byte: number) => void) | null = null;
+  private pending: number[] = [];
+  private readonly hooks: UsartHooks;
+
+  constructor(unit: number, hooks: UsartHooks) {
+    this.unit = unit;
+    this.name = `USART${unit}`;
+    this.hooks = hooks;
+  }
+
+  /** The CPU was (re)built: take over its USART. */
+  attach(usart: AVRUSART): void {
+    this.usart = usart;
+    this.pending = [];
+    usart.onByteTransmit = (value: number) => {
+      // A peripheral of a CPU that has been replaced reaches nobody.
+      if (usart !== this.usart) return;
+      const byte = value & 0xff;
+      this.handler?.(byte);
+      this.hooks.transmitted(byte);
+    };
+    usart.onRxComplete = () => this.drain();
+    usart.onConfigurationChange = () => {
+      this.hooks.configured();
+      // Serial.begin turned the receiver on: what arrived before it can go in now.
+      this.drain();
+    };
+  }
+
+  /** The live avr8js peripheral, for the simulator's own reporting. */
+  get engine(): AVRUSART | null {
+    return this.usart;
+  }
+
+  setTxHandler(handler: ((byte: number) => void) | null): void {
+    this.handler = handler;
+  }
+
+  receive(byte: number): void {
+    this.pending.push(byte & 0xff);
+    this.drain();
+  }
+
+  /** Stop: the wire empties with the power. */
+  dropPending(): void {
+    this.pending = [];
+  }
+
+  /**
+   * The frame loop's retry. The queue is normally re-armed from onRxComplete
+   * and from a configuration write, but a byte refused for a reason neither
+   * of those follows (RX busy at the instant of a Serial.end/begin toggle)
+   * would otherwise wait for the next byte to arrive.
+   */
+  retryPending(): void {
+    this.drain();
+  }
+
+  private drain(): void {
+    const usart = this.usart;
+    if (!usart || this.pending.length === 0) return;
+    if (usart.writeByte(this.pending[0])) this.pending.shift();
+  }
+
+  config(): UartConfig {
+    const usart = this.usart;
+    // Nothing is configured until the sketch enables the transmitter or the
+    // receiver (Serial.begin does both); the reset value of UBRR is not a rate.
+    if (!usart || !(usart.rxEnable || usart.txEnable)) return {};
+    const parity = usart.parityEnabled ? (usart.parityOdd ? 'O' : 'E') : 'N';
+    return { baud: usart.baudRate, frame: `${usart.bitsPerChar}${parity}${usart.stopBits}` };
+  }
+
+  routing(): UartRouting | 'static' {
+    return 'static';
+  }
+}
 
 // SPCR bits (the same on every ATmega here).
 const SPCR_SPE = 0x40;
@@ -651,15 +833,6 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
   private cpu: CPU | null = null;
   /** Peripherals kept alive by reference so GC doesn't collect their CPU hooks */
   private peripherals: unknown[] = [];
-  /**
-   * Pending RX bytes waiting to be fed to the USART. avr8js's writeByte
-   * rejects (returns false, drops the byte) whenever rxBusyValue is set
-   * — and rxBusyValue stays set for `cyclesPerChar` after each call.
-   * A naive `for c of text: usart.writeByte(c)` loop therefore only
-   * delivers the first character. We buffer the rest here and drain
-   * one byte at a time on each frame's tick.
-   */
-  private serialRxQueue: number[] = [];
   private portB: AVRIOPort | null = null;
   private portC: AVRIOPort | null = null;
   private portD: AVRIOPort | null = null;
@@ -669,6 +842,12 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
   private adc: AVRADC | null = null;
   /** The SPI controller port (null on the ATtiny85, which has no SPI peripheral). */
   private readonly spiPort: AvrSpiPort | null;
+  /**
+   * The UART controller ports, USART0 first (none on the ATtiny85). Made once
+   * with the simulator and re-pointed at every rebuilt AVRUSART.
+   */
+  private readonly uartPorts: AvrUartPort[];
+  /** USART0, the console, as the rest of the app reads it (null until a firmware loads). */
   public usart: AVRUSART | null = null;
   public twi: AVRTWI | null = null;
   // The EEPROM's backing store. The backend (the actual cells) is created once
@@ -734,12 +913,12 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
   private lastDdr: Map<string, number> = new Map();
   private lastOcrValues: number[] = [];
   /**
-   * Last known TXEN bit value, used to detect 0→1 transitions and seed the
-   * TX pin baseline at idle HIGH the moment the firmware enables the USART.
-   * Without this seed the oscilloscope shows a floating/LOW baseline until
-   * the first byte transmits, which doesn't match real hardware.
+   * Last known TXEN bit value per USART, used to detect 0→1 transitions and
+   * seed the TX pin baseline at idle HIGH the moment the firmware enables the
+   * USART. Without this seed the oscilloscope shows a floating/LOW baseline
+   * until the first byte transmits, which doesn't match real hardware.
    */
-  private lastTxEnable = false;
+  private lastTxEnable: boolean[] = [];
 
   /** What getBusBinding() hands the fabric, built once. */
   private busBinding: EngineBinding | null = null;
@@ -752,6 +931,15 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
     // The ATtiny85's USI is not an SPI controller avr8js can report frames for
     // (see getBusBinding), so that variant keeps no port.
     this.spiPort = boardVariant === 'tiny85' ? null : new AvrSpiPort();
+    // One port per USART of the variant; the ATtiny85 has none (its core's
+    // Serial is a software UART on two pins, which the fabric decodes there).
+    this.uartPorts = this.usartDefs().map(
+      (def, unit) =>
+        new AvrUartPort(unit, {
+          transmitted: (byte) => this.usartTransmitted(unit, def, byte),
+          configured: () => this.handleUartConfigChange(unit, def),
+        }),
+    );
     // Create the bus up-front with a placeholder master so that
     // Interconnect can install cross-board bridges and parts can
     // register devices BEFORE the firmware loads.  The real AVRTWI
@@ -781,6 +969,12 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
     if (this.boardVariant === 'mega') return PWM_PINS_MEGA;
     if (this.boardVariant === 'tiny85') return PWM_PINS_TINY85;
     return PWM_PINS_UNO;
+  }
+
+  /** The USARTs this variant has, with their pins. */
+  private usartDefs(): UsartDef[] {
+    if (this.boardVariant === 'tiny85') return [];
+    return (this.boardVariant === 'mega' ? ATMEGA2560_PERIPHERALS : ATMEGA328P_PERIPHERALS).usarts;
   }
 
   /**
@@ -895,28 +1089,11 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
       const spi = new AVRSPI(cpu, cfg.spi, AVR_CPU_HZ);
       this.spiPort?.attach(spi, cpu, cfg.spi);
 
-      const usart = new AVRUSART(cpu, cfg.usart0, AVR_CPU_HZ);
-      this.usart = usart;
-      usart.onByteTransmit = (value: number) => {
-        if (this.onSerialData) this.onSerialData(String.fromCharCode(value));
-        // Synthesize the UART frame on PD1 so the oscilloscope sees a real
-        // waveform during Serial.print. See emitUartTxFrame() for details.
-        this.emitUartTxFrame(value);
-      };
-      usart.onRxComplete = () => this.drainSerialRxQueue();
-      usart.onConfigurationChange = () => {
-        if (this.onBaudRateChange) {
-          this.onBaudRateChange(usart.baudRate, {
-            source: 'uart',
-            baud: usart.baudRate,
-            dataBits: usart.bitsPerChar,
-            parity: usart.parityEnabled ? (usart.parityOdd ? 'odd' : 'even') : 'none',
-            stopBits: usart.stopBits,
-          });
-        }
-        // Seed idle HIGH on the TX pin the first time TXEN flips on.
-        this.handleUartConfigChange();
-      };
+      // Every USART of the variant, each behind its port: the console, the
+      // scope and the bus fabric all read them through AvrUartPort.attach.
+      const usarts = cfg.usarts.map((def) => new AVRUSART(cpu, def.config, AVR_CPU_HZ));
+      usarts.forEach((usart, unit) => this.uartPorts[unit].attach(usart));
+      this.usart = usarts[0];
 
       this.twi = new AVRTWI(cpu, cfg.twi, AVR_CPU_HZ);
       // Attach the real AVRTWI to the bus created in the constructor;
@@ -928,7 +1105,7 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
         new AVRTimer(cpu, cfg.timer0),
         new AVRTimer(cpu, cfg.timer1),
         new AVRTimer(cpu, cfg.timer2),
-        usart,
+        ...usarts,
         spi,
         this.twi,
       ];
@@ -970,7 +1147,7 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
     this.lastPortDValue = 0;
     this.lastDdr.clear();
     this.lastOcrValues = new Array(this.pwmPins.length).fill(0);
-    this.lastTxEnable = false;
+    this.lastTxEnable = this.uartPorts.map(() => false);
 
     this.setupPinHooks();
   }
@@ -1020,12 +1197,22 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
   }
 
   /**
+   * A USART shifted a byte out: the console hears USART0 (the monitor is
+   * that port and no other), and the oscilloscope sees the frame on the TX
+   * pin of whichever USART it was.
+   */
+  private usartTransmitted(unit: number, def: UsartDef, byte: number): void {
+    if (unit === 0 && this.onSerialData) this.onSerialData(String.fromCharCode(byte));
+    this.emitUartTxFrame(this.uartPorts[unit].engine, def.txPin, byte);
+  }
+
+  /**
    * Synthesize a real bit-level UART frame on the TX pin so an oscilloscope
    * sees a waveform during Serial.print, matching real ATmega328P / ATmega2560
-   * behavior. avr8js's USART only intercepts the byte at the UDR0 register
-   * level — it never toggles PD1 (Uno/Nano) / PE1 (Mega), so without this
-   * shim the TX pin is flat in the scope while real hardware would show the
-   * UART frame at the configured baud rate.
+   * behavior. avr8js's USART only intercepts the byte at the UDR register
+   * level: it never toggles PD1 (Uno/Nano) / PE1 (Mega) or the TXD of the
+   * Mega's other USARTs, so without this shim the TX pin is flat in the scope
+   * while real hardware would show the UART frame at the configured baud rate.
    *
    * Frame layout (8N1, the Arduino default):
    *   [start LOW] [data LSB ... data MSB] [parity?] [stop1] [stop2?]
@@ -1035,20 +1222,16 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
    *
    * Each transition is emitted via onPinChangeWithTime so the oscilloscope
    * stamps it with simulator time (cpu.cycles / 16_000 ms), giving bit-level
-   * timing that holds at any sweep speed.
+   * timing that holds at any sweep speed. The scope channel only: the bus
+   * fabric hears the byte from the port, and a decoder on a hardware TX pad
+   * would otherwise read every byte a second time.
    */
-  private emitUartTxFrame(byte: number): void {
-    const usart = this.usart;
+  private emitUartTxFrame(usart: AVRUSART | null, txPin: number, byte: number): void {
     if (!usart || !this.cpu || !this.onPinChangeWithTime) return;
     if (!usart.txEnable) return;
 
     const baud = usart.baudRate;
     if (!baud || baud <= 0) return;
-
-    // ATmega328P (Uno/Nano) UART0: TX = PD1 → Arduino pin 1
-    // ATmega2560 (Mega)    UART0: TX = PE1 → Arduino pin 1 (Mega TX0)
-    // ATtiny85 has no hardware USART so this method is never called.
-    const txPin = 1;
 
     const freqHz = 16_000_000;
     const cyclesPerBit = freqHz / baud;
@@ -1082,23 +1265,34 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
       }
     }
     // After the stop bit(s) the line is already HIGH (idle) so no trailing
-    // transition is needed — the next byte will start from HIGH automatically.
+    // transition is needed: the next byte will start from HIGH automatically.
   }
 
   /**
-   * Seed the TX pin at idle HIGH when the firmware sets TXEN for the first
-   * time (typically inside Serial.begin).  Without this seed the scope's
-   * "initial state before the first byte" defaults to LOW, hiding the start
-   * bit transition of the very first byte sent.
+   * The sketch wrote a USART's configuration registers (Serial.begin). USART0
+   * is the console, so its line is reported to the monitor. Every USART seeds
+   * its TX pin at idle HIGH the first time TXEN flips on: without the seed the
+   * scope's "initial state before the first byte" defaults to LOW, hiding the
+   * start-bit transition of the very first byte sent.
    */
-  private handleUartConfigChange(): void {
-    if (!this.usart || !this.cpu) return;
-    const tx = this.usart.txEnable;
-    if (tx && !this.lastTxEnable && this.onPinChangeWithTime) {
-      const timeMs = this.cpu.cycles / 16_000;
-      this.onPinChangeWithTime(1, true, timeMs);
+  private handleUartConfigChange(unit: number, def: UsartDef): void {
+    const usart = this.uartPorts[unit].engine;
+    if (!usart || !this.cpu) return;
+    if (unit === 0 && this.onBaudRateChange) {
+      this.onBaudRateChange(usart.baudRate, {
+        source: 'uart',
+        baud: usart.baudRate,
+        dataBits: usart.bitsPerChar,
+        parity: usart.parityEnabled ? (usart.parityOdd ? 'odd' : 'even') : 'none',
+        stopBits: usart.stopBits,
+      });
     }
-    this.lastTxEnable = tx;
+    const tx = usart.txEnable;
+    if (tx && !this.lastTxEnable[unit] && this.onPinChangeWithTime) {
+      const timeMs = this.cpu.cycles / 16_000;
+      this.onPinChangeWithTime(def.txPin, true, timeMs);
+    }
+    this.lastTxEnable[unit] = tx;
   }
 
   /** Flush all scheduled pin changes whose target cycle has been reached. */
@@ -1334,7 +1528,7 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
         // queue is empty or rxBusyValue is set) and makes the link
         // self-heal across both startup races and Serial.end()/begin()
         // toggles in the sketch.
-        if (this.serialRxQueue.length > 0) this.drainSerialRxQueue();
+        for (const port of this.uartPorts) port.retryPending();
 
         frameCount++;
         if (frameCount % 60 === 0) {
@@ -1372,7 +1566,7 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
     // reached Serial.begin yet). Without this the next run starts with
     // a stale tail that drains into the fresh USART before the sketch
     // is ready, and from the user's point of view the link is "dead".
-    this.serialRxQueue = [];
+    for (const port of this.uartPorts) port.dropPending();
 
     console.log('AVR simulation stopped');
   }
@@ -1495,53 +1689,31 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
   }
 
   /**
-   * Send a byte to the Arduino serial port (RX) — as if typed in the Serial Monitor.
-   *
-   * AVR has no hardware RX FIFO, so avr8js's writeByte() rejects every
-   * call while rxBusyValue is set (one full cyclesPerChar after the
-   * previous byte). A naive loop would only deliver the first character.
-   * Queue the bytes here and drain one at a time from onRxComplete.
+   * Send text to the Arduino serial port (RX), as if typed in the Serial
+   * Monitor: USART0's RX, through its port, which paces the bytes at the
+   * configured rate (avr8js has no RX FIFO; see AvrUartPort).
    */
   serialWrite(text: string): void {
-    if (!this.usart) return;
-    for (let i = 0; i < text.length; i++) {
-      this.serialRxQueue.push(text.charCodeAt(i));
-    }
-    this.drainSerialRxQueue();
+    const port = this.uartPorts[0];
+    if (!port) return;
+    for (let i = 0; i < text.length; i++) port.receive(text.charCodeAt(i));
   }
 
   /**
-   * Feed bytes into a hardware UART's RX from an external part (GPS module,
-   * a wired peer board via Interconnect, …). Uniform seam across simulators
-   * (`sim.feedUart(uart, data)`) — Interconnect already probes for it.
+   * Feed bytes into a hardware UART's RX from a wired peer board via
+   * Interconnect. Uniform seam across simulators (`sim.feedUart(uart, data)`);
+   * a part on the canvas reaches the same RX through the bus fabric instead.
    *
-   * The AVR core only emulates USART0 (Uno/Nano pins 0/1; Mega RX0). Mega
-   * USART1-3 are not modelled by avr8js, so `uart > 0` reports false and the
-   * caller can fall back to bit-level transport (e.g. SoftwareSerial).
+   * `uart` is the USART index: 0 on every ATmega, 0..3 on the Mega. A unit
+   * this chip does not have reports false.
    *
    * @returns true when the bytes were queued for delivery.
    */
   feedUart(uart: number, data: string): boolean {
-    if (uart !== 0 || !this.usart) return false;
-    this.serialWrite(data);
+    const port = this.uartPorts[uart];
+    if (!port) return false;
+    for (let i = 0; i < data.length; i++) port.receive(data.charCodeAt(i));
     return true;
-  }
-
-  /**
-   * Pump the next pending RX byte into the USART. Called once from
-   * serialWrite() to kick the pipeline, then re-armed from
-   * usart.onRxComplete after every byte the sketch actually receives.
-   * The cyclesPerChar gap that avr8js enforces between writeByte calls
-   * gives the sketch time to read UDR0 between bytes — same pacing the
-   * real chip sees at the configured baud rate.
-   */
-  private drainSerialRxQueue(): void {
-    if (!this.usart) return;
-    if (this.serialRxQueue.length === 0) return;
-    const next = this.serialRxQueue[0];
-    if (this.usart.writeByte(next)) {
-      this.serialRxQueue.shift();
-    }
   }
 
   // ── Bus fabric (project board-buses-2026-09) ──────────────────────────────
@@ -1574,12 +1746,37 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
         pins: boardPinsFromPinManager(this.pinManager, (pin, level) => this.setPinState(pin, level)),
         spi: this.spiPort ? [this.spiPort] : [],
         i2c: this.boardVariant === 'tiny85' ? [] : [this.i2cBus],
+        uart: this.uartPorts,
+        clock: this.guestClock(),
         setResetHandler: (handler) => {
           this.busResetHandler = handler;
         },
       };
     }
     return this.busBinding;
+  }
+
+  /**
+   * The guest's clock for the software UART: the cycle counter every pin
+   * callback already runs on, the edge queue the line models use, and a timer
+   * on avr8js's own clock events, which fire between instructions at their
+   * cycle. A timer belongs to the CPU it was set on; a rebuilt CPU drops it,
+   * and the fabric restarts its decoders on that reset anyway.
+   */
+  private guestClock(): GuestClock {
+    return {
+      now: () => this.getCurrentCycles(),
+      clockHz: () => this.getClockHz(),
+      scheduleEdge: (pin, level, atCycle) => this.schedulePinChange(pin, level, atCycle),
+      at: (atCycle, cb) => {
+        const cpu = this.cpu;
+        if (!cpu) return () => {};
+        const event = cpu.addClockEvent(cb, atCycle - cpu.cycles);
+        return () => {
+          cpu.clearClockEvent(event);
+        };
+      },
+    };
   }
 
   // ── Line-owning sensors (simulation/line) ─────────────────────────────────

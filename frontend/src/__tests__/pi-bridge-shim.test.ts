@@ -28,9 +28,17 @@ vi.mock('../simulation/RaspberryPi3Bridge', () => ({
     onDisconnected: unknown = null;
     onError: unknown = null;
     /** The header UART, not the console (RaspberryPi3Bridge declares both).
-     *  The shim chains itself onto this slot, so the tests fire it to play
-     *  the guest writing to /dev/serial0. */
+     *  Two slots, as the real bridge has them: the text one Interconnect
+     *  chains for the peer boards, the raw one the shim owns for its UART
+     *  port (board-buses F6). `uartTx` plays the guest writing to
+     *  /dev/serial0 the way the real bridge fires both. */
     onUartTx: ((text: string) => void) | null = null;
+    onUartTxBytes: ((bytes: Uint8Array) => void) | null = null;
+    uartTx(bytes: number[]) {
+      const raw = Uint8Array.from(bytes);
+      this.onUartTxBytes?.(raw);
+      this.onUartTx?.(new TextDecoder().decode(raw));
+    }
     quietBootDefault = false;
     quietBootLabel = '';
     sent: unknown[] = [];
@@ -58,16 +66,10 @@ import {
 } from '../store/useSimulatorStore';
 import { PiBridgeShim } from '../simulation/PiBridgeShim';
 import { registerPiBusOp } from '../lib/proBoardRegistry';
-import {
-  avrUartTx,
-  detectSimulatorKind,
-  ensureUartBridge,
-  getSimulatorBridges,
-} from '../simulation/customChips/simulatorBridges';
-import { feedBoardSerialOut } from '../simulation/Interconnect';
+import { detectSimulatorKind } from '../simulation/customChips/simulatorBridges';
 import { setWires } from './helpers/multiBoardSetup';
 import { VirtualBMP280, VirtualDS3231, VirtualPCF8574, type I2CDevice } from '../simulation/I2CBusManager';
-import { attachI2cTarget } from '../simulation/buses';
+import { attachI2cTarget, attachUartEndpoint, busRegistry } from '../simulation/buses';
 import { i2cTargetOf } from '../simulation/parts/i2cPart';
 import { PartSimulationRegistry } from '../simulation/parts';
 import { lineGaps, clearLineGaps } from '../simulation/line/requestLine';
@@ -129,113 +131,149 @@ describe('a Pi board has a simulator entry', () => {
 
 // ── The header UART, both directions ────────────────────────────────────────
 //
-// A UART part attaches to a board the way the Grove modules do: it listens on
-// the custom-chip bridge's `uartListeners` and answers through the simulator's
-// `sendSerialBytes`. Every module with a command grammar is this shape, so a
+// A UART part is on the board's header UART because its RX and TX pads are
+// wired to GPIO14/15 (board-buses F6): it registers on the bus fabric, hears
+// what the board transmits through the shim's UART port and answers through
+// its handle. Every module with a command grammar is this shape, so a
 // stand-in of that shape is what the tests drive, and what they assert is the
 // user-visible thing: the module answered.
 
 interface MockPiBridge {
   onUartTx: ((text: string) => void) | null;
   sendUartBytes?: (bytes: number[]) => void;
+  uartTx(bytes: number[]): void;
+}
+
+/** Wire a part's RX/TX pads to the Pi's TXD/RXD (GPIO14/GPIO15), as the canvas does. */
+function wireUart(boardId: string, componentId: string): void {
+  useSimulatorStore.setState((s) => ({
+    wires: [
+      ...s.wires.filter((w) => w.start.componentId !== componentId),
+      ...([
+        ['RX', 'GPIO14'],
+        ['TX', 'GPIO15'],
+      ] as const).map(([pinName, pad]) => ({
+        id: `${componentId}-${pinName}`,
+        start: { componentId, pinName, x: 0, y: 0 },
+        end: { componentId: boardId, pinName: pad, x: 0, y: 0 },
+        waypoints: [],
+        color: '#0a0',
+      })),
+    ],
+  }) as never);
+  busRegistry.netlistChanged();
 }
 
 /**
  * An AT modem in twelve lines: it says nothing until it is spoken to, and
  * answers OK to a well-formed AT line. The real Grove AT modems (ESP8285,
- * WizFi360, HM-11, BC417, Wio-E5) attach through the same two seams.
+ * WizFi360, HM-11, BC417, Wio-E5) attach through the same handle.
  */
-function attachAtModem(shim: PiBridgeShim): () => void {
-  ensureUartBridge(shim);
-  const bridges = getSimulatorBridges(shim);
+function attachAtModem(boardId: string, owner = 'modem'): () => void {
   let line = '';
-  const listener = (byte: number) => {
-    const ch = String.fromCharCode(byte);
-    if (ch !== '\r') {
-      line += ch;
-      return;
-    }
-    const reply = line.trim().toUpperCase() === 'AT' ? 'OK\r\n' : 'ERROR\r\n';
-    line = '';
-    shim.sendSerialBytes(Array.from(new TextEncoder().encode(reply)));
+  wireUart(boardId, owner);
+  const handle = attachUartEndpoint(
+    { owner, pins: { rx: 'RX', tx: 'TX' } },
+    {
+      receive: (byte) => {
+        const ch = String.fromCharCode(byte);
+        if (ch !== '\r') {
+          line += ch;
+          return;
+        }
+        const reply = line.trim().toUpperCase() === 'AT' ? 'OK\r\n' : 'ERROR\r\n';
+        line = '';
+        for (const b of new TextEncoder().encode(reply)) handle.transmit(b);
+      },
+    },
+  );
+  return () => {
+    handle.dispose();
+    useSimulatorStore.setState({ wires: [] } as never);
   };
-  bridges.uartListeners.add(listener);
-  return () => bridges.uartListeners.delete(listener);
 }
 
 const decode = (bytes: number[]) => new TextDecoder().decode(Uint8Array.from(bytes));
+const flush = () => new Promise<void>((r) => queueMicrotask(r));
 
 describe('a UART part on the header', () => {
-  it("is the rp2040 browser path, and the part's reply reaches the guest header UART", () => {
+  it("is the rp2040 browser path, and the monitor's byte seam reaches the guest header UART", () => {
     const { id, shim } = addPi();
-    // The part-to-board direction only. avrUartTx routes an rp2040-kind
-    // simulator through serialWriteByte; the shim used to have no such
-    // method, so a part's replies went nowhere. What the board SENDS is the
-    // test below, and it was the half that never worked.
+    // The part-to-board direction only, through the byte seam the RP family
+    // is fingerprinted by (serialWriteByte); a part on the fabric answers
+    // through the UART port instead, which the tests below drive. What the
+    // board SENDS was the half that never worked.
     expect(detectSimulatorKind(shim)).toBe('rp2040');
     const bridge = getBoardBridge(id) as unknown as { sendUartBytes?: (b: number[]) => void };
     bridge.sendUartBytes = vi.fn();
-    avrUartTx(shim, 0x41);
-    avrUartTx(shim, 0x1ff);
+    shim.serialWriteByte(0x41);
+    shim.serialWriteByte(0x1ff);
     expect(bridge.sendUartBytes).toHaveBeenNthCalledWith(1, [0x41]);
     expect(bridge.sendUartBytes).toHaveBeenNthCalledWith(2, [0xff]);
   });
 
-  it('answers the Linux guest that spoke to it', () => {
-    const { id, shim } = addPi();
+  it('answers the Linux guest that spoke to it', async () => {
+    const { id } = addPi();
     const bridge = getBoardBridge(id) as unknown as MockPiBridge;
     const answered: number[] = [];
     bridge.sendUartBytes = (bytes) => answered.push(...bytes);
-    const detach = attachAtModem(shim);
+    const detach = attachAtModem(id);
 
     // The guest wrote "AT\r" to /dev/serial0; the backend relays it as
-    // `uart_tx` and RaspberryPi3Bridge hands the decoded text to onUartTx.
-    bridge.onUartTx?.('AT\r');
+    // `uart_tx` and RaspberryPi3Bridge hands the raw bytes to onUartTxBytes,
+    // the shim's UART port, and the fabric to the part on GPIO14.
+    bridge.uartTx(Array.from(new TextEncoder().encode('AT\r')));
+    await flush();
 
     expect(decode(answered)).toBe('OK\r\n');
     detach();
   });
 
-  it('answers the in-browser engine that spoke to it', () => {
+  it('answers the in-browser engine that spoke to it', async () => {
     const { id, shim } = addPi();
     useSimulatorStore.setState((s) => ({
       boards: s.boards.map((b) => (b.id === id ? { ...b, engineMode: 'instant' } : b)),
     }));
     const answered: number[] = [];
     shim.instantAdapter = { onUartRx: (bytes) => answered.push(...bytes) };
-    const detach = attachAtModem(shim);
+    const detach = attachAtModem(id);
 
-    // The in-browser engine has no bridge and no socket: it announces every
-    // byte its script transmits through feedBoardSerialOut, which is the
-    // seam the pro overlay's installInstantEngine already calls.
-    for (const ch of 'AT\r') feedBoardSerialOut(id, ch, 0);
+    // The in-browser engine has no bridge and no socket: it hands every
+    // byte its script transmits to the shim, which the pro overlay's
+    // installInstantEngine calls; the Interconnect fan-out is the peers'.
+    shim.headerUartTx(Array.from(new TextEncoder().encode('AT\r')));
+    await flush();
 
     expect(decode(answered)).toBe('OK\r\n');
     detach();
   });
 
-  it('hears each byte once while a peer board is on the same wire', () => {
-    const { id, shim } = addPi();
+  it('hears each byte once while a peer board is on the same wire', async () => {
+    const { id } = addPi();
     const { id: peerId } = addPi('raspberry-pi-3');
     const bridge = getBoardBridge(id) as unknown as MockPiBridge;
     const peerBridge = getBoardBridge(peerId) as unknown as MockPiBridge;
     const peerHeard: number[] = [];
     peerBridge.sendUartBytes = (bytes) => peerHeard.push(...bytes);
+    const heard: number[] = [];
+    wireUart(id, 'listener');
+    const handle = attachUartEndpoint(
+      { owner: 'listener', pins: { rx: 'RX', tx: 'TX' } },
+      { receive: (b) => heard.push(b) },
+    );
     setWires(useSimulatorStore, [
       { fromBoard: id, fromPin: 'GPIO14', toBoard: peerId, toPin: 'GPIO15' },
     ]);
 
-    // The wire makes Interconnect take the same onUartTx slot the shim
-    // already chained itself onto. Both wrappers keep their predecessor, so
-    // the part must hear each byte exactly once and the peer must still get
-    // it: the trap the Grove uartLink comment calls out, from the other end.
-    ensureUartBridge(shim);
-    const heard: number[] = [];
-    getSimulatorBridges(shim).uartListeners.add((b) => heard.push(b));
-    bridge.onUartTx?.('AT');
+    // The wire makes Interconnect chain the text slot for the peer; the
+    // shim's port has its own raw slot. The part must hear each byte exactly
+    // once and the peer must still get it.
+    bridge.uartTx([0x41, 0x54]);
+    await flush();
 
     expect(heard).toEqual([0x41, 0x54]);
     expect(decode(peerHeard)).toBe('AT');
+    handle.dispose();
     setWires(useSimulatorStore, []);
   });
 });

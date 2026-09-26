@@ -8,18 +8,29 @@ import { bootromB1 } from './rp2040-bootrom';
 import { loadUF2, loadUserFiles, getFirmware } from './MicroPythonLoader';
 import { type PioPeripheral, createPioPeripheral } from './PioPeripheral';
 import { requestElectricalResolve } from './spice/electricalResolveHook';
-import { RP2040_CLOCKS_KEY, USB_CDC_LINK, watchRpPeriClock, watchRpUartLine } from './rpUartLine';
+import {
+  RP2040_CLOCKS_KEY,
+  USB_CDC_LINK,
+  rpUartLink,
+  watchRpPeriClock,
+  watchRpUartLine,
+  type RpUartLike,
+} from './rpUartLine';
 import type { SerialLink } from '../store/serialWire';
 import type { LineCapable, LineHostPort, LineSupport } from './line/LineHost';
 import { LineSensorHub } from './line/LineSensorHub';
 import type {
   BusCapableSimulator,
   EngineBinding,
+  GuestClock,
   SpiControllerConfig,
   SpiControllerPort,
   SpiMode,
   SpiRouting,
   I2cRouting,
+  UartConfig,
+  UartControllerPort,
+  UartRouting,
 } from './buses/types';
 import { boardPinsFromPinManager } from './buses/boardPins';
 
@@ -259,6 +270,18 @@ const FUNCSEL_SPI = 1;
  * same table as boardPinTables/rp2040.ts).
  */
 const FUNCSEL_I2C = 3;
+/**
+ * GPIO function select F2: the pad belongs to UART0 or UART1. Four pads per
+ * controller in turn (TX, RX, CTS, RTS), UART0 on GPIO 0-3, 12-19, 28-29 and
+ * UART1 on 4-11, 20-27 (the same table as boardPinTables/rp2040.ts).
+ */
+const FUNCSEL_UART = 2;
+/** What an F2 pad carries, by GPIO number mod 4. */
+const UART_PAD_SIGNAL = ['tx', 'rx', 'cts', 'rts'] as const;
+/** PL011 data register: a read pulls one byte out of the RX FIFO. */
+const UARTDR = 0x0;
+/** UARTFR bit 6: the RX FIFO is full (a byte pushed now would be dropped). */
+const UARTFR_RXFF = 1 << 6;
 /** rp2040js keys its peripheral map by address >> 14 << 2: IO_BANK0 at 0x40014000. */
 const IO_BANK0_KEY = 0x40014;
 /** GPIOn_CTRL is the word at 8n + 4 of IO_BANK0, up to GPIO29. */
@@ -325,6 +348,66 @@ function levelTxEmpty(i2c: RPI2C): void {
  * MicroPython) it points that SoC's controller at this same port, so a
  * device bound to it never notices the rebuild.
  */
+type RpUart = RP2040['uart'][number];
+
+/**
+ * One PL011 UART as the bus fabric sees it (project board-buses-2026-09, F6).
+ * Created once per simulator and never replaced, like the SPI port: when the
+ * simulator builds a new SoC (firmware load, reset, the MicroPython reset) it
+ * points that SoC's controller at this same port, so a device bound to it
+ * never notices the rebuild. TX bytes come from the engine's onByte through
+ * the simulator (which also feeds the console for UART0 and the scope); RX
+ * bytes go to the simulator's inbox, which paces them into the 32-deep FIFO
+ * as the guest reads.
+ */
+class RpUartPort implements UartControllerPort {
+  readonly bus = 'uart' as const;
+  readonly unit: 0 | 1;
+  readonly name: string;
+  /** Installed by the fabric: every byte the guest shifts out. */
+  handler: ((byte: number) => void) | null = null;
+  routingChanged: (() => void) | null = null;
+  private readonly engine: () => RpUart | null;
+  private readonly route: () => UartRouting;
+  private readonly inbox: (byte: number) => void;
+
+  constructor(unit: 0 | 1, engine: () => RpUart | null, route: () => UartRouting, inbox: (byte: number) => void) {
+    this.unit = unit;
+    this.name = `UART${unit}`;
+    this.engine = engine;
+    this.route = route;
+    this.inbox = inbox;
+  }
+
+  setTxHandler(handler: ((byte: number) => void) | null): void {
+    this.handler = handler;
+  }
+
+  setRoutingChangeHandler(handler: (() => void) | null): void {
+    this.routingChanged = handler;
+  }
+
+  receive(byte: number): void {
+    this.inbox(byte & 0xff);
+  }
+
+  config(): UartConfig {
+    const uart = this.engine();
+    // No rate until the guest enabled the port and programmed a divisor: the
+    // reset divisor of 0 is not a rate, and a controller the sketch never
+    // opened must not be checked against a module's.
+    if (!uart || !uart.enabled) return {};
+    const link = rpUartLink(uart as unknown as RpUartLike);
+    if (!link) return {};
+    const parity = link.parity === 'none' ? 'N' : link.parity === 'even' ? 'E' : 'O';
+    return { baud: link.baud, frame: `${link.dataBits}${parity}${link.stopBits}` };
+  }
+
+  routing(): UartRouting {
+    return this.route();
+  }
+}
+
 class RpSpiPort implements SpiControllerPort {
   readonly bus = 'spi' as const;
   readonly unit: 0 | 1;
@@ -430,8 +513,14 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
   // factory hadn't installed yet when the board was added.
   private boardKind = '';
 
-  /** Serial output callback — fires for each byte the Pico sends on UART0 (or USBCDC in MicroPython mode) */
-  public onSerialData: ((char: string) => void) | null = null;
+  /**
+   * Serial output callback: each byte the Pico sends on UART0 (or the USB-CDC
+   * in MicroPython mode), the console. UART1's bytes still arrive here too,
+   * tagged with their unit, until the last consumer that hears the console
+   * for them (the custom-chip bridge of simulatorBridges.ts) is on the bus
+   * fabric; the parts themselves hear UART1 from its port.
+   */
+  public onSerialData: ((char: string, uart?: number) => void) | null = null;
 
   /** The line the console is clocking: UART0's PL011 settings on a compiled sketch
    *  (rate AND frame format), or the USB-CDC "no wire" link in MicroPython mode.
@@ -466,6 +555,35 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
   /** Where each I2C controller's SDA and SCL are right now, from the pads' funcsel. */
   private i2cRouting: [I2cRouting, I2cRouting] = [{}, {}];
   private i2cRoutingKey: [string, string] = ['', ''];
+
+  // ── UART: one controller port per PL011 (project board-buses-2026-09, F6) ─
+  //
+  // UART0 and UART1 each have a port that lives as long as this simulator;
+  // wireUart() points every new SoC's onByte at it. What a controller
+  // transmits reaches the fabric's handler, and UART0 alone also reaches the
+  // console (it is the console of an Arduino sketch: the compile service
+  // prepends `#define Serial Serial1`). UART1 used to be copied into the
+  // same console callback, which made a part hear every UART and answer on
+  // UART0 only (finding rp2040-uart-lumped-and-uart0-only-rx).
+  private readonly uartPorts: [RpUartPort, RpUartPort];
+  /** Where each UART's TX and RX are right now, from the pads' funcsel. */
+  private uartRouting: [UartRouting, UartRouting] = [{}, {}];
+  private uartRoutingKey: [string, string] = ['', ''];
+  /**
+   * Bytes on their way into each UART's receiver, paced at the line's rate.
+   * The PL011 model has no timing: feedByte() lands a byte in the FIFO the
+   * instant it is called, and a burst handed over in one call looked to the
+   * guest like an infinitely fast sender. arduino-pico drains the FIFO from
+   * its RX interrupt into a 32-byte ring the sketch empties from loop(), so
+   * everything past the 32nd byte of such a burst was lost, whether it was a
+   * part's answer or a line pasted into the monitor. Here each byte lands one
+   * character time after the previous one, on the guest clock, from the rate
+   * and frame the guest programmed: what a wire does. A byte for a UART the
+   * guest has not opened waits for it.
+   */
+  private readonly uartInbox: [number[], number[]] = [[], []];
+  /** The alarm that lands the next byte of each UART, while one is on the wire. */
+  private readonly uartWire: [RpAlarm | null, RpAlarm | null] = [null, null];
 
   /** The bus fabric's view of this board: pins, both SPI and both I2C controllers, MCU resets. */
   getBusBinding(): EngineBinding {
@@ -612,6 +730,7 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
           const gpio = offset >>> 3;
           this.refreshSpiRouting((gpio >> 3) & 1 ? 1 : 0);
           this.refreshI2cRouting((gpio >> 1) & 1 ? 1 : 0);
+          this.refreshUartRouting(((gpio + 4) >> 3) & 1 ? 1 : 0);
         }
       };
     }
@@ -632,6 +751,8 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
     this.refreshSpiRouting(1);
     this.refreshI2cRouting(0);
     this.refreshI2cRouting(1);
+    this.refreshUartRouting(0);
+    this.refreshUartRouting(1);
     this.busResetHandler?.();
   }
 
@@ -672,12 +793,42 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
       new RpSpiPort(0, () => this.rp2040?.spi[0] ?? null, () => this.spiRouting[0]),
       new RpSpiPort(1, () => this.rp2040?.spi[1] ?? null, () => this.spiRouting[1]),
     ];
+    this.uartPorts = [
+      new RpUartPort(0, () => this.rp2040?.uart[0] ?? null, () => this.uartRouting[0], (b) => this.queueUartByte(0, b)),
+      new RpUartPort(1, () => this.rp2040?.uart[1] ?? null, () => this.uartRouting[1], (b) => this.queueUartByte(1, b)),
+    ];
     this.busBinding = {
       pins: boardPinsFromPinManager(this.pinManager, (pin, level) => this.busDriveInput(pin, level)),
       spi: this.spiPorts,
       i2c: this.i2cBuses,
+      uart: this.uartPorts,
+      clock: this.guestClock(),
       setResetHandler: (handler) => {
         this.busResetHandler = handler;
+      },
+    };
+  }
+
+  /**
+   * The guest's clock for the software UART: the cycle counter every pin
+   * callback runs on, the edge queue the line models use, and a timer on the
+   * engine's own alarm list, which advanceClock never jumps past. An alarm
+   * belongs to the SoC it was set on; a rebuilt SoC drops it with its clock,
+   * and the fabric restarts its decoders on that reset anyway.
+   */
+  private guestClock(): GuestClock {
+    return {
+      now: () => this.getCurrentCycles(),
+      clockHz: () => this.getClockHz(),
+      scheduleEdge: (pin, level, atCycle) => this.schedulePinChange(pin, level, atCycle),
+      at: (atCycle, cb) => {
+        const mcu = this.rp2040;
+        if (!mcu) return () => {};
+        const alarm = mcu.clock.createAlarm(() => {
+          if (this.rp2040 === mcu) cb();
+        });
+        alarm.schedule(Math.max(0, atCycle - this.totalCycles) * CYCLE_NANOS);
+        return () => alarm.cancel();
       },
     };
   }
@@ -766,11 +917,10 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
     // 6. Set PC to flash start
     this.rp2040.core.PC = 0x10000000;
 
-    // 7. Wire peripherals (I2C, SPI, ADC, PIO, GPIO — same as Arduino mode)
-    // But skip UART serial wiring since MicroPython uses USBCDC
-    this.rp2040.uart[1].onByte = (value: number) => {
-      if (this.onSerialData) this.onSerialData(String.fromCharCode(value));
-    };
+    // 7. Wire peripherals (UART, I2C, SPI, ADC, PIO, GPIO, same as Arduino
+    // mode). The console is the USB-CDC here, so neither UART reaches it:
+    // machine.UART(n) talks to the parts on its pins, through the fabric.
+    this.wireUart(this.rp2040);
     this.wireI2C(0);
     this.wireI2C(1);
     this.wireSpi(this.rp2040);
@@ -1104,30 +1254,9 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
       RP2040_CLOCKS_KEY,
       () => line.publish(),
     );
-    let serialBuffer = '';
-    this.rp2040.uart[0].onByte = (value: number) => {
-      const ch = String.fromCharCode(value);
-      serialBuffer += ch;
-      if (ch === '\n') {
-        console.log('[RP2040 UART0]', serialBuffer.trimEnd());
-        serialBuffer = '';
-      }
-      if (this.onSerialData) {
-        this.onSerialData(ch);
-      }
-      // Synthesize the bit-level waveform on the UART0 TX pin so an
-      // oscilloscope on it sees a real frame — rp2040js doesn't drive the
-      // GPIO when the UART transmits. See emitUartTxFrame().
-      this.emitUartTxFrame(0, value);
-    };
-
-    // ── Wire UART1 (Serial1) — also forward to onSerialData for now ──
-    this.rp2040.uart[1].onByte = (value: number) => {
-      if (this.onSerialData) {
-        this.onSerialData(String.fromCharCode(value));
-      }
-      this.emitUartTxFrame(1, value);
-    };
+    // Both PL011s clock into their ports (the console is UART0's, in
+    // uartTransmitted); the fabric hears them from there.
+    this.wireUart(this.rp2040);
 
     // ── Wire I2C0 and I2C1 ───────────────────────────────────────────
     this.wireI2C(0);
@@ -1250,6 +1379,117 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
         prevState = bits[i];
       }
     }
+  }
+
+  /**
+   * Point a freshly built SoC's UARTs at the ports. Called by every path that
+   * creates an RP2040, so the port bound before is the one the new SoC
+   * shifts into. A new SoC starts with a quiet line: whatever the previous
+   * run never read is gone with it (the old SoC's alarms went with its
+   * clock), and a byte that finds the receive FIFO full waits for the guest
+   * to pull one out of UARTDR.
+   */
+  private wireUart(mcu: RP2040): void {
+    for (const unit of [0, 1] as const) {
+      this.uartInbox[unit].length = 0;
+      this.uartWire[unit] = null;
+      const uart = mcu.uart[unit];
+      uart.onByte = (value: number) => this.uartTransmitted(mcu, unit, value);
+      const read = uart.readUint32.bind(uart);
+      uart.readUint32 = (offset: number): number => {
+        const value = read(offset);
+        if (offset === UARTDR && this.rp2040 === mcu) this.pumpUart(unit);
+        return value;
+      };
+    }
+  }
+
+  /**
+   * A UART shifted a byte out. The fabric hears every controller; the
+   * console hears UART0 while UART0 is the console (an Arduino sketch's
+   * Serial); the scope sees the frame on the TX pad of whichever it was.
+   */
+  private uartTransmitted(mcu: RP2040, unit: 0 | 1, value: number): void {
+    // A controller of a SoC that has been replaced reaches nobody.
+    if (mcu !== this.rp2040) return;
+    const byte = value & 0xff;
+    this.uartPorts[unit].handler?.(byte);
+    if (this.onSerialData && (unit === 1 || !this.micropythonMode)) {
+      this.onSerialData(String.fromCharCode(byte), unit);
+    }
+    this.emitUartTxFrame(unit, byte);
+  }
+
+  /**
+   * Where UART `unit` is routed now: every pad whose funcsel is F2 on that
+   * controller. Serial1 and Serial2 are told apart by this alone, and a
+   * sketch that moves one (setTX/setRX, machine.UART with pins) moves the
+   * fabric's wire with it.
+   */
+  private refreshUartRouting(unit: 0 | 1): void {
+    const mcu = this.rp2040;
+    const r: UartRouting = {};
+    if (mcu) {
+      for (let g = 0; g < mcu.gpio.length; g++) {
+        if ((((g + 4) >> 3) & 1) !== unit || mcu.gpio[g].functionSelect !== FUNCSEL_UART) continue;
+        const signal = UART_PAD_SIGNAL[g & 3];
+        // The fabric follows TX and RX; two pads on one signal are one wire
+        // to the controller, and the lowest stands for it, as for SPI.
+        if ((signal === 'tx' || signal === 'rx') && r[signal] === undefined) r[signal] = g;
+      }
+    }
+    const key = `${r.tx}|${r.rx}`;
+    if (key === this.uartRoutingKey[unit]) return;
+    this.uartRouting[unit] = r;
+    this.uartRoutingKey[unit] = key;
+    this.uartPorts[unit].routingChanged?.();
+  }
+
+  /** A byte for the UART's receiver: onto the wire, behind whatever is already on it. */
+  private queueUartByte(unit: 0 | 1, byte: number): void {
+    if (!this.rp2040) return;
+    this.uartInbox[unit].push(byte);
+    this.pumpUart(unit);
+  }
+
+  /**
+   * Start the next byte of the inbox down the wire, unless one is on it: it
+   * lands (feedByte) one character time later and starts the one after. A
+   * UART the guest has not opened, or has not given a rate, has no character
+   * time yet; the byte waits, and the frame loop asks again. A byte that
+   * lands on a full FIFO waits too, for the read that makes room.
+   */
+  private pumpUart(unit: 0 | 1): void {
+    const mcu = this.rp2040;
+    if (!mcu || this.uartWire[unit] || this.uartInbox[unit].length === 0) return;
+    const uart = mcu.uart[unit];
+    const charNanos = this.uartCharNanos(uart);
+    if (charNanos === null || this.uartRxFull(uart)) return;
+    const alarm = mcu.clock.createAlarm(() => {
+      this.uartWire[unit] = null;
+      if (this.rp2040 !== mcu) return;
+      const next = this.uartInbox[unit][0];
+      if (next === undefined || this.uartRxFull(uart)) return;
+      this.uartInbox[unit].shift();
+      uart.feedByte(next);
+      this.pumpUart(unit);
+    });
+    this.uartWire[unit] = alarm;
+    alarm.schedule(charNanos);
+  }
+
+  /** One character on the wire, in guest nanoseconds, from the PL011's line settings; null until it has some. */
+  private uartCharNanos(uart: RpUart): number | null {
+    if (!uart.enabled) return null;
+    const link = rpUartLink(uart as unknown as RpUartLike);
+    if (!link) return null;
+    const bits = 1 + link.dataBits + (link.parity === 'none' ? 0 : 1) + link.stopBits;
+    return Math.ceil((bits * 1e9) / link.baud);
+  }
+
+  /** The PL011 model reports a full receive FIFO through UARTFR. */
+  private uartRxFull(uart: RpUart): boolean {
+    return (uart.flags & UARTFR_RXFF) !== 0;
   }
 
   private wireI2C(bus: 0 | 1): void {
@@ -1397,6 +1637,9 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
     let dt = deltaMs > 0 ? deltaMs : 1000 / FPS;
     if (dt > MAX_DELTA_MS) dt = MAX_DELTA_MS;
     const cyclesTarget = Math.max(1, Math.floor(CYCLES_PER_MS * dt * this.speed));
+    // A byte that waited for the guest to open its UART goes now.
+    this.pumpUart(0);
+    this.pumpUart(1);
     const { core } = this.rp2040;
     const clock = (this.rp2040 as unknown as { clock?: SimClock }).clock ?? null;
     const pioDiv = this.getPIOClockDiv();
@@ -1550,10 +1793,8 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
         };
         this.onBaudRateChange?.(0, USB_CDC_LINK);
 
-        // Re-wire peripherals (skipping UART0 serial)
-        this.rp2040.uart[1].onByte = (value: number) => {
-          if (this.onSerialData) this.onSerialData(String.fromCharCode(value));
-        };
+        // Re-wire peripherals: the same ports as every other rebuild.
+        this.wireUart(this.rp2040);
         this.wireI2C(0);
         this.wireI2C(1);
         // The same ports as every other rebuild: never a bare loopback,
@@ -1694,7 +1935,8 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
   }
 
   /**
-   * Send text to UART0 RX (or USBCDC in MicroPython mode).
+   * Send text to UART0 RX (or USBCDC in MicroPython mode). A UART byte goes
+   * down the wire at the line's rate, so a pasted line is not cut at 32 bytes.
    */
   serialWrite(text: string): void {
     if (!this.rp2040) return;
@@ -1703,9 +1945,7 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
         this.usbCDC.sendSerialByte(text.charCodeAt(i));
       }
     } else {
-      for (let i = 0; i < text.length; i++) {
-        this.rp2040.uart[0].feedByte(text.charCodeAt(i));
-      }
+      for (let i = 0; i < text.length; i++) this.queueUartByte(0, text.charCodeAt(i) & 0xff);
     }
   }
 
@@ -1722,12 +1962,8 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
    * @returns true when the bytes were delivered.
    */
   feedUart(uart: number, data: string): boolean {
-    if (!this.rp2040) return false;
-    const target = this.rp2040.uart[uart];
-    if (!target) return false;
-    for (let i = 0; i < data.length; i++) {
-      target.feedByte(data.charCodeAt(i));
-    }
+    if (!this.rp2040 || (uart !== 0 && uart !== 1)) return false;
+    for (let i = 0; i < data.length; i++) this.queueUartByte(uart, data.charCodeAt(i) & 0xff);
     return true;
   }
 
@@ -1739,7 +1975,7 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
     if (this.micropythonMode && this.usbCDC) {
       this.usbCDC.sendSerialByte(byte);
     } else {
-      this.rp2040.uart[0].feedByte(byte);
+      this.queueUartByte(0, byte & 0xff);
     }
   }
 

@@ -130,3 +130,26 @@ __all__ = [
     "ledc_signal_for_channel",
     "channel_for_ledc_signal",
 ]
+
+
+# UnTXD_OUT_IDX per chip, by controller (the same gpio_sig_map.h files). The
+# worker reads which UART a pad carries off the matrix so a chip's RX leg,
+# wired to the pad the guest transmits on, follows a `Serial1.begin(9600,
+# SERIAL_8N1, 16, 17)` that moved the port (project board-buses-2026-09, F6).
+# Only the TX signals: a pad's input select (UnRXD_IN) is not in gpio_out_sel.
+UART_TX_OUT_IDX_BY_CHIP = {
+    'esp32': {14: 0, 17: 1, 198: 2},
+    'esp32-s3': {12: 0, 15: 1, 18: 2},
+    'esp32-c3': {6: 0, 9: 1},
+}
+
+
+def uart_tx_signals(machine: str) -> dict[int, int]:
+    """Matrix signal id -> UART controller, for the chip a machine string names."""
+    if not machine:
+        return {}
+    if 'c3' in machine:
+        return UART_TX_OUT_IDX_BY_CHIP['esp32-c3']
+    if 's3' in machine:
+        return UART_TX_OUT_IDX_BY_CHIP['esp32-s3']
+    return UART_TX_OUT_IDX_BY_CHIP['esp32']

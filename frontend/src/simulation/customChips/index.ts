@@ -1,13 +1,7 @@
 export { ChipInstance, type ChipInstanceOptions } from './ChipRuntime';
 export { SPIDevice } from './SPIBus';
 export { WasiShim } from './WasiShim';
-export {
-  getSimulatorBridges,
-  ensureUartBridge,
-  avrUartTx,
-  detectSimulatorKind,
-  type SimulatorKind,
-} from './simulatorBridges';
+export { detectSimulatorKind, type SimulatorKind } from './simulatorBridges';
 
 /** Decode a base64-encoded WASM blob (from /api/compile-chip or stored in props). */
 export function decodeWasmBase64(b64: string): Uint8Array {
