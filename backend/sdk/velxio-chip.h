@@ -49,10 +49,18 @@ typedef enum {
 /** Register a logical pin on the chip. The host wires it via the diagram. */
 extern vx_pin vx_pin_register(const char* name, vx_pin_mode mode);
 
-/** Read the digital value (0 or 1) of a pin. */
+/**
+ * Read the digital value (0 or 1) of a pin. On a board pin it is the level
+ * the wire carries (the MCU's, or another part's on the same pin), never the
+ * mode the pin was registered with; a pin nothing has driven reads 0.
+ */
 extern int    vx_pin_read(vx_pin p);
 
-/** Drive a digital value on an OUTPUT pin. */
+/**
+ * Drive a digital value on an OUTPUT pin. On a board pin the chip is one
+ * driver of the wire: the MCU's pad wins while it drives (the host reports
+ * the contention), and two chips holding one line resolve as a wired-AND.
+ */
 extern void   vx_pin_write(vx_pin p, int value);
 
 /** Read the analog voltage (0.0 .. supply_volts) of a pin. */
@@ -71,7 +79,14 @@ extern void   vx_pin_dac_write(vx_pin p, double voltage);
  */
 extern void   vx_pin_pwm_write(vx_pin p, double duty);
 
-/** Change a pin's mode after registration. Useful for bidirectional I/O. */
+/**
+ * Change a pin's mode after registration, the way a bidirectional line is
+ * done: VX_OUTPUT_LOW / VX_OUTPUT_HIGH drive their level at once, VX_OUTPUT
+ * drives nothing until the first vx_pin_write, and an INPUT mode releases
+ * the line: the chip leaves the wire and the pad's pull, or whoever else
+ * holds it, has it. On the QEMU boards there is no pad model and a released
+ * pin keeps the last level the chip drove.
+ */
 extern void   vx_pin_set_mode(vx_pin p, vx_pin_mode mode);
 
 /**
@@ -154,16 +169,28 @@ typedef int32_t vx_spi;
  * SPI configuration.
  *
  * `cs` is the chip's select line, and the bus HONOURS it: the chip is clocked
- * only while that pin is asserted, as the silicon is. A chip with no select
- * line (a 74HC595, whose RCLK is a latch and not a select) sets it to
- * ((vx_pin)-1) and is always on the bus. The chip still watches the pin itself
- * when it wants the edges, which is the usual way to arm a transfer.
+ * only while that pin is low, as the silicon is. A chip with no select line
+ * (a 74HC595, whose RCLK is a latch and not a select) sets it to ((vx_pin)-1)
+ * and is always on the bus. The chip still watches the pin itself when it
+ * wants the edges, which is the usual way to arm a transfer, and the host
+ * puts the select edge on that pin whichever block of the board drives it:
+ * a controller that raises its select inside the SPI peripheral (the PL022
+ * of the RP2040) moves the chip's CS pin the same way a GPIO does.
  *
  * `sck`, `mosi` and `miso` say which lines the chip is wired to: they decide
  * which bus of the board the chip sits on, so a chip whose miso leg is not
  * wired clocks bytes in and answers nothing.
  *
- * `on_done` fires after every `count` bytes received via vx_spi_start():
+ * `mode` is the SPI mode (CPOL << 1 | CPHA) the chip is written for, and
+ * bytes are exchanged MSB first, as every datasheet the gallery models has
+ * them. The bus compares both with the controller's settings and reports a
+ * mismatch (`spi-mode`, `spi-bit-order`) rather than shifting the bytes the
+ * way the wrong mode would on hardware. There is no clock-rate field: the
+ * rate is the controller's, and a chip has nothing to hold against it.
+ *
+ * `on_done` fires once per transfer, after the `count` bytes of the
+ * vx_spi_start() that armed it (fewer when vx_spi_stop() ended it early);
+ * `buffer` is the pointer that handle's own vx_spi_start() armed:
  *   - Before the call, `buffer` contains the chip's outgoing MISO bytes.
  *   - After the call, `buffer` contains the master's MOSI bytes received.
  *
@@ -207,9 +234,23 @@ extern void vx_spi_stop(vx_spi s);
 
 typedef int32_t vx_timer;
 
+/**
+ * The board's simulated time in nanoseconds: the guest's cycles at its clock
+ * rate in the browser, the QEMU virtual clock on the QEMU boards. 0 when the
+ * chip is created, never backwards across a reset or a Stop/Run, still while
+ * the simulation is stopped. Inside a timer callback it is that timer's
+ * deadline.
+ */
 extern uint64_t vx_sim_now_nanos(void);
 
 extern vx_timer vx_timer_create(void (*cb)(void* user_data), void* user_data);
+/**
+ * Fire `cb` at the guest instant now + period_nanos, and every period after
+ * it with `repeat` (the period is added to the deadline, never to the moment
+ * the callback ran). The chip's clock above, never the host's; a timer armed
+ * before the guest has a clock starts once it runs. The Linux-board host runs
+ * no chip timers.
+ */
 extern void     vx_timer_start(vx_timer t, uint64_t period_nanos, bool repeat);
 extern void     vx_timer_stop(vx_timer t);
 

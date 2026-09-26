@@ -16,12 +16,17 @@ Scope of this MVP:
 - Named blobs (vx_blob_size / vx_blob_read / vx_blob_write)
 - I2C slave (vx_i2c_attach + 4 callbacks)
 - vx_log + printf via WASI fd_write
-- vx_sim_now_nanos (returns wall-clock for now)
+- vx_sim_now_nanos and the timers, on the clock the host hands over (the
+  QEMU workers pass the guest's virtual clock; without one, host time)
+- SPI, one armed buffer per vx_spi_attach handle, behind the chip's own select
+- UART, pin watch, framebuffer
 
-Out of scope (raise NotImplementedError):
-- SPI, UART, Timers (need additional QEMU integration)
-- Pin watch (firmware-driven, not yet wired through the QEMU thread)
-- Framebuffer
+The contract every call follows is the header's (backend/sdk/velxio-chip.h),
+and the browser runtime (frontend/src/simulation/customChips/ChipRuntime.ts)
+answers the same for the same call: one chip model runs beside the CPU here
+and in the tab, and the cross-host table
+(frontend/src/__tests__/board-buses/fixtures/chips-abi-parity/) is what holds
+the two to one answer.
 """
 from __future__ import annotations
 
@@ -107,6 +112,46 @@ _UART_CONFIG_FMT = "<IIIIII"      # 24 bytes (ignore reserved trailer)
 #   offset 28 : on_exchange  (function index, 0 = none; was reserved[0])
 #   offset 32 : reserved[7]  (28 bytes, ignored)
 _SPI_CONFIG_FMT = "<IIIIIIII"     # 32 bytes (ignore reserved trailer)
+
+
+class _SpiHandle:
+    """One vx_spi_attach: its config and the buffer the chip has armed on it.
+
+    A chip with two handles is two devices on the bus, each behind its own
+    select and each with its own buffer, exactly as ChipRuntime.ts keeps one
+    SPIDevice per handle. The runtime used to keep one config and one buffer
+    for the whole chip, so the second attach silently replaced the first and
+    every on_done saw the last vx_spi_start's pointer (finding
+    spi-done-bufptr-shared, on the worker side).
+    """
+
+    __slots__ = ('cfg', 'ptr', 'count', 'pos', 'cache', 'cache_lo', 'gen')
+
+    def __init__(self, cfg: dict) -> None:
+        self.cfg = cfg
+        self.ptr = 0        # WASM ptr of the armed buffer
+        self.count = 0      # bytes armed; 0 = nothing armed
+        self.pos = 0        # bytes exchanged so far
+        # A Python copy of a long armed buffer (see spi_transfer_byte) and
+        # the first position whose MOSI it holds and wasm memory does not yet.
+        self.cache: bytearray | None = None
+        self.cache_lo = 0
+        # Bumped by every vx_spi_start, so a completion can tell whether the
+        # chip re-armed from inside on_done.
+        self.gen = 0
+
+    def arm(self, ptr: int, count: int) -> None:
+        self.cache = None
+        self.ptr = ptr
+        self.count = count
+        self.pos = 0
+        self.gen += 1
+
+    def clear(self) -> None:
+        self.cache = None
+        self.ptr = 0
+        self.count = 0
+        self.pos = 0
 
 
 class ChipNetBus:
@@ -223,9 +268,9 @@ class ChipNetBus:
         if source is not None:
             rt = source[0]
             override = getattr(rt, "_now_override_ns", None)
-            t0 = getattr(rt, "_t0", None)
-            if override is not None and t0 is not None:
-                return int(t0) + int(override)
+            to_host = getattr(rt, "host_ns_of", None)
+            if override is not None and to_host is not None:
+                return int(to_host(int(override)))
         return int(self._clock())
 
     def apply_remote(self, net_id: str, value: int, ts_ns: int = 0) -> None:
@@ -344,6 +389,7 @@ class WasmChipRuntime:
         display: dict | None = None,
         component_id: str | None = None,
         blobs: dict[str, bytes] | None = None,
+        clock: Optional[Callable[[], int]] = None,
     ):
         """
         Args:
@@ -376,6 +422,14 @@ class WasmChipRuntime:
             blobs:      named byte storage for vx_blob_* (the microSD card
                         image arrives as "card"). Raw bytes; decode_blobs()
                         turns the base64 that travels on the wire into them.
+            clock:      () -> ns, the guest's clock: what vx_sim_now_nanos
+                        answers and what the timer deadlines are on. The QEMU
+                        workers pass QEMU_CLOCK_VIRTUAL, the clock the guest's
+                        own micros() counts, so a chip that measures a pulse
+                        or paces a timer agrees with the sketch whatever the
+                        host's load (memory: parts run on the guest clock,
+                        never the wall clock). None keeps host time, which
+                        is all a host without a guest clock has.
         """
         self._engine = wasmtime.Engine()
         self._store = wasmtime.Store(self._engine)
@@ -387,13 +441,9 @@ class WasmChipRuntime:
         )
 
         # See _mem_view / _call_indirect: both caches are dropped whenever wasm
-        # runs, which is the only thing that can invalidate them.
+        # runs, which is the only thing that can invalidate them. A handle's
+        # buffer copy (_SpiHandle.cache) is written back by the same hook.
         self._mem_view_cache = None
-        # A Python copy of a long armed SPI buffer (see spi_transfer_byte) and
-        # the first position whose MOSI it holds and wasm memory does not yet.
-        # Written back before wasm runs, by the same hook that drops the view.
-        self._spi_cache: bytearray | None = None
-        self._spi_cache_lo = 0
         self._fn_cache: dict[int, object] = {}
         self._fast_cache: dict[int, object] = {}
 
@@ -434,9 +484,14 @@ class WasmChipRuntime:
         # racing a write loses the part of the span the write had just added.
         self._blob_lock = threading.Lock()
 
-        # I2C state populated by vx_i2c_attach
-        self.i2c_address: int | None = None
-        self.i2c_callbacks: dict | None = None    # {on_connect, on_read, on_write, on_stop, user_data}
+        # I2C state populated by vx_i2c_attach: one entry per call, in call
+        # order. A chip that attaches two addresses on one SDA/SCL is one chip
+        # with two targets (the browser runtime keeps them the same way); each
+        # START selects the entry whose address it names, and the STOP goes
+        # to every entry addressed since the last one.
+        self._i2c_devices: list[dict] = []        # [{address, on_connect, on_read, on_write, on_stop, user_data}]
+        self._i2c_current: dict | None = None     # the entry the last START addressed
+        self._i2c_touched: list[dict] = []        # entries addressed since the last STOP
 
         # UART state — at most one UART per chip in MVP
         self.uart_config: dict | None = None      # {rx, tx, baud_rate, on_rx_byte, on_tx_done, user_data}
@@ -444,11 +499,8 @@ class WasmChipRuntime:
         # worker's bus table decides per byte from the tab's wiring map
         # (uart_bus_table.py), and a chip on no controller is silent.
 
-        # SPI state
-        self.spi_config: dict | None = None       # {sck, mosi, miso, cs, mode, on_done, user_data}
-        self._spi_buffer_ptr: int = 0             # WASM ptr to current MISO buffer
-        self._spi_buffer_count: int = 0
-        self._spi_buffer_pos: int = 0
+        # SPI state: one entry per vx_spi_attach (see _SpiHandle).
+        self._spi_handles: list[_SpiHandle] = []
 
         # Timer state — list of active timers
         # each: {cb_idx, user_data, period_ns, repeat, next_fire_ns, active}
@@ -487,11 +539,19 @@ class WasmChipRuntime:
         self._fb_dirty_hi = 0
         self._fb_lock = threading.Lock()
 
-        # Timestamp anchor for sim_now_nanos
+        # The chip's clock. With `clock`, vx_sim_now_nanos is what it answers;
+        # without one, host time since this instance was made (_t0).
+        self._clock = clock
         self._t0 = time.monotonic_ns()
         # Set while a remote net edge is delivered (notify_net_change with a
-        # stamp): the instant the chip's callbacks read as "now".
-        self._now_override_ns: int | None = None
+        # stamp), and while a timer callback runs (fire_due_timers): the
+        # instant the chip's callbacks read as "now". PER THREAD: the timer
+        # thread fires a callback at its deadline while QEMU's thread delivers
+        # a pin edge, and the edge's callback must read the clock, not the
+        # other thread's deadline. The ESP32 worker serialises the two under
+        # the iothread lock; the STM32 worker has no such lock to take, and
+        # a 1 ms chip timer there stamped every edge with its own deadline.
+        self._override = threading.local()
 
         # Build the linker
         linker = wasmtime.Linker(self._engine)
@@ -501,6 +561,14 @@ class WasmChipRuntime:
 
         self._instance = linker.instantiate(self._store, self._module)
         self._exports = self._instance.exports(self._store)
+
+    @property
+    def _now_override_ns(self) -> int | None:
+        return getattr(self._override, "ns", None)
+
+    @_now_override_ns.setter
+    def _now_override_ns(self, value: int | None) -> None:
+        self._override.ns = value
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -514,6 +582,50 @@ class WasmChipRuntime:
         chip_setup(self._store)
         self._drop_mem_view()
         self._flush_stdout()
+
+    # ── What the chip declared ───────────────────────────────────────────────
+
+    @property
+    def spi_config(self) -> dict | None:
+        """The first vx_spi_attach's config (the dict the handle answers
+        from, so a host that edits it edits the live one), None when the
+        chip declared no SPI. The workers ask this to know whether to put the
+        chip on their bus table."""
+        return self._spi_handles[0].cfg if self._spi_handles else None
+
+    def spi_handle_count(self) -> int:
+        """How many SPI handles the chip attached: each is a device of its
+        own on the bus, behind its own select."""
+        return len(self._spi_handles)
+
+    @property
+    def _spi_cache(self) -> bytearray | None:
+        """Handle 0's buffer copy; kept so a host can see the copy is in use."""
+        return self._spi_handles[0].cache if self._spi_handles else None
+
+    @property
+    def i2c_address(self) -> int | None:
+        """The first address the chip attached, None when it declared no I2C.
+        The Linux-board adapter and the workers' logs read this one."""
+        return self._i2c_devices[0]["address"] if self._i2c_devices else None
+
+    @property
+    def i2c_addresses(self) -> list[int]:
+        """Every address the chip attached, in call order, each once: what a
+        worker registers on its bus table so all of them answer."""
+        out: list[int] = []
+        for d in self._i2c_devices:
+            if d["address"] not in out:
+                out.append(d["address"])
+        return out
+
+    @property
+    def i2c_callbacks(self) -> dict | None:
+        """The entry a START last addressed, else the last attach: the config
+        call_i2c_callback answers from when no address is given."""
+        if self._i2c_current is not None:
+            return self._i2c_current
+        return self._i2c_devices[-1] if self._i2c_devices else None
 
     # ── Memory & helpers ──────────────────────────────────────────────────────
 
@@ -607,8 +719,9 @@ class WasmChipRuntime:
     def _drop_mem_view(self) -> None:
         # Wasm is about to run: the chip must find in its buffer every MOSI
         # byte the master has clocked so far, and may rewrite what is left.
-        if self._spi_cache is not None:
-            self._spi_sync()
+        for st in self._spi_handles:
+            if st.cache is not None:
+                self._spi_sync(st)
         self._mem_view_cache = None
 
     # A buffer at least this long is served from a Python copy. Every byte
@@ -618,32 +731,43 @@ class WasmChipRuntime:
     # (a command byte, a register) is cheaper to serve in place.
     _SPI_CACHE_MIN = 16
 
-    def _spi_cached_frame_done(self, miso_byte: int) -> int:
-        """The last byte of a buffer served from the copy. on_done runs wasm,
-        which writes the copy back first (_drop_mem_view), so the chip sees
-        the whole frame, exactly as it does for a buffer served in place."""
-        cfg = self.spi_config or {}
-        on_done = cfg.get("on_done", 0)
-        if on_done:
-            self._call_indirect(on_done, cfg["user_data"], self._spi_buffer_ptr,
-                                self._spi_buffer_count)
-        else:
-            self._spi_sync()
-        self._flush_stdout()
-        return miso_byte
+    def _spi_frame_done(self, st: _SpiHandle) -> None:
+        """The last byte of an armed buffer went out: on_done, once, with the
+        buffer the chip armed on THIS handle. For a buffer served from the
+        copy, on_done runs wasm, which writes the copy back first
+        (_drop_mem_view), so the chip sees the whole frame exactly as it does
+        for a buffer served in place.
 
-    def _spi_sync(self) -> None:
+        Afterwards the transfer is over. The chip may have re-armed from
+        inside on_done (the 74HC595 idiom), and then the new buffer stands;
+        if it did not, nothing is armed: the next byte reads the idle level
+        and a vx_spi_stop reports nothing, as SPIDevice does in the browser.
+        The old code left the finished buffer armed, so the vx_spi_stop every
+        CS-gated chip issues on the rising edge fired on_done a second time
+        with the same frame (PHASES.md F7, the worker's first divergence).
+        """
+        gen = st.gen
+        on_done = st.cfg.get("on_done", 0)
+        if on_done:
+            self._call_indirect(on_done, st.cfg["user_data"], st.ptr, st.count)
+        elif st.cache is not None:
+            self._spi_sync(st)
+        self._flush_stdout()
+        if st.gen == gen:
+            st.clear()
+
+    def _spi_sync(self, st: _SpiHandle) -> None:
         """Put the MOSI bytes the cached buffer took back into wasm memory and
         forget the copy: after wasm runs, the chip may have re-armed or
         rewritten the rest of it."""
-        cache = self._spi_cache
-        self._spi_cache = None
+        cache = st.cache
+        st.cache = None
         if cache is None:
             return
-        lo, hi = self._spi_cache_lo, min(self._spi_buffer_pos, len(cache))
+        lo, hi = st.cache_lo, min(st.pos, len(cache))
         if hi > lo:
             view = self._mem_view()
-            ctypes.memmove(ctypes.addressof(view) + self._spi_buffer_ptr + lo,
+            ctypes.memmove(ctypes.addressof(view) + st.ptr + lo,
                            bytes(cache[lo:hi]), hi - lo)
 
     def _read_cstring(self, ptr: int) -> str:
@@ -829,8 +953,11 @@ class WasmChipRuntime:
             initial = 1 if mode == self.MODE_OUTPUT_HIGH else 0
             gpio = self._pin_map.get(name)
             net = self._net_map.get(name)
+            # `seen`: the host has reported a level on this pad at least
+            # once (notify_pin_change), so `value` is a level and not the
+            # registration default. Until then an input reads its pull.
             self._pins.append({"name": name, "mode": mode, "value": initial,
-                               "gpio": gpio, "net": net})
+                               "gpio": gpio, "net": net, "seen": False})
             if net is not None and self._net_bus is not None:
                 self._net_bus.register(net, self, handle)
             # Drive the initial level into QEMU if this is an OUTPUT_LOW/HIGH pin
@@ -880,8 +1007,22 @@ class WasmChipRuntime:
             return
 
         def vx_pin_set_mode(handle: int, mode: int) -> None:
-            if 0 <= handle < len(self._pins):
-                self._pins[handle]["mode"] = mode
+            if not (0 <= handle < len(self._pins)):
+                return
+            p = self._pins[handle]
+            p["mode"] = mode
+            # VX_OUTPUT_LOW / VX_OUTPUT_HIGH carry a level, at set_mode as at
+            # registration: the open-drain idiom pulls a line with
+            # set_mode(VX_OUTPUT_LOW) and never writes it (the browser runtime
+            # drives it the same way). Plain VX_OUTPUT keeps the last value.
+            if mode in (self.MODE_OUTPUT_LOW, self.MODE_OUTPUT_HIGH):
+                vx_pin_write(handle, 1 if mode == self.MODE_OUTPUT_HIGH else 0)
+            # VX_INPUT is the documented tri-state idiom. There is nothing to
+            # release here: QEMU's pin injection (qemu_picsimlab_set_pin)
+            # carries a level and no float state, so the pad keeps the last
+            # level the chip drove. The cross-host table says so on that row
+            # rather than pretending; a pad model in the worker is what would
+            # close it.
 
         def vx_pin_watch(handle: int, edge: int, cb_idx: int, user_data: int) -> None:
             if not (0 <= handle < len(self._pins)):
@@ -892,13 +1033,21 @@ class WasmChipRuntime:
                 # no edges to detect.
                 return
 
+            # The watch starts from the level the pin reads NOW (pin_level:
+            # the guest's level when reported, the pull when never driven),
+            # the way the browser's watch starts from the PinManager's level.
+            # It used to start from the registration default (0), so a
+            # pulled-up select the guest first drives high fired a rising
+            # edge no silicon would see.
+            start = self.pin_level(handle) & 1
+
             def _entry() -> dict:
                 return {
                     "handle": handle,
                     "edge": edge & 3,
                     "cb_idx": cb_idx,
                     "user_data": user_data,
-                    "last_value": p["value"] & 1,
+                    "last_value": start,
                 }
 
             if p["gpio"] is not None:
@@ -935,9 +1084,12 @@ class WasmChipRuntime:
 
         # ── I2C ──
         def vx_i2c_attach(cfg_ptr: int) -> int:
+            # Every attach is kept: a chip on two addresses is two targets on
+            # one pair of pins. Returns 0 like the browser runtime, so a chip
+            # reads the same handle in every host.
             cfg = self._read_i2c_config(cfg_ptr)
-            self.i2c_address = cfg["address"]
-            self.i2c_callbacks = cfg
+            cfg["address"] = cfg["address"] & 0x7F
+            self._i2c_devices.append(cfg)
             return 0
 
         # ── UART ──
@@ -946,10 +1098,12 @@ class WasmChipRuntime:
             return 0
 
         def vx_uart_write(_handle: int, buf_ptr: int, count: int) -> int:
-            if count <= 0:
-                return 1
-            data = self._read_bytes(buf_ptr, count)
-            if self._uart_writer is not None:
+            # An empty write puts nothing on the wire and still completes,
+            # as it does in the browser runtime: on_tx_done is the chip's
+            # pacing signal, and a host that skips it for zero bytes leaves a
+            # state machine waiting.
+            data = self._read_bytes(buf_ptr, count) if count > 0 else b""
+            if data and self._uart_writer is not None:
                 try:
                     # The bytes only: the worker's bus table puts them in the
                     # guest UART whose RX the chip's TX pad is wired to, as the
@@ -967,29 +1121,35 @@ class WasmChipRuntime:
 
         # ── SPI ──
         def vx_spi_attach(cfg_ptr: int) -> int:
-            self.spi_config = self._read_spi_config(cfg_ptr)
-            return 0
+            # The handle is the index: a chip with two handles is two
+            # devices, each behind its own select, as in the browser runtime.
+            self._spi_handles.append(_SpiHandle(self._read_spi_config(cfg_ptr)))
+            return len(self._spi_handles) - 1
 
-        def vx_spi_start(_handle: int, buf_ptr: int, count: int) -> None:
+        def vx_spi_start(handle: int, buf_ptr: int, count: int) -> None:
+            if not (0 <= handle < len(self._spi_handles)):
+                return
             # Called from inside wasm, so any copy was already written back.
-            self._spi_cache = None
-            self._spi_buffer_ptr = buf_ptr
-            self._spi_buffer_count = count
-            self._spi_buffer_pos = 0
+            # An empty exchange arms nothing: no byte to shift, no completion.
+            self._spi_handles[handle].arm(buf_ptr, max(0, int(count)))
 
-        def vx_spi_stop(_handle: int) -> None:
-            self._spi_cache = None
-            # Fire on_done with what we have so far.
-            if self.spi_config and self.spi_config["on_done"] and self._spi_buffer_count > 0:
-                self._call_indirect(
-                    self.spi_config["on_done"],
-                    self.spi_config["user_data"],
-                    self._spi_buffer_ptr,
-                    self._spi_buffer_pos,
-                )
-            self._spi_buffer_ptr = 0
-            self._spi_buffer_count = 0
-            self._spi_buffer_pos = 0
+        def vx_spi_stop(handle: int) -> None:
+            if not (0 <= handle < len(self._spi_handles)):
+                return
+            st = self._spi_handles[handle]
+            st.cache = None
+            if st.count <= 0:
+                # Nothing armed (or the transfer already completed and
+                # reported): nothing to report. This is the case the CS idiom
+                # hits on every rising edge after a full frame.
+                return
+            # End the exchange where it stands: on_done with the bytes
+            # exchanged so far, as CS rising does.
+            ptr, pos = st.ptr, st.pos
+            st.clear()
+            on_done = st.cfg.get("on_done", 0)
+            if on_done:
+                self._call_indirect(on_done, st.cfg["user_data"], ptr, pos)
 
         # ── Time + timers ──
         def vx_sim_now_nanos() -> int:
@@ -1198,7 +1358,31 @@ class WasmChipRuntime:
     # ── Time + telemetry helpers ──────────────────────────────────────────────
 
     def sim_now_nanos(self) -> int:
+        """The chip's "now": the clock the host handed over (the guest's), or
+        host time since this instance was made."""
+        if self._clock is not None:
+            return int(self._clock())
         return time.monotonic_ns() - self._t0
+
+    # The cross-worker net bridge stamps every edge on CLOCK_MONOTONIC, the
+    # one timeline two workers on a host share, and a chip's instants are on
+    # its own clock. These two map between them: on host time the map is the
+    # fixed origin _t0; on a guest clock it is the offset between the two
+    # clocks right now, which keeps the spacing between edges (what a
+    # self-clocked protocol measures) as long as guest and host time run at
+    # the same rate, as they do without -icount.
+
+    def host_ns_of(self, chip_ns: int) -> int:
+        """CLOCK_MONOTONIC at the chip instant `chip_ns`."""
+        if self._clock is None:
+            return int(self._t0) + int(chip_ns)
+        return time.monotonic_ns() - (int(self._clock()) - int(chip_ns))
+
+    def chip_ns_of(self, host_ns: int) -> int:
+        """The chip's instant at CLOCK_MONOTONIC `host_ns`."""
+        if self._clock is None:
+            return int(host_ns) - int(self._t0)
+        return int(self._clock()) - (time.monotonic_ns() - int(host_ns))
 
     def _now_nanos_for_chip(self) -> int:
         """What vx_sim_now_nanos answers: the stamped instant while a remote
@@ -1222,12 +1406,47 @@ class WasmChipRuntime:
 
     # ── Exposed for the I2C slave adapter ────────────────────────────────────
 
-    def call_i2c_callback(self, name: str, *args: int) -> int:
-        """Invoke one of {on_connect, on_read, on_write, on_stop} via indirect call."""
-        if not self.i2c_callbacks:
+    def call_i2c_callback(self, name: str, *args: int, address: int | None = None) -> int:
+        """Invoke one of {on_connect, on_read, on_write, on_stop} via indirect
+        call, on the target the transaction is for.
+
+        `on_connect` names the address the master put on the wire: the entry
+        attached at that address takes the transaction (a chip with two
+        addresses is two targets), and an address the chip never attached
+        falls back to the entry a host without the address would have used,
+        the last attach, so a single-address chip answers as before. A read
+        or write goes to the entry the last START selected. The STOP is the
+        bus's: every entry addressed since the last STOP sees it, in the
+        order they were addressed, which is what the browser runtime does
+        and what the silicon of a two-address chip does.
+        """
+        if not self._i2c_devices:
             return 0
-        idx = self.i2c_callbacks.get(name, 0)
-        result = self._call_indirect(idx, self.i2c_callbacks["user_data"], *args)
+        if name == "on_stop":
+            touched = self._i2c_touched or ([self._i2c_current] if self._i2c_current else [])
+            self._i2c_touched = []
+            self._i2c_current = None
+            result = 0
+            for dev in touched:
+                result = self._call_indirect(dev.get("on_stop", 0), dev["user_data"])
+            self._flush_stdout()
+            return result
+        if name == "on_connect":
+            addr = address if address is not None else (int(args[0]) if args else None)
+            dev = None
+            if addr is not None:
+                for d in self._i2c_devices:
+                    if d["address"] == (int(addr) & 0x7F):
+                        dev = d
+                        break
+            if dev is None:
+                dev = self._i2c_devices[-1]
+            self._i2c_current = dev
+            if dev not in self._i2c_touched:
+                self._i2c_touched.append(dev)
+        else:
+            dev = self._i2c_current or self._i2c_devices[-1]
+        result = self._call_indirect(dev.get(name, 0), dev["user_data"], *args)
         self._flush_stdout()
         return result
 
@@ -1347,7 +1566,7 @@ class WasmChipRuntime:
         if not entries:
             return
         if at_ns is not None:
-            self._now_override_ns = max(0, at_ns - self._t0)
+            self._now_override_ns = max(0, self.chip_ns_of(at_ns))
         try:
             self._fire_watches(entries, value)
         finally:
@@ -1361,10 +1580,19 @@ class WasmChipRuntime:
         Must be called while holding the QEMU IO-thread lock — the chip's
         callback can call vx_pin_write which goes back into picsimlab.
         """
+        # The level is the chip's to read back (vx_pin_read) whether or not
+        # it watches the pad: a hardware chip select has no GPIO the reader
+        # could answer for, and the edge reported here is the only place its
+        # level exists.
+        v = value & 1
+        for p in self._pins:
+            if p["gpio"] == gpio:
+                p["value"] = v
+                p["seen"] = True
         entries = self._pin_watches.get(gpio)
         if not entries:
             return
-        self._fire_watches(entries, value)
+        self._fire_watches(entries, v)
         self._flush_stdout()
 
     # ── UART hook (chip ← firmware) ──────────────────────────────────────────
@@ -1391,12 +1619,30 @@ class WasmChipRuntime:
         if not (0 <= handle < len(self._pins)):
             return 0
         p = self._pins[handle]
-        # Prefer the live QEMU value when wired & a reader is available.
+        mode = p["mode"]
+        # An output reads back what the chip drives: the pad is its own, and
+        # the PinManager in the tab answers the chip's last write the same
+        # way. The guest's view of that pad (a contention) is not the chip's.
+        if mode in (1, self.MODE_OUTPUT_LOW, self.MODE_OUTPUT_HIGH):
+            return p["value"] & 1
+        # An input on a board pad reads the live QEMU level when the guest
+        # has reported one. A pad the guest never drove is what the reader
+        # answers None for (the workers' _pin_state has no entry): the pin
+        # then reads the last level the host handed the chip on it (a
+        # hardware chip select exists only as the edge the peripheral
+        # reports, notify_pin_change), and before any, low. The chip's own
+        # pull is not modelled on a board pin, in this host or the browser's
+        # (its PinManager folds a never-driven pin into LOW too): the parts on
+        # that pin inject levels with no strength, and a pull that counted
+        # would beat every one of them.
         if p["gpio"] is not None and self._pin_reader is not None:
             try:
-                return self._pin_reader(p["gpio"]) & 1
+                level = self._pin_reader(p["gpio"])
             except Exception:
-                pass
+                level = None
+            if level is not None:
+                return int(level) & 1
+            return p["value"] & 1
         # No board GPIO: the net level is the pin level, so a chip reads
         # what another chip on the same net last drove.
         if p["net"] is not None and self._net_bus is not None:
@@ -1406,48 +1652,73 @@ class WasmChipRuntime:
         return p["value"] & 1
 
     # ── SPI hook (chip ← firmware) ───────────────────────────────────────────
-    def spi_cs_active(self) -> bool:
-        """Whether this chip's select line is asserted right now.
+    def spi_cs_active(self, handle: int = 0) -> bool:
+        """Whether the select line of SPI handle `handle` is asserted now.
 
         velxio-chip.h states the contract: the bus HONOURS `cfg.cs`, so the
         chip is clocked only while that pin is low, and a chip that set cs to
         -1 has no select line and is always on the bus (a 74HC595). The level
         comes from pin_level, so a select wired to a board GPIO follows the
-        guest and one on a chip net follows whatever drives that net.
+        guest and one on a chip net follows whatever drives that net; a
+        select the guest never drove reads its pull.
         """
-        if not self.spi_config:
+        if not (0 <= handle < len(self._spi_handles)):
             return False
-        handle = int(self.spi_config.get("cs", -1))
-        if handle < 0:
+        pin = int(self._spi_handles[handle].cfg.get("cs", -1))
+        if pin < 0:
             return True
-        return self.pin_level(handle) == 0
+        if self._pad_floats(pin):
+            # A select nobody has driven is floating, and a floating select
+            # is deselected: what the tab's fabric does (csWhenFloating) and
+            # what the pull-up on every breakout does on the bench. It used
+            # to read 0 here (the reader's default) and select the chip
+            # before the sketch had touched the pad.
+            return False
+        return self.pin_level(pin) == 0
 
-    def spi_transfer_byte(self, mosi: int) -> int:
-        """Called by the worker when the firmware clocks one SPI byte.
-        Returns the byte the chip put in its MISO buffer at the current position;
-        overwrites that buffer slot with `mosi` so the chip's `on_done` callback
-        sees what the master sent.
+    def _pad_floats(self, handle: int) -> bool:
+        """True when the chip pin `handle` sits on a board pad no one has
+        reported a level on: neither the guest (the reader has no entry) nor
+        the host (no notify_pin_change yet)."""
+        p = self._pins[handle]
+        if p["gpio"] is None or p.get("seen"):
+            return False
+        if self._pin_reader is None:
+            return False
+        try:
+            return self._pin_reader(p["gpio"]) is None
+        except Exception:
+            return False
+
+    def spi_transfer_byte(self, mosi: int, handle: int = 0) -> int:
+        """Called by the worker when the firmware clocks one SPI byte to the
+        device that SPI handle `handle` is. Returns the byte the chip put in
+        that handle's MISO buffer at the current position; overwrites that
+        buffer slot with `mosi` so the chip's `on_done` callback sees what
+        the master sent.
         """
         # The per-byte path of every responder a worker hosts: a streamed card
-        # read comes through here 515 times a sector, so each attribute is
-        # read once into a local and the buffer state is written back once.
+        # read comes through here 515 times a sector, so the handle is fetched
+        # once and its state is read into locals and written back once.
         #
         # A copy exists only while a long buffer is armed and part-way through
         # (it is made below and dropped by vx_spi_start, vx_spi_stop and
         # whenever wasm runs), so the middle of a sector needs no other check.
-        cache = self._spi_cache
+        if not (0 <= handle < len(self._spi_handles)):
+            return 0xFF
+        st = self._spi_handles[handle]
+        cache = st.cache
         if cache is not None:
-            pos = self._spi_buffer_pos
+            pos = st.pos
             miso_byte = cache[pos]
             cache[pos] = mosi & 0xFF
             pos += 1
-            self._spi_buffer_pos = pos
-            if pos < self._spi_buffer_count:
+            st.pos = pos
+            if pos < st.count:
                 return miso_byte
-            return self._spi_cached_frame_done(miso_byte)
-        cfg = self.spi_config
-        if not cfg:
-            return 0xFF
+            self._spi_frame_done(st)
+            return miso_byte
+        cfg = st.cfg
         # A chip that answers each byte as it arrives (velxio-chip.h,
         # `on_exchange`) is asked here and nothing else runs: the worker and the
         # Pi host always hand over a whole byte, so the buffer below is only
@@ -1458,38 +1729,33 @@ class WasmChipRuntime:
             miso_byte = self._call_indirect(on_exchange, cfg["user_data"], mosi & 0xFF) & 0xFF
             self._flush_stdout()
             return miso_byte
-        pos = self._spi_buffer_pos
-        count = self._spi_buffer_count
+        pos = st.pos
+        count = st.count
         if pos >= count:
-            # Nothing armed (count 0), or the armed buffer is used up.
+            # Nothing armed: the chip neither answers nor consumes, and the
+            # line reads its idle level.
             return 0xFF
         if count - pos >= self._SPI_CACHE_MIN:
             view = self._mem_view()
-            cache = self._spi_cache = bytearray(
-                ctypes.string_at(ctypes.addressof(view) + self._spi_buffer_ptr, count))
-            self._spi_cache_lo = pos
+            cache = st.cache = bytearray(
+                ctypes.string_at(ctypes.addressof(view) + st.ptr, count))
+            st.cache_lo = pos
             miso_byte = cache[pos]
             cache[pos] = mosi & 0xFF
-            self._spi_buffer_pos = pos + 1
+            st.pos = pos + 1
             return miso_byte
         # One byte in and one byte out of the chip's armed buffer, straight
         # through the cached view (see _mem_view).
         view = self._mem_view_cache
         if view is None:
             view = self._mem_view()
-        off = self._spi_buffer_ptr + pos
+        off = st.ptr + pos
         miso_byte = view[off]          # the chip's pre-filled response
         view[off] = mosi & 0xFF        # what the master sent, for on_done
         pos += 1
-        self._spi_buffer_pos = pos
+        st.pos = pos
         if pos >= count:
-            # Transfer complete — fire on_done with the buffer the chip prepared.
-            on_done = cfg.get("on_done", 0)
-            if on_done:
-                self._call_indirect(on_done, cfg["user_data"], self._spi_buffer_ptr, count)
-            self._flush_stdout()
-            # Reset; the chip's on_done may have called vx_spi_start again.
-            # If it didn't, future bytes return 0xff until it re-arms.
+            self._spi_frame_done(st)
         return miso_byte
 
     # ── Timers ──────────────────────────────────────────────────────────────

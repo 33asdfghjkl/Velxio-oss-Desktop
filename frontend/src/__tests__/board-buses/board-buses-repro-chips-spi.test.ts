@@ -693,11 +693,16 @@ describe('a chip on software SPI (Uno)', () => {
     offClk();
     // What a 74HC595 sees on its pins: eight SRCLK rising edges, A5 on SER.
     expect({ rising, sampled: sampled.toString(16) }).toEqual({ rising: 8, sampled: 'a5' });
-    // The Q readback of this wiring: a level injected on D5-D8/A0-A3 (made
-    // inputs first, as the probe's MISO above) reads back.
+    // The Q readback of this wiring. The 595's Q pins are its outputs (low
+    // at registration, nothing latched yet), and under F7's net model a chip
+    // output is a driver of its board pin: a level injected on D5-D8/A0-A3
+    // (made inputs first, as the probe's MISO above) does not move a pin the
+    // chip holds, and the sketch reads the chip's level back, as a push-pull
+    // output on the bench would win over a weak source. Before F7 the
+    // injection landed straight in the PIN register and read ff.
     readPins(con, SR_GPIO_Q);
     for (const p of SR_GPIO_Q) sim.setPinState(p, true);
-    expect(readPins(con, SR_GPIO_Q)).toBe(0xff);
+    expect(readPins(con, SR_GPIO_Q)).toBe(0x00);
   });
 
   // Flipped by F3: shiftOut() on D2/D3 is a software SPI master on the D3 SCK
@@ -728,10 +733,10 @@ describe('the gallery MCP3008 chip (Uno)', () => {
     con.cmd('h 10');
     expect(sim.pinManager.getPwmValue(9)).toBeCloseTo(128 / 255, 5);
     // Six bytes in one CS frame. The chip decodes the CH0 command and puts the
-    // conversion, 514 = 0x202, on MISO as 02 02 (today in the frame after the
-    // command, which is the finding). "Not the loopback" proves nothing here:
-    // an absent or unselected chip leaves the line idle at ff, the same bytes
-    // the defect answers.
+    // conversion, 514 = 0x202, on MISO as 02 02 (the example used to answer
+    // it in the frame AFTER the command, which was the finding). "Not the
+    // loopback" proves nothing here: an absent or unselected chip leaves the
+    // line idle at ff, the same bytes the defect answered.
     const has514 = /(^| )02 02( |$)/;
     con.cmd('l 10');
     const selected = hex(con.spi('01 80 00 00 00 00'));
@@ -741,7 +746,11 @@ describe('the gallery MCP3008 chip (Uno)', () => {
     expect(hex(con.spi('01 80 00 00 00 00'))).not.toMatch(has514);
   });
 
-  it.fails('mcp3008-example-returns-1023: one 3-byte frame returns the conversion of that frame (CH0 at half scale, CH1 at GND)', async () => {
+  // Closed by F7: the example answers through velxio-chip.h `on_exchange`
+  // (D-013), so the result bits land in the frame that carries the command,
+  // as the silicon puts them, instead of being queued for a second frame that
+  // CS rising cancelled.
+  it('mcp3008-example-returns-1023: one 3-byte frame returns the conversion of that frame (CH0 at half scale, CH1 at GND)', async () => {
     const { sim, con } = uno();
     await attachChip(sim, 'adc', 'mcp3008', galleryJson('mcp3008'), ADC);
     run(sim, con);
@@ -749,6 +758,51 @@ describe('the gallery MCP3008 chip (Uno)', () => {
     con.cmd('h 10');
     const expected = Math.floor((128 / 255) * 1023 + 0.5);
     expect([mcp3008Read(con, 10, 0), mcp3008Read(con, 10, 1)]).toEqual([expected, 0]);
+    // And the same code on the next frame, and the next: the CS edge resets
+    // the conversion, nothing of the previous frame carries over.
+    expect([mcp3008Read(con, 10, 0), mcp3008Read(con, 10, 0)]).toEqual([expected, expected]);
+  });
+
+  // The chip keeps a transfer armed across the CS edge (its look-ahead byte
+  // for a bit-banged master), so this is the always-armed chip of
+  // spibus-no-cs-armed-chip-swallows: only its chip select may decide which
+  // bytes it takes and answers. TESTS.md S05, half of it.
+  it('spibus-no-cs-armed-chip-swallows: the MCP3008, armed across its CS edge, leaves the microSD card on the same bus alone while the card is selected', async () => {
+    const { sim, con } = uno();
+    attachSd(sim, 8);
+    await attachChip(sim, 'adc', 'mcp3008', galleryJson('mcp3008'), ADC);
+    run(sim, con);
+    con.cmd('a 9 128');
+    deselect(con, 8, 10);
+    const expected = Math.floor((128 / 255) * 1023 + 0.5);
+    // The card's answer would be ANDed with the ADC's 00 bytes if the ADC took
+    // the card's frames; the ADC then reads its own frame right after.
+    expect({ sd: sdHandshake(con, 8), adc: mcp3008Read(con, 10, 0) }).toEqual({ sd: SD_OK, adc: expected });
+  });
+
+  // TESTS.md S08: the same chip on four plain GPIOs, read the way the Pi
+  // tutorials do (Adafruit's readadc: start + SGL + channel in one byte, two
+  // bytes of zeros, result = (hi << 4 | lo >> 4) & 0x3ff). The result bits
+  // come from the look-ahead byte the chip keeps armed, bit by bit, before
+  // each byte of the master is complete.
+  it('no-bitbang-spi-miso-undriven: the gallery MCP3008 answers a bit-banged readadc() on MISO', async () => {
+    const { sim, con } = uno();
+    // CS D4, SCK D5, MOSI D6, MISO D7; CH0 on the D9 PWM, CH1 on GND.
+    await attachChip(sim, 'adc', 'mcp3008', galleryJson('mcp3008'), { CS: 4, SCK: 5, MOSI: 6, MISO: 7, CH0: 9, CH1: -1 });
+    run(sim, con);
+    con.cmd('a 9 128');
+    con.cmd('r 7');
+    deselect(con, 4);
+    const readadc = (ch: number): number => {
+      con.cmd('l 4');
+      con.cmd(`b 5 6 7 ${(0x18 | ch).toString(16)}`);
+      const hi = parseInt(con.cmd('b 5 6 7 00'), 16);
+      const lo = parseInt(con.cmd('b 5 6 7 00'), 16);
+      con.cmd('h 4');
+      return ((hi << 4) | (lo >> 4)) & 0x3ff;
+    };
+    const expected = Math.floor((128 / 255) * 1023 + 0.5);
+    expect([readadc(0), readadc(1), readadc(0)]).toEqual([expected, 0, expected]);
   });
 });
 

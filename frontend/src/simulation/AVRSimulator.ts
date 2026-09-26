@@ -1659,6 +1659,16 @@ export class AVRSimulator implements LineCapable, BusCapableSimulator {
     // whose DDR says input, so reporting it would draw a level the pad does
     // not have.
     if (this.mcuDrives(arduinoPin)) return;
+    // The wire's level channel hears it too. This is the single door every
+    // external level comes through (a button, a tilt switch, a line model's
+    // edge, the SPICE connector), and the PinManager's `pinStates` is the
+    // level the wire holds; without this line it held the PORT latch, so a
+    // custom chip watching a pin a part drives saw the pull-up's HIGH for
+    // ever while the sketch's digitalRead saw every press (finding
+    // chip-board-pin-read-blind-to-other-parts). Left out while the sketch
+    // drives the pad, as the register is: the injected level is not on the
+    // wire then.
+    this.pinManager.triggerPinChange(arduinoPin, state, 'external');
     this.externalScope.emit(this.onPinChangeWithTime, arduinoPin, state);
   }
 

@@ -186,10 +186,11 @@ sockets preserve.
 ## Limits that remain
 
 - **The worker places edges with a Python sleep.** `_chip_timer_thread`
-  waits on `threading.Event.wait` and then fires due timers, so the
-  transmitter's own edges carry host jitter before the bridge adds any. The
-  browser chip runtime backs `vx_sim_now_nanos` with simulated time and has
-  no such jitter.
+  waits against the guest's virtual clock in naps of up to 20 ms and then
+  fires due timers, so the transmitter's own edges carry host jitter before
+  the bridge adds any (the callback still reads its exact deadline). The
+  browser chip runtime puts each deadline on the engine's event queue at its
+  guest cycle and has no such jitter.
 - **Every bridged edge is two WebSocket messages.** A protocol that toggles a
   line quickly saturates that path first, and a background tab widens the
   latency. The latency no longer reaches the bit timing, though: every edge

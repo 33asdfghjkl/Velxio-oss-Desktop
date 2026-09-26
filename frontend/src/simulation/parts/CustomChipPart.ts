@@ -25,7 +25,7 @@ import { chipUartOwner } from '../customChips/ChipRuntime';
 import { readChipUartPads } from '../customChips/chipUartPads';
 import { setAdcVoltage, analogRailVolts } from './partUtils';
 import { attachUartEndpoint } from '../buses';
-import type { UartHandle } from '../buses/types';
+import { isBusCapable, type GuestClock, type UartHandle } from '../buses/types';
 
 // Physical-key (KeyboardEvent.code) -> Galaksija keyboard matrix offset, from
 // the libretro Galaksija core's keyMap. The chip's set_key takes this offset;
@@ -85,6 +85,15 @@ const GALAKSIJA_KEY_OFFSET: Record<string, number> = {
   ShiftLeft: 53,
   ShiftRight: 53,
 };
+
+/**
+ * The guest clock of the board a part's simulator stands for, or null when
+ * it has none: the board-less stub, or a bridge that offers no binding.
+ */
+function readGuestClock(sim: unknown): GuestClock | null {
+  if (!isBusCapable(sim)) return null;
+  return sim.getBusBinding()?.clock ?? null;
+}
 
 PartSimulationRegistry.register('custom-chip', {
   attachEvents: (_element, simulator, getArduinoPin, componentId) => {
@@ -372,6 +381,17 @@ PartSimulationRegistry.register('custom-chip', {
     let keyboardCleanup: (() => void) | undefined;
     let extensionCleanup: (() => void) | undefined;
 
+    // The chip keeps the board's time: the guest clock of the engine binding,
+    // the one the fabric's software UART already runs on. A simulator with
+    // no binding (the board-less stub) has no guest clock, and then the tick
+    // below is the chip's only clock.
+    let guestClock: GuestClock | null = null;
+    try {
+      guestClock = readGuestClock(sim);
+    } catch {
+      /* a bridge that cannot bind yet: no clock */
+    }
+
     (async () => {
       try {
         const wasm = decodeWasmBase64(wasmBase64);
@@ -379,6 +399,7 @@ PartSimulationRegistry.register('custom-chip', {
           wasm,
           componentId,
           pinManager: sim.pinManager,
+          clock: guestClock,
           // No I2C bus is handed over: the chip enters the bus its own SDA/SCL
           // are wired to when it calls vx_i2c_attach, on whichever controller
           // that is (Wire1, the XIAO RP2040's I2C1) or on none.
@@ -497,8 +518,18 @@ PartSimulationRegistry.register('custom-chip', {
         // stepping its core, or a sensor publishing samples) need a
         // host-side tick to fire those callbacks — without this loop the
         // WASM is loaded but never executes anything past chip_setup().
-        // We feed wall-clock nanoseconds; the chip's WasiShim already
-        // exposes the same epoch via vx_sim_now_nanos.
+        //
+        // On a board the chip's timers are on the guest clock and fire at
+        // their guest instant from the engine's own event queue; the tick is
+        // the net under them (a rebuilt CPU drops its events). With no guest
+        // clock the tick IS the clock: the time this canvas has been running,
+        // advanced by the frame's length while it runs and standing still
+        // while it is stopped. It used to feed performance.now(), the page's
+        // age, and compare timers started at 0 against it: the first tick
+        // replayed every period of that age at once (finding
+        // browser-chip-clock-always-zero).
+        let hostNanos = 0n;
+        let lastFrameMs: number | null = null;
         const tick = () => {
           if (disposed || !instance) return;
           // Whatever the chip drew since the last frame reaches the canvas now,
@@ -517,16 +548,25 @@ PartSimulationRegistry.register('custom-chip', {
             ? !useElectricalStore.getState().paused
             : simState.boards.some((b) => b.running);
           if (runnable) {
+            const nowMs = performance.now();
+            // A frame after a pause (the tab in the background) is not that
+            // long of running time: the same 50 ms cap the AVR frame loop uses.
+            if (lastFrameMs !== null) {
+              hostNanos += BigInt(Math.floor(Math.min(nowMs - lastFrameMs, 50) * 1_000_000));
+            }
+            lastFrameMs = nowMs;
             try {
               // Cap per-frame compute at 6 ms so a slow multi-chip bus (a Z80
               // running real-time over the settle kernel) degrades to a slower
               // boot instead of freezing the tab. Fast single-chip examples
               // finish their due fires well under the budget, so they are
               // unaffected and still run at real time.
-              instance.tickTimers(BigInt(Math.floor(performance.now() * 1_000_000)), 6);
+              instance.tickTimers(guestClock ? undefined : hostNanos, 6);
             } catch (e) {
               console.error(`[custom-chip:${componentId}] tickTimers threw:`, e);
             }
+          } else {
+            lastFrameMs = null;
           }
           rafHandle = requestAnimationFrame(tick);
         };

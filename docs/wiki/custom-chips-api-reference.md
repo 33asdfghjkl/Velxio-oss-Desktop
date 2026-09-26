@@ -92,8 +92,12 @@ s->out = vx_pin_register("OUT", VX_OUTPUT_LOW);   // starts LOW, no glitch
 int vx_pin_read(vx_pin p);
 ```
 
-Returns the digital state of a pin: `0` (LOW) or `1` (HIGH). If the pin
-isn't wired to anything in the diagram, returns `0`.
+Returns the digital state of a pin: `0` (LOW) or `1` (HIGH). On a board pin
+it is the level the wire carries: what the MCU drives, or what another part
+on the same pin puts there (a button, a tilt switch, a second chip), not the
+mode the pin was registered with. A pin nothing has driven yet, or one the
+diagram wires to nothing, returns `0`; no host models a chip's own pull on a
+board pin.
 
 ### `vx_pin_write`
 
@@ -104,6 +108,16 @@ void vx_pin_write(vx_pin p, int value);
 Drive an OUTPUT pin to `value` (0 or 1). The host propagates the change
 through the wiring graph immediately — any other chip with a `pin_watch` on
 the wired pin will see the edge.
+
+On a board pin the chip is one driver of the wire, resolved against the
+MCU's pad and any other chip on it: while the MCU drives the pad the chip
+cannot move it (the host reports the contention and feeds nothing back), and
+two chips holding one line resolve as a wired-AND. A pin a bus attach named
+as one the bus drives (the `miso` of `vx_spi_attach`, the `tx` of
+`vx_uart_attach`, `sda` and `scl` of `vx_i2c_attach`) is the bus's: its
+registration mode puts no level on the wire, and an explicit `vx_pin_write`
+or `vx_pin_set_mode` by the chip takes it back (a UART chip that turns its
+TX into a plain level in an IO mode relies on that).
 
 ### `vx_pin_read_analog`
 
@@ -128,8 +142,19 @@ Drive an analog voltage on a pin. Used by DAC chips.
 void vx_pin_set_mode(vx_pin p, vx_pin_mode mode);
 ```
 
-Change a pin's direction after registration — useful for bidirectional
-buses (e.g. open-drain protocols where you switch between input and output).
+Change a pin's direction after registration, which is how a bidirectional
+line (an open-drain protocol, a bus the chip only sometimes drives) is done:
+
+- `VX_OUTPUT_LOW` and `VX_OUTPUT_HIGH` drive that level at once, exactly as
+  `vx_pin_write` would.
+- `VX_OUTPUT` changes the direction and drives nothing until the first
+  `vx_pin_write`.
+- `VX_INPUT`, `VX_INPUT_PULLUP` and `VX_INPUT_PULLDOWN` release the line:
+  the chip leaves the wire and whatever else holds it decides the level, the
+  pad's pull (a `pinMode(INPUT_PULLUP)` in the sketch restores HIGH) or
+  another chip; a floating pad keeps the level it had. The chip's own pull
+  is not put on a board pin. On the QEMU boards the worker has no pad model,
+  so a released pin keeps the last level the chip drove.
 
 ### `vx_pin_watch`
 
@@ -297,6 +322,21 @@ void on_stop(void* ud);
 The master issued STOP. Reset any "transaction in progress" state your
 chip has — the next `on_connect` is a fresh transaction.
 
+Every START names your address to `on_connect`, a repeated START included:
+`Wire.endTransmission(false)` followed by `requestFrom()` reaches you as
+`on_connect(write)`, the register byte, `on_connect(read)`, the reads, and
+one `on_stop`. That is what the browser runtime and the QEMU workers deliver.
+On a QEMU board the bridge reports a repeated START as a STOP followed by a
+START, and on a Linux board the guest shim speaks whole transactions, so on
+those hosts the chip sees an `on_stop` between the two phases as well. Keep
+the register pointer across `on_stop` (the register-map idiom above does)
+and a write-then-read serves the right bytes everywhere; only state that
+must not survive a STOP belongs in `on_stop`.
+
+A chip may attach several addresses on the same pins (`vx_i2c_attach` once
+per address): each has its own callbacks, and a STOP reaches every address
+the transaction touched.
+
 ### Example: 24C01 EEPROM
 
 ```c
@@ -385,14 +425,23 @@ void   vx_spi_stop  (vx_spi s);
 
 ### How it works
 
-1. `vx_spi_attach` registers the chip on the bus.
+1. `vx_spi_attach` registers the chip on the bus its `sck` wire reaches. The
+   bus clocks the chip only while `cs` is low (a select tied to GND, or
+   `((vx_pin)-1)`, means always), compares `mode` and the MSB-first order
+   every chip shifts in with the controller's settings, and reports a
+   mismatch (`spi-mode`, `spi-bit-order`) instead of emulating the shifted
+   bytes. The select edge reaches the chip's own `vx_pin_watch` on `cs`
+   whichever block of the board drives it, a GPIO or the SPI peripheral's own
+   chip-select output.
 2. The chip calls `vx_spi_start(handle, buf, N)` to say "I want to exchange
    N bytes; here's my MISO data."
 3. As the master clocks bytes, byte by byte:
    - the master's MOSI byte overwrites `buf[i]`
    - the chip's `buf[i]` (its MISO data) is shifted out to the master
 4. After N bytes, `on_done(buf, N)` fires. `buf` now contains the N MOSI
-   bytes the master sent.
+   bytes the master sent, and it is the pointer this handle's own
+   `vx_spi_start` armed: a chip with two handles (two selects on one bus,
+   or two buses) is handed each one's buffer.
 
 ### Answering inside the same byte (`on_exchange`)
 
@@ -455,6 +504,12 @@ static void on_cs_change(void* ud, vx_pin pin, int value) {
 
 vx_pin_watch(s->cs, VX_EDGE_BOTH, on_cs_change, s);
 ```
+
+`on_done` fires once per transfer. When the master clocked every byte of
+the buffer it has already fired, and the `vx_spi_stop` on the rising edge
+finds nothing armed and reports nothing; when the master released the
+select part-way, `vx_spi_stop` is what fires it, with the bytes exchanged so
+far. The same in the browser, the QEMU workers and the Linux-board host.
 
 ---
 
@@ -524,9 +579,26 @@ void     vx_timer_start (vx_timer t, uint64_t period_nanos, bool repeat);
 void     vx_timer_stop  (vx_timer t);
 ```
 
-Timer ticks are anchored to **simulated time** — they fire deterministically
-relative to CPU cycles, not wall-clock seconds. A 1-ms timer will fire after
-exactly 1 ms of simulated AVR time regardless of how fast the host actually runs.
+`vx_sim_now_nanos` is the board's **simulated time**: the guest's cycle count
+at its clock rate on the browser engines, the QEMU virtual clock on the QEMU
+boards. It starts at 0 when the chip is created, never runs backwards (Stop
+and Run, a reload of the firmware or a reset rebuild the guest, and the
+chip's clock carries on from where it was) and stands still while the
+simulation is stopped. Inside a timer callback it answers the timer's
+deadline, so a periodic timer reads exact multiples of its period whatever
+the granularity the deadline was reached with.
+
+Timers are anchored to that clock, not to wall-clock seconds: a timer fires
+at the guest instant its deadline falls on (between two instructions, never
+early), a repeating one adds its period to the deadline, and a 1-ms timer
+fires after exactly 1 ms of simulated time whether the host runs the board
+faster or slower than real time. `vx_timer_stop` cancels it. A timer armed
+before the guest has a clock (an engine before its SoC boots) starts once it
+runs. On the QEMU boards the worker's timer thread wakes against the guest
+clock in naps of up to 20 ms, so a deadline there carries that much host
+jitter (the callback still reads the exact deadline). The Linux-board host
+forwards I2C transactions and SPI chip enables to a chip and nothing else:
+on a Raspberry Pi a chip's timers do not run.
 
 ```c
 static void on_tick(void* ud) {
@@ -719,7 +791,8 @@ These are checked at compile time inside the header:
 If any of these change, your chip won't compile until the runtime side is
 updated to match. This is intentional — it catches ABI drift early.
 
-Each config struct also has a `uint32_t reserved[8]` field at the end. Zero
-it out (the Velxio header initializer literally `= {.field = ...}` syntax
-zeros unmentioned fields). Future versions may use those slots; today they
-must be 0.
+Each config struct also has `uint32_t reserved[]` slots at the end (8 in
+`vx_i2c_config` and `vx_uart_config`, 7 in `vx_spi_config`, whose first slot
+became `on_exchange`). Zero them out (the Velxio header initializer literally
+`= {.field = ...}` syntax zeros unmentioned fields). Future versions may use
+those slots; today they must be 0.

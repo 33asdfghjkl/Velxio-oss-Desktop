@@ -435,7 +435,7 @@ describe('browser-hosted chip clock', () => {
     expect(dts('clk1').length).toBeGreaterThanOrEqual(4);
   });
 
-  it.fails(`${ID}: vx_sim_now_nanos measures the 20 ms period the sketch drives, in guest time`, async () => {
+  it(`${ID}: vx_sim_now_nanos measures the 20 ms period the sketch drives, in guest time`, async () => {
     const board = uno(HEX.clock);
     await attachChip(board.sim, 'clk1', 'clock-probe', PINS, WIRES);
     runMs(board.sim, 130);
@@ -497,7 +497,7 @@ describe('browser-hosted chip clock', () => {
   // fires for 10 s) and the rest follow the wall clock, not the guest: the
   // mismatch the finding names. Ticking the timers on the guest clock, the
   // finding's fix, makes this pass on its own.
-  it.fails(`${ID}: a 1 ms chip timer fires once per ms of guest time after Run, not once per ms the page has been open`, async () => {
+  it(`${ID}: a 1 ms chip timer fires once per ms of guest time after Run, not once per ms the page has been open`, async () => {
     const { moves, guestMs } = await timerRun();
     expect(moves.length).toBeLessThan(guestMs * 1.1);
     expect(moves.length).toBeGreaterThan(guestMs * 0.9);
@@ -508,7 +508,7 @@ describe('browser-hosted chip clock', () => {
   // a frame's fires (an even count) land together and the sketch never sees
   // an edge. It passes only when each fire lands at its guest-time instant
   // inside the frame.
-  it.fails(`${ID}: a 1 ms chip timer toggles OUT every 1 ms of guest time (the sketch measures a 2000 us period)`, async () => {
+  it(`${ID}: a 1 ms chip timer toggles OUT every 1 ms of guest time (the sketch measures a 2000 us period)`, async () => {
     const { periods } = await timerRun();
     expect(periods.length).toBeGreaterThanOrEqual(4);
     for (const p of periods) {
@@ -549,7 +549,7 @@ describe('chip releases a board pin', () => {
     expect(irqs).toBeGreaterThanOrEqual(1);
   });
 
-  // The idiom-1 it.fails below reads "held=1", which a chip that never heard
+  // The idiom-1 row below used to read "held=1", which a chip that never heard
   // TRIG would also produce. Prove the pull happens: the chip's
   // set_mode(OUTPUT_LOW) takes D2 low on the PinManager after the sketch's
   // pull-up raised it.
@@ -560,13 +560,13 @@ describe('chip releases a board pin', () => {
     expect(pmD2.indexOf(false, pmD2.indexOf(true))).toBeGreaterThan(0);
   });
 
-  it.fails(`${ID}: releasing with vx_pin_set_mode(VX_INPUT) lets the pull-up restore HIGH (write-0 pull)`, async () => {
+  it(`${ID}: releasing with vx_pin_set_mode(VX_INPUT) lets the pull-up restore HIGH (write-0 pull)`, async () => {
     const { lines, irqs } = await pulses(0);
     expect(lines).toEqual(Array(5).fill('held=0 rel=1'));
     expect(irqs).toBe(5);
   });
 
-  it.fails(`${ID}: a pull made with vx_pin_set_mode(VX_OUTPUT_LOW) reaches the board, and the release restores HIGH`, async () => {
+  it(`${ID}: a pull made with vx_pin_set_mode(VX_OUTPUT_LOW) reaches the board, and the release restores HIGH`, async () => {
     const { lines, irqs } = await pulses(1);
     expect(lines).toEqual(Array(5).fill('held=0 rel=1'));
     expect(irqs).toBe(5);
@@ -615,7 +615,7 @@ describe('chip reads a board pin another part drives', () => {
     expect(phase2).toContain('rise 4');
   });
 
-  it.fails(`${ID}: the chip counts the four edges the tilt switch puts on D2, and OVF toggles back to 0`, async () => {
+  it(`${ID}: the chip counts the four edges the tilt switch puts on D2, and OVF toggles back to 0`, async () => {
     const { phase2 } = await scenario();
     expect(phase2).toContain('rise 4');
     expect(phase2).toContain('ovf=0');
@@ -878,10 +878,66 @@ describe('multi-board: the board a chip attaches to', () => {
     expect(out.match(/spi=\w+/g)).toEqual(['spi=A5', 'spi=A5', 'spi=A5']);
   });
 
-  it.fails(`${ID}: with only VCC/GND on board A, the chip still serves board B's SPI, where its signal pins are`, async () => {
+  it(`${ID}: with only VCC/GND on board A, the chip still serves board B's SPI, where its signal pins are`, async () => {
     const out = await spiOnB('A');
     expect(out).toContain('READY');
     expect(out.match(/spi=\w+/g)).toEqual(['spi=A5', 'spi=A5', 'spi=A5']);
+  });
+
+  // The SPI row above is served by the bus fabric, which places a chip by its
+  // wiring and mirrors the select onto the chip's own PinManager, whichever
+  // board's it is. A plain GPIO has no such fabric: the chip's pin watch is on
+  // the PinManager of the board it attached to, and its output goes into that
+  // board's guest. So this row is the one that needs the part on board B.
+  it(`${ID}: a chip's plain GPIO watch and output follow its signal pins' board, not its rails' board`, async () => {
+    const idA = useSimulatorStore.getState().boards[0].id;
+    const idB = useSimulatorStore.getState().addBoard('arduino-uno', 600, 100);
+    const simB = getBoardSimulator(idB) as unknown as AVRSimulator;
+    const board = uno(HEX.clock, simB);
+    placeChip('clk', 'clock-probe', ['IN', 'OUT', 'GND', 'VCC']);
+    useSimulatorStore.getState().setWires([
+      wire(1, 'clk', 'VCC', idA, '5V'),
+      wire(2, 'clk', 'GND', idA, 'GND.1'),
+      wire(3, 'clk', 'IN', idB, '3'),
+      wire(4, 'clk', 'OUT', idB, '2'),
+    ] as never);
+    const comp = useSimulatorStore.getState().components.find((c) => c.id === 'clk')!;
+    const { DynamicComponent } = await import('../../components/DynamicComponent');
+    const { createRoot } = await import('react-dom/client');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root!.render(
+        createElement(DynamicComponent, {
+          id: 'clk',
+          metadata: CUSTOM_CHIP_METADATA as never,
+          properties: comp.properties as Record<string, unknown>,
+        }),
+      );
+    });
+    await vi.waitFor(() => expect(chipSaid('clk')).toContain('clock-probe ready'), {
+      timeout: 5000,
+      interval: 2,
+    });
+    runMs(board.sim, 130);
+    expect(board.out()).toContain('READY');
+    // The chip heard board B's 20 ms square wave on IN, in B's guest time.
+    const dts = chipSaid('clk')
+      .filter((l) => l.startsWith('dt '))
+      .map((l) => Number(l.slice(3)));
+    expect(dts.length).toBeGreaterThanOrEqual(4);
+    for (const dt of dts) {
+      expect(dt).toBeGreaterThan(19_900);
+      expect(dt).toBeLessThan(20_100);
+    }
+    // And B's sketch saw the chip's 1 ms timer on OUT (2000 us periods).
+    const periods = [...board.out().matchAll(/P=(\d+)/g)].map((m) => Number(m[1]));
+    expect(periods.length).toBeGreaterThanOrEqual(4);
+    for (const p of periods) {
+      expect(p).toBeGreaterThan(1_800);
+      expect(p).toBeLessThan(2_200);
+    }
   });
 });
 
@@ -982,7 +1038,7 @@ describe('multi-board: chip-bus settle kernel', () => {
     two.dispose();
   });
 
-  it.fails(`${ID}: a drive of the cross-board net settles L on board A and M on board B`, async () => {
+  it(`${ID}: a drive of the cross-board net settles L on board A and M on board B`, async () => {
     const two = await build(true);
     two.pmA.triggerPinChange(7, true, 'mcu');
     // M lives on board B only: its level must never be written into board A.

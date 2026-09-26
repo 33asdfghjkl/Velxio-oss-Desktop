@@ -66,6 +66,16 @@ EmitFn = Callable[[dict], None]
 ResolveFn = Callable[[int], Optional[int]]
 
 
+def _deliver(slave: Any, event: int, addr: int) -> int:
+    """One event to one slave. A slave registered with several addresses can
+    only tell which one the master named if it is told: a slave that says
+    `wants_address` gets it (WasmChipI2CSlave, for a chip on two addresses);
+    every other slave keeps the one-argument contract it always had."""
+    if getattr(slave, 'wants_address', False):
+        return slave.handle_event(event, addr)
+    return slave.handle_event(event)
+
+
 class _Registration:
     __slots__ = ('key', 'slave', 'addresses', 'owner', 'record_bus', 'name')
 
@@ -252,7 +262,7 @@ class I2cBusTable:
         if not found:
             return None
         if len(found) == 1:
-            return found[0].slave.handle_event(event)
+            return _deliver(found[0].slave, event, int(addr) & 0x7F)
         return self._arbitrate(int(bus_id), int(addr) & 0x7F, found, event)
 
     def _arbitrate(self, bus_id: int, addr: int, found: list[_Registration],
@@ -265,7 +275,7 @@ class I2cBusTable:
             acked: list[_Registration] = []
             first_nack = 1
             for reg in found:
-                r = reg.slave.handle_event(event)
+                r = _deliver(reg.slave, event, addr)
                 if r == 0:
                     acked.append(reg)
                 elif first_nack == 1:
@@ -279,18 +289,18 @@ class I2cBusTable:
         if op == I2C_READ:
             v = 0xFF
             for reg in active:
-                v &= int(reg.slave.handle_event(event)) & 0xFF
+                v &= int(_deliver(reg.slave, event, addr)) & 0xFF
             return v
         if op == I2C_WRITE:
             ack = False
             for reg in active:
-                if reg.slave.handle_event(event) == 0:
+                if _deliver(reg.slave, event, addr) == 0:
                     ack = True
             return 0 if ack else 1
         # FINISH, NACK and anything else end the phase for everyone addressed.
         result = 0
         for i, reg in enumerate(found):
-            r = reg.slave.handle_event(event)
+            r = _deliver(reg.slave, event, addr)
             if i == 0:
                 result = r
         if op in (I2C_FINISH, I2C_NACK):

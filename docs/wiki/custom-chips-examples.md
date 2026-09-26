@@ -254,40 +254,61 @@ void chip_setup(void) {
 
 8-channel, 10-bit ADC.
 
-**Why study it**: SPI with CS-driven transactions, two-phase exchange (the
-master sends a command, then clocks more bytes to read the result), and
-analog reads via `vx_pin_read_analog`.
+**Why study it**: SPI with CS-driven transactions, a chip that answers
+inside the same byte it is being asked in (`on_exchange`), a look-ahead
+buffer for bit-banged masters, and analog reads via `vx_pin_read_analog`.
+
+The MCP3008 has no byte framing: after CS falls it takes a start bit, four
+configuration bits, samples, sends a null bit and then the 10-bit result. The
+common drivers put the first result bits in the SAME byte as the
+configuration bits, so a buffer filled before that byte arrives cannot hold
+them. The chip models the bit stream and shifts each byte through it:
 
 ```c
-static void on_cs_change(void *ud, vx_pin pin, int value) {
-  chip_state_t *s = ud;
-  if (value == VX_LOW) {
-    s->buf[0] = s->buf[1] = s->buf[2] = 0xff;
-    vx_spi_start(s->spi, s->buf, 3);
-  } else {
-    vx_spi_stop(s->spi);
+/* One clock edge: DIN in, DOUT out. */
+static int clock_bit(const chip_state_t *s, frame_t *f, int din) {
+  switch (f->phase) {
+    case IDLE:     if (din) { f->phase = CONFIG; f->cfg = 0; f->cfg_bits = 0; } return 0;
+    case CONFIG:   f->cfg = (f->cfg << 1) | din;
+                   if (++f->cfg_bits == 4) f->phase = SAMPLE;
+                   return 0;
+    case SAMPLE:   f->result = convert(s, f->cfg); f->phase = NULL_BIT; return 0;
+    case NULL_BIT: f->phase = MSB; f->bit = 9; return 0;
+    case MSB: {    int out = (f->result >> f->bit) & 1;
+                   if (f->bit-- == 0) { f->phase = LSB; f->bit = 1; }
+                   return out; }
+    /* ... LSB-first repeat, then zeros until CS rises */
   }
 }
 
-static void on_spi_done(void *ud, uint8_t *buffer, uint32_t count) {
+/* A hardware controller clocked one whole byte. */
+static uint8_t on_spi_exchange(void *ud, uint8_t mosi) {
   chip_state_t *s = ud;
-  if (count < 3) return;
-  uint8_t channel = (buffer[1] >> 4) & 0x07;
-  double voltage = vx_pin_read_analog(s->CH[channel]);
-  uint16_t result = (voltage / 5.0) * 1023.0 + 0.5;
+  uint8_t miso = clock_byte(s, &s->f, mosi);
+  arm(s);                        /* refresh the look-ahead byte */
+  return miso;
+}
 
-  /* Pre-fill response: byte[0] don't care, byte[1] = upper 2 bits, byte[2] = lower 8 */
-  s->buf[0] = 0;
-  s->buf[1] = (result >> 8) & 0x03;
-  s->buf[2] = result & 0xff;
-  vx_spi_start(s->spi, s->buf, 3);   // arm response phase
+/* CS moved either way: back to waiting for a start bit, still armed. */
+static void on_cs_change(void *ud, vx_pin pin, int value) {
+  chip_state_t *s = ud;
+  s->f.phase = IDLE;
+  arm(s);
 }
 ```
 
-**Pattern**: when a chip needs to send a response, fill the buffer and call
-`vx_spi_start` again — the master clocks more bytes which read out the
-buffer (and overwrite it with whatever the master happens to send next, which
-the chip can ignore).
+`arm()` clocks a COPY of the frame with DIN low and puts the resulting byte
+in the `vx_spi_start` buffer: that is what a bit-banged master (`shiftIn`,
+the Pi's `readadc` loop) reads bit by bit before its own byte is complete.
+`on_done` catches the real frame up when that buffer is consumed, so both
+kinds of master read the same code.
+
+**Pattern**: a chip whose answer depends on bits of the byte it is receiving
+sets `on_exchange` and keeps a look-ahead byte armed. A chip that answers a
+command in the bytes AFTER it (a register file, a flash) can stay on the
+buffer alone. Either way, restart the protocol from the CS watch: the bus
+puts the select edge on that pin even when the controller drives it in
+hardware.
 
 ---
 

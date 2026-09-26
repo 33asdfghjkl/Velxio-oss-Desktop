@@ -19,7 +19,10 @@ the worker's registered callbacks the way the C side does:
 The test sends one JSON op per line on a control pipe (BB_CTL_IN) and reads
 one JSON reply per op (BB_CTL_OUT). Symbols the real library may lack
 (velxio_push_camera_frame, bql_lock_impl, ...) are left out on purpose, so the
-worker takes the same fallback it takes on an older libqemu build.
+worker takes the same fallback it takes on an older libqemu build. The guest
+clock (qemu_clock_get_ns, QEMU_CLOCK_VIRTUAL) is one of those: it is exported
+only when the test sets BB_FAKE_GUEST_CLOCK, and then the `clock` op moves it
+(board-buses F7: the chips a worker hosts read that clock).
 """
 from __future__ import annotations
 
@@ -64,6 +67,11 @@ class FakeLibQemu:
             lambda on: self._record('spi_cs_events', on))
         self.qemu_picsimlab_uart_receive = _Fn(
             lambda uart, buf, n: self._record('uart_receive', uart, list(bytes(buf[:n]))))
+        # The guest's virtual clock, in ns, moved by the `clock` op. Only a
+        # test that asks for it sees the symbol at all.
+        self._clock_ns = 0
+        if os.environ.get('BB_FAKE_GUEST_CLOCK'):
+            self.qemu_clock_get_ns = _Fn(lambda _kind: self._clock_ns)
 
     # ── what the worker calls into QEMU ─────────────────────────────────────
     def _register(self, ref) -> None:
@@ -147,6 +155,12 @@ class FakeLibQemu:
                 self._out_sel = (ctypes.c_uint32 * 64)(*([256] * 64))
             for gpio, sig in op['out_sel'].items():
                 self._out_sel[int(gpio)] = int(sig)
+            return {}
+        if kind == 'clock':
+            # QEMU_CLOCK_VIRTUAL reaches `ns`, as -icount or the host's time
+            # would move it; the worker's chip timer thread reads it on its
+            # own, so the reply needs no wait.
+            self._clock_ns = int(op['ns'])
             return {}
         if kind == 'wait':
             want = op['call']

@@ -249,7 +249,7 @@ firmware's critical path.
   via `vx_pin_write` in the same critical section. Used by the 74HC595 to
   latch on RCLK rising edge.
 - ✅ `vx_log` and `printf` via WASI `fd_write` → `chip_log` WS events
-- ✅ `vx_sim_now_nanos` (anchored at runtime instantiation)
+- ✅ `vx_sim_now_nanos` and the timers on the guest's virtual clock (`QEMU_CLOCK_VIRTUAL`; 0 at the chip's creation, the timer's deadline inside its callback)
 
 ### Deferred (clear extension paths)
 

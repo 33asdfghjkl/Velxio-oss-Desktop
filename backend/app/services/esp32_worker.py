@@ -848,12 +848,14 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     _i2c_table = _I2cBusTable(emit=lambda ev: _emit(ev) if not _stopped.is_set() else None,
                               resolve_bus=lambda sda: _resolve_i2c_bus(sda))
 
-    def _i2c_add(gpio: int, record: dict, slave, addr: int) -> None:
+    def _i2c_add(gpio: int, record: dict, slave, addr) -> None:
         """Put a sensor record's slave on the bus under the record's pin, the
         identity the tab detaches it by. The record's owner links it to the
         tab's bus map, and a `bus` field on the record names its controller
-        for a caller that knows it directly."""
-        _i2c_table.add(('sensor', int(gpio)), slave, [addr],
+        for a caller that knows it directly. `addr` is one address or every
+        address the slave answers (a custom chip can attach several)."""
+        addrs = [addr] if isinstance(addr, int) else list(addr)
+        _i2c_table.add(('sensor', int(gpio)), slave, addrs,
                        owner=_i2c_owner_of(record), bus=record.get('bus'))
     # ── SPI bus (project board-buses-2026-09, F4) ─────────────────────────
     # QEMU asks for the MISO of every byte synchronously and cannot wait for
@@ -1219,11 +1221,22 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             icount_shift_for_run), host time while the VM runs otherwise;
             either way it is the clock the guest measures our pulses with."""
             return _qemu_clock_get_ns(_QEMU_CLOCK_VIRTUAL) / 1000.0
+
+        def _guest_clock_ns() -> int:
+            """The same clock in ns, whole: what a hosted chip's
+            vx_sim_now_nanos answers and its timers are scheduled on
+            (board-buses F7). A chip measuring the sketch's pulses or pacing
+            its own reads the timeline the sketch reads, whatever the host's
+            load; before this the chips ran on the worker's wall clock."""
+            return int(_qemu_clock_get_ns(_QEMU_CLOCK_VIRTUAL))
     except AttributeError:
         _log('libqemu does not export qemu_clock_get_ns; DHT22 pacing uses host time')
 
         def _guest_now_us() -> float:
             return time.perf_counter_ns() / 1000.0
+
+        # No guest clock to hand the chips: they keep host time, as before.
+        _guest_clock_ns = None
 
     class _Dht22Handler:
         """Sync-handler shape over a Dht22Reply: one step per GPIO_IN read."""
@@ -2037,14 +2050,17 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         out['fast'] = rt.spi_transfer_byte
         return out
 
-    def _chip_responder(rt) -> dict:
+    def _chip_responder(rt, handle: int = 0) -> dict:
         # A chip declares its own select through vx_spi_attach; velxio-chip.h
-        # says the bus honours it, and cs = -1 means no select line.
+        # says the bus honours it, and cs = -1 means no select line. Each
+        # handle the chip attached is a device of its own behind its own
+        # select, as in the tab.
+        owner = f'chip:{getattr(rt, "component_id", None) or id(rt)}'
         return _responder(
-            f'chip:{getattr(rt, "component_id", None) or id(rt)}',
+            owner if handle == 0 else f'{owner}:spi{handle}',
             None, True,
-            lambda _rt=rt: _rt.spi_cs_active(),
-            lambda mosi, _rt=rt: _rt.spi_transfer_byte(mosi) & 0xFF,
+            lambda _rt=rt, _h=handle: _rt.spi_cs_active(_h),
+            lambda mosi, _rt=rt, _h=handle: _rt.spi_transfer_byte(mosi, _h) & 0xFF,
         )
 
     def _epaper_responder(comp_id: str, st: dict) -> dict:
@@ -2068,7 +2084,8 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         list. Called whenever the population changes, never per byte."""
         resp: list = list(_spi_models)
         for rt in _chip_spi_runtimes:
-            resp.append(_chip_responder(rt))
+            for h in range(rt.spi_handle_count()):
+                resp.append(_chip_responder(rt, h))
         for comp_id, st in _epaper_state.items():
             resp.append(_epaper_responder(comp_id, st))
         _spi_resp[:] = resp
@@ -2278,7 +2295,11 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             _lib.qemu_picsimlab_set_pin(gpio + 1, value)
 
         def _map_pin_reader(gpio: int, _store=_pin_state):
-            return int(_store.get(gpio, 0)) & 1
+            # None for a pad the guest never drove: the runtime then reads
+            # the pin's pull, so a select with a pull-up floats deselected
+            # instead of reading 0 (selected) before the sketch touches it.
+            v = _store.get(gpio)
+            return None if v is None else int(v) & 1
 
         def _map_timer(rt):
             if rt not in _chip_timer_runtimes:
@@ -2326,6 +2347,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     timer_scheduler=_map_timer,
                     blobs=decode_blobs(model.get('blobs')),
                     component_id=owner,
+                    clock=_guest_clock_ns,
                 )
                 runtime.run_chip_setup()
             except Exception as e:  # noqa: BLE001
@@ -2613,9 +2635,11 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 def _chip_pin_writer(gpio: int, value: int, _lib=lib):
                     _lib.qemu_picsimlab_set_pin(gpio + 1, value)
 
-                # GPIO input: chip reads current QEMU pin state.
+                # GPIO input: chip reads current QEMU pin state; None for a
+                # pad the guest never drove, so the runtime reads the pull.
                 def _chip_pin_reader(gpio: int, _store=_pin_state):
-                    return int(_store.get(gpio, 0)) & 1
+                    v = _store.get(gpio)
+                    return None if v is None else int(v) & 1
 
                 # UART RX: chip's vx_uart_write → inject bytes into firmware UART.
                 # Acquire the iothread lock ONLY if we don't already hold it
@@ -2664,6 +2688,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     net_bus=net_bus,
                     display=display,
                     component_id=comp_id,
+                    clock=_guest_clock_ns,
                 )
                 runtime.run_chip_setup()
                 _rt_cell[0] = runtime
@@ -2673,11 +2698,14 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     _log(f"[custom-chip] framebuffer chip registered ({comp_id})")
 
                 if runtime.i2c_address is not None:
+                    # One slave for every address the chip attached: the
+                    # table hands each event the address it names.
                     slave = WasmChipI2CSlave(runtime.i2c_address, runtime)
-                    _i2c_add(gpio, s, slave, runtime.i2c_address)
+                    _i2c_add(gpio, s, slave, runtime.i2c_addresses)
                     sensor_data['i2c_addr'] = runtime.i2c_address
                     sensor_data['slave']    = slave
-                    _log(f"[custom-chip] I2C slave registered at 0x{runtime.i2c_address:02x}")
+                    _log("[custom-chip] I2C slave registered at "
+                         + ", ".join(f"0x{a:02x}" for a in runtime.i2c_addresses))
                 if runtime.uart_config is not None:
                     _uart_table.add(runtime, runtime, owner=_uart_owner_of(s))
                     _log(f"[custom-chip] UART chip registered "
@@ -2920,6 +2948,20 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     # Wakes on each chip's next_timer_deadline. Acquires the QEMU IO-thread lock
     # before firing callbacks because vx_pin_write inside a timer would touch
     # picsimlab_set_pin which requires the lock.
+    def _chip_now_ns() -> int:
+        """The timeline the chips' deadlines are on: the guest's clock when
+        libqemu exposes it (what the runtimes were given), host time since
+        the worker started otherwise."""
+        if _guest_clock_ns is not None:
+            return _guest_clock_ns()
+        return time.monotonic_ns() - _t0_ref[0]
+
+    # The guest clock does not run at the host's pace (it stops while the VM
+    # is paused, and -icount runs it slower or faster): a wait is a bounded
+    # nap, re-checked against the guest, so a deadline is never overshot by
+    # more than this and never fired early (fire_due_timers reads the clock).
+    _CHIP_TIMER_NAP_MAX_S = 0.020
+
     def _chip_timer_thread() -> None:
         while not _stopped.is_set():
             # Find the soonest deadline across all chips with active timers.
@@ -2932,12 +2974,14 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 # No active timers — sleep a bit and re-check.
                 _stopped.wait(0.050)
                 continue
-            now_ns = time.monotonic_ns() - _t0_ref[0]
+            now_ns = _chip_now_ns()
             wait_ns = max(0, soonest_ns - now_ns)
             if wait_ns > 0:
-                _stopped.wait(wait_ns / 1e9)
+                _stopped.wait(min(wait_ns / 1e9, _CHIP_TIMER_NAP_MAX_S))
                 if _stopped.is_set():
                     break
+                if _chip_now_ns() < soonest_ns:
+                    continue
             # Fire under the IO-thread lock so any pin_write the timer triggers is safe.
             if _lock_iothread:
                 _lock_iothread(b'esp32_worker.py:chip_timer', 0)
