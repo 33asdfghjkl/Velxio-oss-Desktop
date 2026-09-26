@@ -6,10 +6,18 @@
  * between boards along the wires the user drew. UART, I2C, SPI, and
  * SoftwareSerial protocols all "just work" on top of pin propagation
  * because each board's hardware peripherals decode the actual
- * transitions. For cross-process boards (ESP32 backend QEMU, Pi3B
- * QEMU) it additionally enables a byte-level shortcut on hardware
- * UART pins so that high-baud links don't drop bytes when the
- * WebSocket round-trip would be too slow for bit-level transport.
+ * transitions.
+ *
+ * UART between boards is the bus fabric's (project board-buses-2026-09,
+ * F6): a wire from one board's UART pin to another's is one net with a
+ * controller on each end (simulation/buses/registry.ts, relinkUart), and the
+ * byte a controller transmits reaches the other board's controller there.
+ * The byte-level fan-out below is kept for the boards the fabric cannot
+ * serve, an engine that publishes no UART controller port (every engine of
+ * the product does; the mocked engines of the multi-board suites do not):
+ * per byte, `busRegistry.servesUartWire` says whether the fabric carried the
+ * wire, and only then does this stay out of it, so a byte never arrives
+ * twice.
  *
  * Design:
  *   - Singleton `interconnect`. The store calls `bindBoard` /
@@ -30,7 +38,8 @@
 import type { BoardKind } from '../types/board';
 import type { Wire } from '../types/wire';
 import { boardPinToNumber } from '../utils/boardPinMapping';
-import { classifyPin, isUartWire } from '../utils/boardProtocols';
+import { isUartWire } from '../utils/boardProtocols';
+import { busRegistry } from './buses/registry';
 import {
   resolveCrossBoardChipNets,
   type ChipNetState,
@@ -533,8 +542,10 @@ export function ensureChipNetHooks(): void {
 function installSerialFanout(
   fromBoardId: string,
   fromUart: number,
+  fromPin: number,
   toBoardId: string,
   toUart: number,
+  toPin: number,
 ): () => void {
   const entry = boards.get(fromBoardId);
   if (!entry) return () => {};
@@ -544,7 +555,15 @@ function installSerialFanout(
     set = new Set();
     entry.serialFanout.set(fromUart, set);
   }
-  const cb = (ch: string) => pushSerialByte(toBoardId, ch, toUart);
+  const cb = (ch: string) => {
+    // The fabric carried this byte from the transmitting controller to the
+    // receiving one (both ends are ports on it, linked by this wire): a
+    // second delivery here would be the byte twice. Asked per byte, because
+    // a port's routing follows the sketch (Serial1.begin) and an engine is
+    // bound at Run, both after this route was built.
+    if (busRegistry.servesUartWire(fromBoardId, fromPin, toBoardId, toPin)) return;
+    pushSerialByte(toBoardId, ch, toUart);
+  };
   set.add(cb);
   return () => {
     entry.serialFanout.get(fromUart)?.delete(cb);
@@ -584,31 +603,23 @@ function buildRouteForWire(wire: Wire): RouteHandle | null {
     teardowns.push(installBridgePinFanout(bEntry.id, bRes.pin, aEntry.id, aRes.pin));
   }
 
-  // ─ Optional UART byte-level shortcut ────────────────────────────────────
-  // Enable when at least one side is a cross-process bridge (latency
-  // would drop bit-level transport) AND when both pins classify as
-  // matching UART TX/RX endpoints.
-  const aIsCross = isEsp32Bridge(aEntry.kind) || isPi3Bridge(aEntry.kind);
-  const bIsCross = isEsp32Bridge(bEntry.kind) || isPi3Bridge(bEntry.kind);
+  // ─ UART byte-level fan-out, for the boards the fabric does not serve ────
+  // A hardware-UART pin pair by the boards' static tables. When the fabric
+  // links the two boards' nets and has a controller port on each end, the
+  // byte goes that way and the callback installed here stays out (see the
+  // header); otherwise this is the path, as it was for every board before
+  // the fabric.
   const uartInfo = isUartWire(aEntry.kind, wire.start.pinName, bEntry.kind, wire.end.pinName);
-
-  // Always wire the byte-level shortcut for hardware-UART pin pairs —
-  // even browser-only cases benefit: AVR/RP2040 sims emit per-byte
-  // events that cleanly arrive at the other side without depending on
-  // bit-level pin replay timing.
   if (uartInfo) {
-    const aRoleIsTx = classifyPin(aEntry.kind, wire.start.pinName).kind === 'uart-tx';
     const aUart = uartInfo.uartA;
     const bUart = uartInfo.uartB;
-    if (aRoleIsTx) {
-      // A.TX → B.RX
-      teardowns.push(installSerialFanout(aEntry.id, aUart, bEntry.id, bUart));
+    if (uartInfo.txSide === 'a') {
+      // A.TX -> B.RX
+      teardowns.push(installSerialFanout(aEntry.id, aUart, aRes.pin, bEntry.id, bUart, bRes.pin));
     } else {
-      // A.RX → B.TX (the wire's "start" was the RX side)
-      teardowns.push(installSerialFanout(bEntry.id, bUart, aEntry.id, aUart));
+      // A.RX -> B.TX (the wire's "start" was the RX side)
+      teardowns.push(installSerialFanout(bEntry.id, bUart, bRes.pin, aEntry.id, aUart, aRes.pin));
     }
-    void aIsCross;
-    void bIsCross;
   }
 
   return {

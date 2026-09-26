@@ -2,14 +2,14 @@
  * ChipRuntime — TypeScript port of test/test_custom_chips/src/ChipRuntime.js.
  *
  * Loads a Velxio custom-chip WASM, wires its imports to host services
- * (PinManager, the SPI and I2C bus fabric, attribute storage, timer
+ * (PinManager, the SPI, I2C and UART bus fabric, attribute storage, timer
  * queue), and dispatches its callbacks back into the simulator. One
  * ChipInstance per chip dropped on the canvas.
  */
 import type { PinManager } from '../PinManager';
 import { SPIDevice } from './SPIBus';
-import { attachI2cTarget, attachSpiDevice } from '../buses';
-import type { BusHandle, I2cTarget, SpiMode } from '../buses/types';
+import { attachI2cTarget, attachSpiDevice, attachUartEndpoint } from '../buses';
+import type { BusHandle, I2cTarget, SpiMode, UartHandle } from '../buses/types';
 import { WasiShim, type SimNanosFn, type WriteStdoutFn } from './WasiShim';
 import { setChipPinDrive } from './chipPinDrives';
 import { isSyntheticChipPin, isSyntheticNetPin } from './syntheticPins';
@@ -162,6 +162,24 @@ interface SpiEntry {
   bus: BusHandle | null;
 }
 
+/** One vx_uart_attach: its config and, once setup is over, its place on the wires. */
+interface UartEntry {
+  cfg: UartConfig;
+  /** Registration on the bus fabric, disposed with the chip. */
+  bus: UartHandle | null;
+}
+
+/**
+ * The fabric owner of a chip's UART handle: the chip's own component id for
+ * its first UART, which is the identity a QEMU worker's copy of the chip
+ * carries too (uart_bus_table.owner_of), and `<id>:uart<n>` for any further
+ * one. Every host that registers a chip's UART names it this way, so a map
+ * built in the tab and a record hosted in a worker meet on the same word.
+ */
+export function chipUartOwner(componentId: string, handle: number): string {
+  return handle === 0 ? componentId : `${componentId}:uart${handle}`;
+}
+
 /**
  * A test's stand-in for the bus fabric: it takes the chip's I2C devices, one
  * per vx_i2c_attach, and drives them byte by byte itself. The canvas hosts
@@ -245,7 +263,9 @@ export class ChipInstance {
   private attrHandles: AttrEntry[] = [];
   private _pinWatches = new Map<number, Set<() => void>>();
   private timers: TimerEntry[] = [];
-  private uarts: UartConfig[] = [];
+  private uarts: UartEntry[] = [];
+  /** A host's ear on what the chip transmits (tests, a part that mirrors the
+   *  bytes). The wire itself is the fabric's, see _uart_write. */
   private _uartTxListener: ((byte: number) => void) | null = null;
   private spiDevices: SpiEntry[] = [];
   /** chip_setup is running: SPI handles wait for it to finish before joining. */
@@ -379,6 +399,11 @@ export class ChipInstance {
     // And its I2C with every address it attached, in one registration each
     // pair of pins, rather than one per call while setup is still adding them.
     for (const g of this.i2cGroups) if (!g.bus) g.bus = this._joinI2cBus(g);
+    // And its UARTs, once the pads they name are registered pins.
+    for (let i = 0; i < this.uarts.length; i++) {
+      const u = this.uarts[i];
+      if (!u.bus) u.bus = this._joinUartBus(u, i);
+    }
     this.wasi.flush();
   }
 
@@ -434,6 +459,8 @@ export class ChipInstance {
     this.i2cDevices = [];
     for (const e of this.spiDevices) e.bus?.dispose();
     this.spiDevices = [];
+    for (const u of this.uarts) u.bus?.dispose();
+    this.uarts = [];
     // Stop driving any bus nets this chip contributed to, then re-resolve them
     // so a removed chip releases the bus (its drivers no longer count).
     if (this.componentId) clearBusDriversForChip(this.pinManager, this.componentId);
@@ -979,11 +1006,59 @@ export class ChipInstance {
 
   // ── UART ─────────────────────────────────────────────────────────────────
 
+  /**
+   * vx_uart_attach: THIS is where a chip gets on a UART wire, with the RX and
+   * TX pads its config names, as vx_spi_attach and vx_i2c_attach do for their
+   * buses. The fabric walks the wires from each pad: the RX pad hears whatever
+   * transmits on the board pin it reaches (a controller's TX, or a GPIO the
+   * sketch bit-bangs on the guest's clock), the TX pad drives the wire it
+   * reaches (a controller's RX, or edges on a plain GPIO), and a pad wired to
+   * nothing is on no wire at all. There is no USART0 or Serial1 to fall back
+   * to. The rate is the chip's own (`baud_rate`): what the fabric checks the
+   * controller against, and the bit time a pad on a plain GPIO is clocked at.
+   *
+   * Until board-buses F6 the part that hosts the chip did this attach, after
+   * start(), from the pads it asked the chip for, and skipped the ESP32 kind
+   * so an overlay extension could do the same job there; two hosts for one
+   * registration, and a third would have been needed for every new one. The
+   * chip's own call is the one place that knows the pads, so it registers.
+   *
+   * The handle is the index, as before: chips key their writes by it.
+   */
   private _uart_attach(cfgPtr: number): number {
     const cfg = readUartConfig(this.memory!, cfgPtr);
     const handle = this.uarts.length;
-    this.uarts.push(cfg);
+    const entry: UartEntry = { cfg, bus: null };
+    this.uarts.push(entry);
+    // During chip_setup the pads may not all be registered yet, and the SPI
+    // and I2C joins wait for start() to finish it too; a handle attached
+    // later (from a timer) joins straight away.
+    if (!this.inSetup) entry.bus = this._joinUartBus(entry, handle);
     return handle;
+  }
+
+  /**
+   * Put one UART handle on the wires its pads reach. Null when the chip has
+   * no canvas identity to resolve its wires against, or names no pad at all.
+   */
+  private _joinUartBus(entry: UartEntry, handle: number): UartHandle | null {
+    if (!this.componentId) return null;
+    const rx = this._busPad(entry.cfg.rx);
+    const tx = this._busPad(entry.cfg.tx);
+    if (!rx && !tx) {
+      // No pad to resolve: nothing on a bench would ever reach it either.
+      this.wasi.writeStdout('vx_uart_attach names no RX/TX pin; the chip is on no wire\n');
+      return null;
+    }
+    return attachUartEndpoint(
+      {
+        owner: chipUartOwner(this.componentId, handle),
+        componentId: this.componentId,
+        pins: { ...(rx ? { rx } : {}), ...(tx ? { tx } : {}) },
+        baud: entry.cfg.baud_rate > 0 ? entry.cfg.baud_rate : 9600,
+      },
+      { receive: (byte) => this.feedUart(byte, handle) },
+    );
   }
 
   private _uart_write(handle: number, bufPtr: number, count: number): number {
@@ -991,63 +1066,71 @@ export class ChipInstance {
     if (!u) return 0;
     const u8 = new Uint8Array(this.memory!.buffer);
     const bytes = u8.slice(bufPtr, bufPtr + count);
-    if (this._uartTxListener) {
-      for (const b of bytes) this._uartTxListener(b);
+    for (const b of bytes) {
+      // The wire: the fabric puts the byte on the TX pad's net (into the
+      // controller whose RX is there, or as edges on a plain GPIO).
+      u.bus?.transmit(b);
+      // The host's ear, if it has one.
+      this._uartTxListener?.(b);
     }
-    if (u.on_tx_done) {
+    if (u.cfg.on_tx_done) {
       const table = this.exports?.__indirect_function_table as WebAssembly.Table | undefined;
-      const fn = table?.get(u.on_tx_done) as ((ud: number) => void) | null;
+      const fn = table?.get(u.cfg.on_tx_done) as ((ud: number) => void) | null;
       if (fn) {
-        try { fn(u.user_data); } catch { /* swallow */ }
+        try { fn(u.cfg.user_data); } catch { /* swallow */ }
       }
     }
     this.wasi.flush();
     return 1;
   }
 
+  /** A byte arriving at the chip's RX pad (the fabric's delivery; tests feed it directly). */
   feedUart(byte: number, handle = 0): void {
     const u = this.uarts[handle];
-    if (!u || !u.on_rx_byte) return;
+    if (!u || !u.cfg.on_rx_byte) return;
     const table = this.exports?.__indirect_function_table as WebAssembly.Table | undefined;
-    const fn = table?.get(u.on_rx_byte) as ((ud: number, byte: number) => void) | null;
+    const fn = table?.get(u.cfg.on_rx_byte) as ((ud: number, byte: number) => void) | null;
     if (fn) {
-      try { fn(u.user_data, byte & 0xff); } catch { /* swallow */ }
+      try { fn(u.cfg.user_data, byte & 0xff); } catch { /* swallow */ }
     }
     this.wasi.flush();
   }
 
+  /**
+   * Hear every byte the chip transmits, on any handle, after the fabric has
+   * had it. An observer: it does not stand in for the wire, and a host that
+   * puts what it hears back on a bus of its own sends every byte twice.
+   */
   onUartTx(cb: (byte: number) => void): void {
     this._uartTxListener = cb;
   }
 
   /**
    * Where a declared UART's TX physically goes: the board pin its TX chip-pin
-   * is wired to (null when unwired/synthetic) and the configured baud. Lets
-   * the part route TX to the hardware USART vs a bit-banged GPIO.
+   * is wired to (null when unwired/synthetic) and the configured baud.
    */
   getUartTxRoute(handle = 0): { txArduinoPin: number | null; baud: number } | null {
     const u = this.uarts[handle];
     if (!u) return null;
-    const pin = this.pins[u.tx];
+    const pin = this.pins[u.cfg.tx];
     return {
       txArduinoPin: pin?.arduinoPin ?? null,
-      baud: u.baud_rate > 0 ? u.baud_rate : 9600,
+      baud: u.cfg.baud_rate > 0 ? u.cfg.baud_rate : 9600,
     };
   }
 
   /**
-   * The chip pad names a UART was attached with (`vx_uart_config.rx/.tx`),
-   * so a host can route each direction by the board pin the user wired to
-   * that pad. Null pads for handles the chip never registered. The names,
-   * not the pin numbers: the host owns the wire map and the board's pin
-   * table, and a pad wired to nothing still has a name to log.
+   * The chip pad names a UART was attached with (`vx_uart_config.rx/.tx`).
+   * Null pads for handles the chip never registered. The names, not the pin
+   * numbers: a host that cannot run the chip beside its guest (a QEMU board)
+   * reads them off an inert copy and places them on the fabric itself.
    */
   getUartPads(handle = 0): { rxPad: string | null; txPad: string | null } | null {
     const u = this.uarts[handle];
     if (!u) return null;
     return {
-      rxPad: this.pins[u.rx]?.name ?? null,
-      txPad: this.pins[u.tx]?.name ?? null,
+      rxPad: this.pins[u.cfg.rx]?.name ?? null,
+      txPad: this.pins[u.cfg.tx]?.name ?? null,
     };
   }
 

@@ -2598,11 +2598,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 # Each entry: {'pin': <chip pin>, 'net': <net id>,
                 # 'remote': bool}. Absent on older frontends.
                 nets       = s.get('nets', []) or []
-                # {gpio: uart_id} for the UART pins the diagram wires to
-                # this chip, so vx_uart_attach binds to the UART the
-                # sketch actually talks on. Absent on older frontends.
-                uart_map   = {int(k): int(v)
-                              for k, v in (s.get('uart_map', {}) or {}).items()}
                 net_map    = {str(n['pin']): str(n['net'])
                               for n in nets if n.get('pin') and n.get('net')}
                 net_bus    = None
@@ -2627,18 +2622,18 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 # (typical case: the chip's vx_uart_write is fired from inside
                 # _on_uart_tx, which is already in the QEMU thread holding the
                 # lock — re-acquiring there triggers an assertion).
-                # `uart_id` is what the runtime resolved from the record alone;
-                # the table answers from the wiring the tab mapped and the live
-                # matrix, and a chip on no controller writes into the air (F6).
+                # The table answers from the wiring the tab mapped and the live
+                # matrix; a chip on no controller writes into the air (F6). The
+                # record itself names no UART any more.
                 _rt_cell: list = [None]
 
-                def _chip_uart_writer(uart_id: int, data: bytes,
+                def _chip_uart_writer(data: bytes,
                                       _lib=lib,
                                       _lock=_lock_iothread,
                                       _unlock=_unlock_iothread,
                                       _is_locked=_iothread_locked,
                                       _cell=_rt_cell):
-                    unit = _uart_table.unit_of(_cell[0], default=uart_id)
+                    unit = _uart_table.unit_of(_cell[0])
                     if unit is None:
                         return
                     uart_id = int(unit)
@@ -2667,7 +2662,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     timer_scheduler=_chip_timer_scheduler,
                     net_map=net_map,
                     net_bus=net_bus,
-                    uart_map=uart_map,
                     display=display,
                     component_id=comp_id,
                 )
@@ -2685,10 +2679,9 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     sensor_data['slave']    = slave
                     _log(f"[custom-chip] I2C slave registered at 0x{runtime.i2c_address:02x}")
                 if runtime.uart_config is not None:
-                    _uart_table.add(runtime, runtime, owner=_uart_owner_of(s),
-                                    legacy_unit=runtime.uart_id)
+                    _uart_table.add(runtime, runtime, owner=_uart_owner_of(s))
                     _log(f"[custom-chip] UART chip registered "
-                         f"(owner={_uart_owner_of(s)!r}, record says UART{runtime.uart_id})")
+                         f"(owner={_uart_owner_of(s)!r}, on the UART the tab's map names)")
                 if runtime.spi_config is not None:
                     _chip_spi_runtimes.append(runtime)
                     _spi_population_changed()

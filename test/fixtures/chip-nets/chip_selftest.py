@@ -301,7 +301,7 @@ class Plc:
             pin_map=self.map,
             pin_writer=net.writer,
             pin_reader=net.reader,
-            uart_writer=lambda _uart, data: self.out.extend(data),
+            uart_writer=lambda data: self.out.extend(data),
         )
         net.runtimes.append(self.rt)
         self.rt.run_chip_setup()

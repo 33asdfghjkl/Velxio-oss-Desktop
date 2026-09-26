@@ -1968,18 +1968,6 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
   }
 
   /**
-   * Send a raw byte to the serial interface (for control characters like Ctrl+C).
-   */
-  serialWriteByte(byte: number): void {
-    if (!this.rp2040) return;
-    if (this.micropythonMode && this.usbCDC) {
-      this.usbCDC.sendSerialByte(byte);
-    } else {
-      this.queueUartByte(0, byte & 0xff);
-    }
-  }
-
-  /**
    * Execute one ARM instruction synchronously and return the number
    * of CPU cycles it took.  Mirrors `AVRSimulator.step()` for tests
    * that need deterministic single-stepping outside the

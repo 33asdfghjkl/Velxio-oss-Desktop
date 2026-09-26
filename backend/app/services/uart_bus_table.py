@@ -8,7 +8,7 @@ beside the guest: QEMU hands the worker every byte the firmware transmits
 guest's RX (qemu_picsimlab_uart_receive). What the worker cannot see is the
 circuit. Before F6 each chip resolved its UART once, at vx_uart_attach, from a
 {gpio: uart} table the frontend built with a static pin classifier, and a
-record with no table landed on CHIP_UART (Serial1) whatever the wiring: the
+record with no table landed on Serial1 whatever the wiring: the
 grove-worker-no-uart-map finding, and the reason a module wired to Serial2 on
 a variant the classifier did not know was answered by the wrong port.
 
@@ -24,7 +24,7 @@ fabric.ts), on the worker's side of the wire:
   - a chip whose legs the fabric placed on no controller (unwired, or on
     plain GPIOs the guest would have to bit-bang) hears nothing and is heard
     by nobody. The worker has no bit-timed pins, so there is no software UART
-    to fall back to, and CHIP_UART is not a place a wire leads.
+    to fall back to, and Serial1 is not a place a wire leads.
 
 Which unit a chip is on comes from, in this order:
 
@@ -40,10 +40,13 @@ Which unit a chip is on comes from, in this order:
      placed on this board): the unit whose TX feeds the RX leg, else the one
      whose RX reads the TX leg, from the board's pin table. An owner the map
      lists as unplaced is on no wire of this board and is silent;
-  3. for a registration the map says nothing about (a record from a part that
-     is not on the fabric, or a tab that predates F6), the unit the record
-     alone gave it: its own `uart_map`, else CHIP_UART. Kept so an unmigrated
-     part keeps working; it goes when the last one migrates.
+  3. nothing else: a registration the map says nothing about (a record the
+     tab has not placed yet, or one from a part that is not on the fabric)
+     is on no unit, silent both ways. Every part that sends the worker a
+     UART chip is on the fabric since F6 (CustomChipPart, the Grove
+     chipPart), so a map always follows a record; the record's own word
+     (a `uart_map` guessed from a static pin table, Serial1 when it had
+     none) is no longer asked.
 
 Owners link a map entry to a registration: a record's `owner` field, else its
 `component_id`, the same identity the tab's registry keys the endpoint by.
@@ -99,14 +102,12 @@ class _Placement:
 
 
 class _Registration:
-    __slots__ = ('key', 'runtime', 'owner', 'legacy_unit', 'name')
+    __slots__ = ('key', 'runtime', 'owner', 'name')
 
-    def __init__(self, key: Any, runtime: Any, owner: Optional[str],
-                 legacy_unit: Optional[int]) -> None:
+    def __init__(self, key: Any, runtime: Any, owner: Optional[str]) -> None:
         self.key = key
         self.runtime = runtime
         self.owner = owner
-        self.legacy_unit = legacy_unit
         # A stable order for dispatch that does not depend on the order the
         # registrations arrived in, as the tab sorts its listeners by owner.
         self.name = owner if owner else f'{type(runtime).__name__}@{id(runtime):x}'
@@ -126,12 +127,11 @@ class UartBusTable:
 
     # ── registrations ──────────────────────────────────────────────────────
 
-    def add(self, key: Any, runtime: Any, *, owner: Optional[str] = None,
-            legacy_unit: Optional[int] = None) -> None:
+    def add(self, key: Any, runtime: Any, *, owner: Optional[str] = None) -> None:
         """Register `runtime` under `key`. The same key again replaces it.
-        `legacy_unit` is what the record alone put the chip on (its own
-        uart_map, else CHIP_UART), used only while no map names the owner."""
-        reg = _Registration(key, runtime, owner or None, _as_unit(legacy_unit))
+        `owner` is the identity the tab's map names it by (owner_of); a
+        registration is on no unit until a map names its owner."""
+        reg = _Registration(key, runtime, owner or None)
         with self._lock:
             regs = dict(self._regs)
             regs[key] = reg
@@ -221,8 +221,10 @@ class UartBusTable:
         placement = self._placement
         p = placement.get(reg.owner) if placement is not None and reg.owner else None
         if p is None:
-            # The map says nothing about this chip: the record alone decides.
-            return reg.legacy_unit
+            # The map says nothing about this chip (none has arrived yet, or
+            # it is not on the tab's fabric): on no unit. There is no unit a
+            # record alone could name that a wire on the bench would lead to.
+            return None
         if p.silent:
             return None
         if p.rx_pin is not None and self._resolve is not None:

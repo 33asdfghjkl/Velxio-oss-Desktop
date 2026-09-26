@@ -200,6 +200,8 @@ export class BusRegistry {
   private readonly uartMapListeners = new Set<UartMapListener>();
   private readonly uartDirty = new Set<string>();
   private uartFlushQueued = false;
+  /** relinkUart is running: a net it creates or refreshes must not start another. */
+  private uartRelinking = false;
   private readonly attrListeners = new Set<SpiAttrsListener>();
   /**
    * What each remote host was last told a device's live inputs are, by owner,
@@ -227,6 +229,9 @@ export class BusRegistry {
     for (const e of this.spi.values()) this.place(e);
     for (const e of this.i2c.values()) this.placeI2c(e);
     for (const e of this.uart.values()) this.placeUart(e);
+    // A wire between two boards' UART pins carries no endpoint, so nothing
+    // above notices it: the links are recomputed here as well.
+    this.relinkUart();
   }
 
   // ── Boards ────────────────────────────────────────────────────────────────
@@ -282,6 +287,8 @@ export class BusRegistry {
     this.fabricHooks.delete(boardId);
     f.dispose();
     this.fabrics.delete(boardId);
+    // The other boards' nets on a wire to this one still name its nets.
+    this.relinkUart();
   }
 
   // ── SPI devices ───────────────────────────────────────────────────────────
@@ -741,6 +748,10 @@ export class BusRegistry {
   }
 
   private uartMapChanged(boardId: string): void {
+    // Synchronous, before anyone is told: a fabric calls this when a net is
+    // born, a leg lands or a controller is (re)routed, and the wiring checks
+    // that follow in the fabric must already see the peer boards.
+    this.relinkUart();
     if (this.uartMapListeners.size === 0) return;
     this.uartDirty.add(boardId);
     if (this.uartFlushQueued) return;
@@ -759,6 +770,98 @@ export class BusRegistry {
         }
       }
     });
+  }
+
+  // ── UART between boards ───────────────────────────────────────────────────
+
+  /**
+   * Link the UART nets of every wire that reaches more than one board. A
+   * wire is walked from each board pin a bound controller is routed to and
+   * from each pin an endpoint's leg landed on (`resolveAll`, which follows
+   * pad-to-pad wires, directly or through a breadboard, a passive or a part);
+   * the nets of the boards it reaches become peers of one another (see
+   * UartNet.peers). Recomputed as a whole, from scratch, on every change that
+   * can move a link: the circuit, a controller's routing, a board's engine, a
+   * leg. Re-entrant calls (a net this creates asks the fabric, which calls
+   * back) are folded into the running one. A resolver without `resolveAll`
+   * links nothing: every board is then alone on its wires, as before F6's
+   * second part, and the Interconnect's byte fan-out still serves it.
+   */
+  private relinkUart(): void {
+    if (this.uartRelinking) return;
+    this.uartRelinking = true;
+    try {
+      const touched = new Set<UartNet>();
+      for (const f of this.fabrics.values()) {
+        for (const net of f.uartNets.values()) {
+          if (net.peers.size === 0) continue;
+          net.peers.clear();
+          touched.add(net);
+        }
+      }
+      const resolveAll = this.resolver.resolveAll?.bind(this.resolver);
+      if (resolveAll) {
+        const seen = new Set<string>();
+        const link = (boardId: string, pin: number): void => {
+          const ends: Array<{ boardId: string; pin: number }> = [];
+          for (const p of resolveAll({ kind: 'board', boardId, pin })) {
+            if (p.kind === 'board' && !ends.some((e) => e.boardId === p.boardId)) ends.push(p);
+          }
+          if (ends.length < 2) return;
+          const key = ends
+            .map((e) => `${e.boardId}|${e.pin}`)
+            .sort()
+            .join(';');
+          if (seen.has(key)) return;
+          seen.add(key);
+          const nets = ends.map((e) => this.fabric(e.boardId).uartNetFor(e.pin));
+          for (const n of nets) {
+            for (const m of nets) if (m !== n) n.peers.add(m);
+            touched.add(n);
+          }
+        };
+        for (const [boardId, f] of this.fabrics) {
+          if (!f.bound) continue;
+          for (const pin of f.uartControllerPins()) link(boardId, pin);
+        }
+        for (const e of this.uart.values()) {
+          for (const leg of [e.rx, e.tx]) if (leg) link(leg.fabric.boardId, leg.net.pin);
+        }
+      }
+      // A net that lost its peers and has no leg of its own goes; every
+      // other touched net gets its decoders, emitter and wiring checks again.
+      for (const net of touched) this.fabrics.get(net.boardId)?.uartMembershipChanged(net);
+    } finally {
+      this.uartRelinking = false;
+    }
+  }
+
+  /**
+   * The other boards' pins on the wire of `boardId`'s `pin`, as the fabric
+   * has linked them (sorted by board, then pin). Empty for a pin the fabric
+   * holds no net on, or one wired to no other board.
+   */
+  uartPeers(boardId: string, pin: number): Array<{ boardId: string; pin: number }> {
+    const net = this.fabrics.get(boardId)?.uartNets.get(pin);
+    if (!net) return [];
+    return Array.from(net.peers, (p) => ({ boardId: p.boardId, pin: p.pin })).sort((a, b) =>
+      a.boardId < b.boardId ? -1 : a.boardId > b.boardId ? 1 : a.pin - b.pin,
+    );
+  }
+
+  /**
+   * Whether a byte a controller of `fromBoardId` transmits on `fromPin`
+   * reaches a controller of `toBoardId` listening on `toPin` through the
+   * fabric: the two nets are peers, a controller's TX is routed to the first
+   * and a controller's RX to the second. The Interconnect asks per byte and
+   * keeps its own fan-out for the wires this answers false for (a board
+   * whose engine publishes no UART port), so a byte never arrives twice.
+   */
+  servesUartWire(fromBoardId: string, fromPin: number, toBoardId: string, toPin: number): boolean {
+    const src = this.fabrics.get(fromBoardId)?.uartNets.get(fromPin);
+    const dst = this.fabrics.get(toBoardId)?.uartNets.get(toPin);
+    if (!src || !dst || !src.peers.has(dst)) return false;
+    return src.controllerTx !== null && dst.controllerRx !== null;
   }
 
   // ── The bus map a remote worker needs ─────────────────────────────────────

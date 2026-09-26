@@ -1046,13 +1046,8 @@ export class PiBridgeShim {
     }
     (this.bridge as Partial<RaspberryPi3Bridge>).sendUartBytes?.(bytes);
   }
-  /** One byte, the RP2040 name: the monitor's byte seam, and the one the
-   *  custom-chip host fingerprints the RP family by (detectSimulatorKind).
-   *  A part on the fabric answers through the UART port, not through this. */
-  serialWriteByte(byte: number): void {
-    this.sendSerialBytes([byte & 0xff]);
-  }
-  /** Text counterpart, the uniform `sim.feedUart(uart, data)` seam. */
+  /** Text counterpart, the uniform `sim.feedUart(uart, data)` seam. A part on
+   *  the fabric answers through the UART port, not through this. */
   feedUart(uart: number, data: string): boolean {
     this.sendSerialBytes(Array.from(new TextEncoder().encode(data)), uart);
     return true;

@@ -24,8 +24,9 @@ The rules, as the tab's fabric has them (simulation/buses/uartBus.ts):
     the pad; a pad the matrix does not route falls back to the tab's answer
     (ESP-IDF 5 puts a port on its IO_MUX pins without the matrix);
   - an owner the map lists as unplaced, or places on no controller, is
-    silent both ways; a record the map says nothing about keeps what its own
-    uart_map gave it, Serial1 when nothing did, as before F6.
+    silent both ways, and so is a record the map says nothing about: the
+    record's own word (the pre-F6 uart_map, Serial1 when it had none) is
+    not asked (F6 second part; before it, that word was the fallback).
 """
 from __future__ import annotations
 
@@ -68,24 +69,26 @@ def entry(owner: str, rx_uart=None, tx_uart=None, rx_pin=None, tx_pin=None) -> d
 
 
 class TestTableRegistration:
-    def test_a_record_nobody_placed_keeps_what_its_own_map_gave_it(self):
-        """Before any map, and for an owner the map never names: the unit the
-        record alone resolved (its uart_map, Serial1 when nothing did)."""
+    def test_a_record_nobody_placed_is_silent(self):
+        """Before any map, and for an owner the map never names: on no unit.
+        The record's own word (its pre-F6 uart_map, Serial1 when it had
+        none) is not asked; a wire the tab has not mapped leads nowhere."""
         t = UartBusTable()
         a, b = Chip('a'), Chip('b')
-        t.add(a, a, owner='chipA', legacy_unit=2)
-        t.add(b, b, owner='chipB', legacy_unit=1)
-        assert t.unit_of(a) == 2
-        assert t.unit_of(b) == 1
-        assert t.runtimes_on(2) == [a]
-        assert t.runtimes_on(1) == [b]
+        t.add(a, a, owner='chipA')
+        t.add(b, b, owner='chipB')
+        assert t.unit_of(a) is None
+        assert t.unit_of(b) is None
+        assert t.runtimes_on(2) == []
+        assert t.runtimes_on(1) == []
         assert t.runtimes_on(0) == []
 
     def test_removal_is_by_identity(self):
         t = UartBusTable()
         a, b = Chip('a'), Chip('b')
-        t.add(a, a, owner='chipA', legacy_unit=1)
-        t.add(b, b, owner='chipB', legacy_unit=1)
+        t.add(a, a, owner='chipA')
+        t.add(b, b, owner='chipB')
+        t.apply_map([entry('chipA', rx_uart=1), entry('chipB', rx_uart=1)])
         assert t.remove(a) is a
         assert t.remove(a) is None
         assert t.runtimes_on(1) == [b]
@@ -94,8 +97,9 @@ class TestTableRegistration:
     def test_the_same_key_again_replaces(self):
         t = UartBusTable()
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
-        t.add(a, a, owner='chipA', legacy_unit=2)
+        t.add(a, a, owner='chipA')
+        t.add(a, a, owner='chipB')
+        t.apply_map([entry('chipA', rx_uart=1), entry('chipB', rx_uart=2)])
         assert len(t) == 1
         assert t.unit_of(a) == 2
 
@@ -115,7 +119,7 @@ class TestTableMap:
     def test_the_map_places_an_owner_on_the_controller_that_feeds_its_rx(self):
         t = UartBusTable()
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([entry('chipA', rx_uart=2, tx_uart=2, rx_pin=17, tx_pin=16)])
         assert t.unit_of(a) == 2
         assert t.runtimes_on(2) == [a]
@@ -125,7 +129,7 @@ class TestTableMap:
         """A GPS: no RX leg, its TX on the board's RX pin."""
         t = UartBusTable()
         a = Chip('a')
-        t.add(a, a, owner='gps', legacy_unit=1)
+        t.add(a, a, owner='gps')
         t.apply_map([entry('gps', tx_uart=2, tx_pin=16)])
         assert t.unit_of(a) == 2
 
@@ -134,7 +138,7 @@ class TestTableMap:
         nobody reads its TX. No Serial1 fallback: a wire leads nowhere."""
         t = UartBusTable()
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([entry('chipA', rx_pin=32, tx_pin=33)])
         assert t.unit_of(a) is None
         assert t.runtimes_on(1) == []
@@ -142,23 +146,26 @@ class TestTableMap:
     def test_an_unplaced_owner_is_silent(self):
         t = UartBusTable()
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([{'unplaced': ['chipA']}])
         assert t.unit_of(a) is None
         assert t.runtimes_on(1) == []
 
-    def test_an_owner_absent_from_the_next_map_falls_back_to_its_record(self):
+    def test_an_owner_absent_from_the_next_map_is_silent(self):
+        """The whole list travels every time: an owner that left the tab's
+        fabric is gone by being absent, and on no unit."""
         t = UartBusTable()
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([entry('chipA', rx_uart=2)])
         t.apply_map([])
-        assert t.unit_of(a) == 1
+        assert t.unit_of(a) is None
+        assert t.runtimes_on(2) == []
 
     def test_a_map_with_no_uart_key_keeps_the_placement(self):
         t = UartBusTable()
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([entry('chipA', rx_uart=2)])
         t.apply_map(None)
         assert t.unit_of(a) == 2
@@ -168,13 +175,13 @@ class TestTableMap:
         t = UartBusTable()
         t.apply_map([entry('chipA', rx_uart=2)])
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         assert t.unit_of(a) == 2
 
     def test_garbage_entries_are_ignored(self):
         t = UartBusTable()
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([None, 42, {'owner': ''}, {'unplaced': 'chipA'},
                      entry('chipA', rx_uart='2', tx_uart=True)])
         # '2' is taken as a unit, True (a bool) is not.
@@ -185,8 +192,9 @@ class TestTableMap:
     def test_runtimes_on_a_controller_are_in_owner_order(self):
         t = UartBusTable()
         b, a = Chip('b'), Chip('a')
-        t.add(b, b, owner='zeta', legacy_unit=1)
-        t.add(a, a, owner='alpha', legacy_unit=1)
+        t.add(b, b, owner='zeta')
+        t.add(a, a, owner='alpha')
+        t.apply_map([entry('zeta', rx_uart=1), entry('alpha', rx_uart=1)])
         assert t.runtimes_on(1) == [a, b]
 
 
@@ -195,7 +203,7 @@ class TestTableMatrix:
         routed = {17: 1}
         t = UartBusTable(resolve_tx_pad=lambda pad: routed.get(pad, NOT_ROUTED))
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         # The tab's static table puts pad 17 on UART2 (U2TXD IO_MUX); the
         # sketch did Serial1.begin(9600, SERIAL_8N1, 16, 17).
         t.apply_map([entry('chipA', rx_uart=2, tx_uart=2, rx_pin=17, tx_pin=16)])
@@ -208,21 +216,21 @@ class TestTableMatrix:
         matrix, so an unrouted pad is not "no UART": the tab's table decides."""
         t = UartBusTable(resolve_tx_pad=lambda pad: NOT_ROUTED)
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([entry('chipA', rx_uart=2, tx_uart=2, rx_pin=17, tx_pin=16)])
         assert t.unit_of(a) == 2
 
     def test_a_matrix_that_cannot_be_read_falls_back_to_the_tab(self):
         t = UartBusTable(resolve_tx_pad=lambda pad: None)
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([entry('chipA', rx_uart=2, rx_pin=17)])
         assert t.unit_of(a) == 2
 
     def test_a_pad_no_one_can_name_leaves_the_chip_silent(self):
         t = UartBusTable(resolve_tx_pad=lambda pad: NOT_ROUTED)
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([entry('chipA', rx_pin=32, tx_pin=33)])
         assert t.unit_of(a) is None
 
@@ -237,7 +245,7 @@ class TestTableMatrix:
             return NOT_ROUTED
         t = UartBusTable(resolve_tx_pad=resolve)
         a = Chip('a')
-        t.add(a, a, owner='chipA', legacy_unit=1)
+        t.add(a, a, owner='chipA')
         t.apply_map([entry('chipA', rx_uart=2, tx_uart=2, rx_pin=17, tx_pin=16)])
         t.unit_of(a)
         assert asked == [17]
@@ -266,7 +274,8 @@ GPIO_OUT = 256
 
 def uart_chip(pin: int, chip_id: int, owner: str, uart_map: dict | None = None) -> dict:
     """The record a Grove UART module sends the worker: no uart_map (the
-    fabric's map places it), unless a test asks for the pre-F6 shape."""
+    fabric's map places it), unless a test sends the pre-F6 shape to show
+    that it is ignored."""
     return {
         'sensor_type': 'custom-chip', 'pin': pin, 'wasm_b64': _wasm('uart-probe'),
         'attrs': {'id': chip_id}, 'component_id': owner,
@@ -285,19 +294,24 @@ def replies(w) -> list[tuple[int, list[int]]]:
     return [(c[1], c[2]) for c in w.guest('calls')['calls'] if c[0] == 'uart_receive']
 
 
-class TestWorkerLegacy:
-    def test_setup_a_record_with_its_own_uart_map_is_on_that_uart(self, worker):
-        """The rig, and the path a pre-F6 tab keeps: the record's own table."""
+class TestWorkerUnmapped:
+    def test_setup_a_record_with_its_own_uart_map_is_silent_until_the_tab_maps_it(self, worker):
+        """The pre-F6 shape: a record carrying the {gpio: uart} table the tab
+        used to guess. It is not honoured: with no map from the fabric the
+        chip hears no UART, the one its table named included."""
         w = worker(sensors=[uart_chip(400, 0x11, 'chipA', {U2_TX_PAD: 2, U2_RX_PAD: 2})])
         say(w, 2, 0x41)
         say(w, 1, 0x42)
-        assert replies(w) == [(2, [0x11, 0x41])]
+        say(w, 0, 0x43)
+        assert replies(w) == []
 
-    def test_setup_a_record_with_nothing_lands_on_serial1_as_before(self, worker):
+    def test_setup_a_record_with_nothing_is_silent_on_serial1_too(self, worker):
+        """Where every chip used to land unconditionally (Serial1) is no
+        longer a place a record lands."""
         w = worker(sensors=[uart_chip(400, 0x11, 'chipA')])
         say(w, 1, 0x41)
         say(w, 0, 0x42)
-        assert replies(w) == [(1, [0x11, 0x41])]
+        assert replies(w) == []
 
 
 class TestWorkerMap:

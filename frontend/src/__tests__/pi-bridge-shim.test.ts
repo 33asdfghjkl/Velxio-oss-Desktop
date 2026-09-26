@@ -197,19 +197,21 @@ const decode = (bytes: number[]) => new TextDecoder().decode(Uint8Array.from(byt
 const flush = () => new Promise<void>((r) => queueMicrotask(r));
 
 describe('a UART part on the header', () => {
-  it("is the rp2040 browser path, and the monitor's byte seam reaches the guest header UART", () => {
+  it("is the rp2040 browser path, and the peer-board seam reaches the guest header UART", () => {
     const { id, shim } = addPi();
-    // The part-to-board direction only, through the byte seam the RP family
-    // is fingerprinted by (serialWriteByte); a part on the fabric answers
-    // through the UART port instead, which the tests below drive. What the
-    // board SENDS was the half that never worked.
+    // The part-to-board direction only, through the seam a peer board's
+    // bytes take (feedUart, the Interconnect's); the RP family is
+    // fingerprinted by getBusBinding alone since serialWriteByte went. A part
+    // on the fabric answers through the UART port instead, which the tests
+    // below drive. What the board SENDS was the half that never worked.
     expect(detectSimulatorKind(shim)).toBe('rp2040');
+    expect((shim as unknown as Record<string, unknown>).serialWriteByte, 'the byte seam is gone').toBeUndefined();
     const bridge = getBoardBridge(id) as unknown as { sendUartBytes?: (b: number[]) => void };
     bridge.sendUartBytes = vi.fn();
-    shim.serialWriteByte(0x41);
-    shim.serialWriteByte(0x1ff);
+    expect(shim.feedUart(0, 'A')).toBe(true);
+    shim.sendSerialBytes([0x1ff]);
     expect(bridge.sendUartBytes).toHaveBeenNthCalledWith(1, [0x41]);
-    expect(bridge.sendUartBytes).toHaveBeenNthCalledWith(2, [0xff]);
+    expect(bridge.sendUartBytes).toHaveBeenNthCalledWith(2, [0x1ff]);
   });
 
   it('answers the Linux guest that spoke to it', async () => {

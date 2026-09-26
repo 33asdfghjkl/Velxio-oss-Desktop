@@ -196,7 +196,7 @@ class _Plc:
     """One KQ-130F. TX / RX have board GPIOs; LINE has none and lives on the
     net, which is exactly the wiring that used to carry nothing."""
 
-    def __init__(self, bus, net_id, label, base_gpio, attrs=None, uart_map=None):
+    def __init__(self, bus, net_id, label, base_gpio, attrs=None):
         self.out = bytearray()
         self.logs: list[str] = []
         values = {'line_noise_percent': 0.0, 'bit_period_us': KQ_BIT_US,
@@ -207,10 +207,9 @@ class _Plc:
             values,
             self._emit,
             pin_map={'TX': base_gpio, 'RX': base_gpio + 1},
-            uart_writer=lambda _uart, data: self.out.extend(data),
+            uart_writer=lambda data: self.out.extend(data),
             net_map={'LINE': net_id} if net_id is not None else None,
             net_bus=bus,
-            uart_map=uart_map,
         )
         self.rt.run_chip_setup()
 

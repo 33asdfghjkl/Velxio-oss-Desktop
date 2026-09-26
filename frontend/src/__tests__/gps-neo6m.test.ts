@@ -1,46 +1,56 @@
 /**
- * gps-neo6m.test.ts — u-blox NEO-6M GPS module simulation.
+ * gps-neo6m.test.ts: the u-blox NEO-6M GPS module as a UART endpoint of the
+ * bus fabric (project board-buses-2026-09, F6).
  *
  * Covers:
- *   • NMEA building blocks: checksum, ddmm.mmmmm coordinate encoding,
+ *   - NMEA building blocks: checksum, ddmm.mmmmm coordinate encoding,
  *     GPGGA / GPRMC structure, CRLF cycle framing.
- *   • Part registration in PartSimulationRegistry.
- *   • Byte-level injection: TX wired to a hardware UART RX pin routes the
- *     stream through `sim.feedUart(uart, data)` — Uno pin 0 (uart 0) and
- *     ESP32 GPIO16 (uart 2).
- *   • Bit-banged injection: TX wired to a plain digital pin on a
- *     cycle-accurate sim emits a real 9600-baud 8N1 waveform via
- *     `schedulePinChange` that decodes back to the NMEA text
- *     (the SoftwareSerial wiring every NEO-6M Arduino tutorial uses).
- *   • Live position updates via the SensorControlPanel registry.
+ *   - The module on the fabric, layer 1 (TESTS.md): a fake circuit, fake
+ *     board pins, a fake guest clock and fake controller ports that follow the
+ *     real contracts. Its TX pad on a hardware RX pin reaches that controller
+ *     and no other; on a plain GPIO it leaves as 8N1 edges on the guest clock
+ *     (the software emitter, what SoftwareSerial decodes); on the board's own
+ *     TX pin it is reported as contention and heard by nobody; on nothing it
+ *     is on no wire, with no fallback to UART0. The descriptor has no RX leg.
+ *   - Time: one cycle a second and one character time between bytes, both on
+ *     the GUEST clock; the wall clock alone moves nothing. A stopped board
+ *     silences the module. Live position updates, the UTC field, the PPS
+ *     marker.
+ *
+ * The same module on real firmware (TinyGPS++ on an Uno, a Mega and the ESP32
+ * devkit) is board-buses/board-buses-f6-gps-avr.test.ts and the pro
+ * esp32sim/__tests__/gps-uart-esp32js.test.ts.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PartSimulationRegistry } from '../simulation/parts/PartSimulationRegistry';
 import { dispatchSensorUpdate } from '../simulation/SensorUpdateRegistry';
-import { useSimulatorStore } from '../store/useSimulatorStore';
+import { busRegistry } from '../simulation/buses';
+import type {
+  BoardPins,
+  BusDiagnostic,
+  EngineBinding,
+  GuestClock,
+  NetResolver,
+  PinRef,
+  ResolvedPin,
+  UartConfig,
+  UartControllerPort,
+  UartRouting,
+} from '../simulation/buses/types';
 import {
   GPS_BAUD,
+  GPS_BYTE_MS,
+  GPS_PPS_MS,
+  GPS_TICK_MS,
   nmeaChecksum,
   nmeaSentence,
   formatNmeaCoord,
   buildGpgga,
   buildGprmc,
   buildNmeaCycle,
-  scheduleUartBitstream,
 } from '../simulation/parts/GpsParts';
 import '../simulation/parts/GpsParts';
-
-// ─── Globals ──────────────────────────────────────────────────────────────────
-
-beforeEach(() => {
-  vi.useFakeTimers();
-});
-
-afterEach(() => {
-  vi.useRealTimers();
-  useSimulatorStore.setState({ boards: [], wires: [] } as never);
-});
 
 const MADRID = { lat: 40.4168, lng: -3.7038, altitude: 667, speed: 0, course: 0 };
 const T0 = new Date(Date.UTC(2026, 6, 31, 12, 35, 19));
@@ -113,305 +123,433 @@ describe('NMEA building blocks', () => {
   });
 });
 
-// ─── Part registration + store wiring helpers ────────────────────────────────
+// ─── The fabric, faked at the contracts ──────────────────────────────────────
+
+/** Board pins: what a part drives through driveInput is all the emitter needs. */
+class FakePins implements BoardPins {
+  driven: Array<{ pin: number; level: boolean }> = [];
+  onPinChange(): () => void {
+    return () => {};
+  }
+  peekPinState(): boolean | undefined {
+    return undefined;
+  }
+  driveInput(pin: number, level: boolean): void {
+    this.driven.push({ pin, level });
+  }
+}
+
+/** The guest's clock, moved by the test; every scheduled edge is kept. */
+class FakeClock implements GuestClock {
+  cycles = 0;
+  readonly hz = 16_000_000;
+  edges: Array<{ pin: number; level: boolean; at: number }> = [];
+  now(): number {
+    return this.cycles;
+  }
+  clockHz(): number {
+    return this.hz;
+  }
+  scheduleEdge(pin: number, level: boolean, at: number): void {
+    this.edges.push({ pin, level, at });
+  }
+  at(): () => void {
+    return () => {};
+  }
+}
+
+/** A controller port whose guest is an RX queue; pins from the board's table. */
+class FakePort implements UartControllerPort {
+  readonly bus = 'uart' as const;
+  readonly unit: number;
+  readonly name: string;
+  rx: number[] = [];
+  cfg: UartConfig = { baud: GPS_BAUD, frame: '8N1' };
+  /** Fixed by the board's table, or live as an ESP32 port reads its GPIO matrix. */
+  route: UartRouting | 'static';
+  constructor(unit: number, name: string, route: UartRouting | 'static' = 'static') {
+    this.unit = unit;
+    this.name = name;
+    this.route = route;
+  }
+  setTxHandler(): void {}
+  receive(byte: number): void {
+    this.rx.push(byte);
+  }
+  config(): UartConfig {
+    return { ...this.cfg };
+  }
+  routing(): UartRouting | 'static' {
+    return this.route;
+  }
+  text(): string {
+    return String.fromCharCode(...this.rx);
+  }
+}
+
+class FakeCircuit implements NetResolver {
+  nets = new Map<string, ResolvedPin>();
+  kinds = new Map<string, string>();
+  resolve(ref: PinRef): ResolvedPin {
+    if (ref.kind === 'board') return { kind: 'board', boardId: ref.boardId, pin: ref.pin };
+    return this.nets.get(`${ref.componentId}:${ref.pinName}`) ?? { kind: 'floating' };
+  }
+  boardKind(id: string): string | undefined {
+    return this.kinds.get(id);
+  }
+  boards(): string[] {
+    return Array.from(this.kinds.keys());
+  }
+  wire(comp: string, pin: string, to: ResolvedPin | null): void {
+    if (to) this.nets.set(`${comp}:${pin}`, to);
+    else this.nets.delete(`${comp}:${pin}`);
+  }
+}
+
+/**
+ * Bytes off the edges an emitter scheduled on `pin`: each frame from its own
+ * start edge, bits sampled at their centres, 8N1 at `baud` on `hz`.
+ */
+function decodeEdges(
+  edges: Array<{ pin: number; level: boolean; at: number }>,
+  pin: number,
+  hz: number,
+  baud: number,
+): string {
+  const es = edges.filter((e) => e.pin === pin).sort((a, b) => a.at - b.at);
+  const bit = hz / baud;
+  const levelAt = (t: number): boolean => {
+    let l = true; // idle high
+    for (const e of es) {
+      if (e.at <= t) l = e.level;
+      else break;
+    }
+    return l;
+  };
+  let out = '';
+  let i = 0;
+  while (i < es.length) {
+    while (i < es.length && es[i].level) i++;
+    if (i >= es.length) break;
+    const t0 = es[i].at;
+    expect(levelAt(t0 + 0.5 * bit), 'start bit').toBe(false);
+    let byte = 0;
+    for (let b = 0; b < 8; b++) if (levelAt(t0 + (1.5 + b) * bit)) byte |= 1 << b;
+    expect(levelAt(t0 + 9.5 * bit), 'stop bit').toBe(true);
+    out += String.fromCharCode(byte);
+    const end = t0 + 9.5 * bit;
+    while (i < es.length && es[i].at <= end) i++;
+  }
+  return out;
+}
 
 const GPS_ID = 'gps_neo6m_test_1';
+const BOARD = 'board-1';
+const boardPin = (pin: number): ResolvedPin => ({ kind: 'board', boardId: BOARD, pin });
 
-function wireGpsTo(boardKind: string, boardPin: string): void {
-  useSimulatorStore.setState({
-    boards: [{ id: 'board-1', boardKind, x: 0, y: 0 }],
-    activeBoardId: 'board-1',
-    wires: [
-      {
-        id: 'w1',
-        start: { componentId: GPS_ID, pinName: 'TX', x: 0, y: 0 },
-        end: { componentId: 'board-1', pinName: boardPin, x: 0, y: 0 },
-        color: '#0f0',
-        signalType: 'digital',
-      },
-    ],
-  } as never);
+interface Rig {
+  circuit: FakeCircuit;
+  pins: FakePins;
+  clock: FakeClock;
+  ports: FakePort[];
+  port: FakePort;
+  diags: BusDiagnostic[];
+  el: Record<string, unknown>;
+  running: { value: boolean };
+  /** Wire the module's TX (and optionally its RX pad) and attach it as the canvas would. */
+  attach(tx: ResolvedPin | null, rx?: ResolvedPin): void;
+  /** Guest time passes, and the wall clock with it, tick by tick. */
+  run(ms: number): void;
+  /** Wall time passes while the guest stands still. */
+  idle(ms: number): void;
+  cleanup(): void;
 }
 
-function makeElement(props: Record<string, unknown> = {}): HTMLElement {
-  return {
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-    dispatchEvent: vi.fn(),
-    ...props,
-  } as unknown as HTMLElement;
-}
+let cleanups: Array<() => void> = [];
 
-function makeByteSim() {
-  const fed: Array<{ uart: number; data: string }> = [];
-  return {
-    isRunning: () => true,
-    setPinState: vi.fn(),
-    pinManager: { onPinChange: vi.fn().mockReturnValue(() => {}) },
-    feedUart: vi.fn((uart: number, data: string) => {
-      fed.push({ uart, data });
-      return true;
-    }),
-    fed,
+function rig(opts: { kind?: string; units?: Array<[number, string, (UartRouting | 'static')?]> } = {}): Rig {
+  const circuit = new FakeCircuit();
+  circuit.kinds.set(BOARD, opts.kind ?? 'arduino-uno');
+  const pins = new FakePins();
+  const clock = new FakeClock();
+  const ports = (opts.units ?? [[0, 'USART0']]).map(([u, n, route]) => new FakePort(u, n, route));
+  const binding: EngineBinding = { pins, spi: [], uart: ports, clock };
+  const diags: BusDiagnostic[] = [];
+  cleanups.push(busRegistry.onDiagnostic((d) => diags.push(d)));
+  busRegistry.setResolver(circuit);
+  busRegistry.bindEngine(BOARD, binding);
+  const running = { value: true };
+  const sim = {
+    isRunning: () => running.value,
+    getCurrentCycles: () => clock.cycles,
+    getClockHz: () => clock.hz,
   };
+  const el: Record<string, unknown> = {};
+  let off: (() => void) | null = null;
+  const r: Rig = {
+    circuit,
+    pins,
+    clock,
+    ports,
+    port: ports[0],
+    diags,
+    el,
+    running,
+    attach(tx, rx) {
+      circuit.wire(GPS_ID, 'TX', tx);
+      if (rx) circuit.wire(GPS_ID, 'RX', rx);
+      busRegistry.netlistChanged();
+      const logic = PartSimulationRegistry.get('gps-neo6m')!;
+      off = logic.attachEvents!(el as unknown as HTMLElement, sim as never, () => null, GPS_ID);
+      cleanups.push(() => off?.());
+    },
+    run(ms) {
+      for (let t = 0; t < ms; t += GPS_TICK_MS) {
+        const step = Math.min(GPS_TICK_MS, ms - t);
+        clock.cycles += (step / 1000) * clock.hz;
+        vi.advanceTimersByTime(step);
+      }
+    },
+    idle(ms) {
+      vi.advanceTimersByTime(ms);
+    },
+    cleanup() {
+      off?.();
+      off = null;
+    },
+  };
+  return r;
 }
 
-/** Drain the wall-clock chunked feed queue (8 bytes / 8 ms). */
-const drainFeed = () => vi.advanceTimersByTime(500);
+const lines = (text: string) => text.split('\r\n').filter((l) => l.length > 0);
+/** Guest milliseconds one NMEA cycle takes on the wire. */
+const cycleMs = (text: string) => text.length * GPS_BYTE_MS;
 
-describe('gps-neo6m — registration', () => {
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  while (cleanups.length) cleanups.pop()!();
+  busRegistry.clear();
+  vi.useRealTimers();
+});
+
+describe('gps-neo6m: registration', () => {
   it('is registered in PartSimulationRegistry', () => {
     expect(PartSimulationRegistry.get('gps-neo6m')).toBeDefined();
   });
 });
 
-describe('gps-neo6m — byte-level UART injection', () => {
-  it('feeds uart 0 when TX is wired to Uno pin 0 (RX)', () => {
-    wireGpsTo('arduino-uno', '0');
-    const sim = makeByteSim();
-    const logic = PartSimulationRegistry.get('gps-neo6m')!;
-    const cleanup = logic.attachEvents!(
-      makeElement(),
-      sim as never,
-      (name) => (name === 'TX' ? 0 : null),
-      GPS_ID,
-    );
-
-    vi.advanceTimersByTime(1000);
-    drainFeed();
-    cleanup();
-
-    expect(sim.feedUart).toHaveBeenCalled();
-    expect(sim.fed.every((c) => c.uart === 0)).toBe(true);
-    const text = sim.fed.map((c) => c.data).join('');
-    const lines = text.split('\r\n').filter((l) => l.length > 0);
-    expect(lines[0]).toMatch(/^\$GPGGA,/);
-    expect(lines[1]).toMatch(/^\$GPRMC,/);
-    for (const line of lines) expectValidSentence(line);
+describe('gps-neo6m on the fabric: a hardware RX pin', () => {
+  it("TX on the Uno's D0 (RX): one guest second after attach a valid NMEA cycle reaches USART0, one character time apart", () => {
+    const r = rig();
+    r.attach(boardPin(0));
+    expect(busRegistry.uartPlacement(GPS_ID)).toEqual({
+      rx: null,
+      tx: { boardId: BOARD, pin: 0, controller: 'USART0' },
+    });
+    // Nothing before the first second is up.
+    r.run(1000);
+    expect(r.port.rx).toEqual([]);
+    // The cycle opens on the next poll: one character, then one per
+    // GPS_BYTE_MS of guest time, so a 20 ms poll carries 19 or 20 more.
+    r.run(GPS_TICK_MS);
+    expect(r.port.rx.length).toBe(1);
+    expect(r.port.text()).toBe('$');
+    r.run(GPS_TICK_MS);
+    expect(r.port.rx.length).toBeGreaterThanOrEqual(19);
+    expect(r.port.rx.length).toBeLessThanOrEqual(21);
+    r.run(400);
+    const text = r.port.text();
+    const ls = lines(text);
+    expect(ls).toHaveLength(2);
+    expect(ls[0]).toMatch(/^\$GPGGA,/);
+    expect(ls[1]).toMatch(/^\$GPRMC,/);
+    for (const l of ls) expectValidSentence(l);
     expect(text).toContain('4025.00800,N');
     expect(text).toContain('00342.22800,W');
+    expect(text).toContain(',667.0,M,');
+    // The whole cycle took its length in character times, not one instant.
+    expect(text.length * GPS_BYTE_MS).toBeGreaterThan(100);
   });
 
-  it('feeds uart 2 when TX is wired to ESP32 GPIO16 (RX2)', () => {
-    wireGpsTo('esp32', '16');
-    const sim = makeByteSim();
-    const logic = PartSimulationRegistry.get('gps-neo6m')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as never, () => null, GPS_ID);
-
-    vi.advanceTimersByTime(1000);
-    drainFeed();
-    cleanup();
-
-    expect(sim.feedUart).toHaveBeenCalled();
-    expect(sim.fed.every((c) => c.uart === 2)).toBe(true);
-    expect(sim.fed.map((c) => c.data).join('')).toContain('$GPGGA');
+  it('the wall clock alone moves nothing: no byte while the guest stands still', () => {
+    const r = rig();
+    r.attach(boardPin(0));
+    r.idle(10_000);
+    expect(r.port.rx).toEqual([]);
+    r.run(1100);
+    expect(r.port.text()).toMatch(/^\$GPGGA,/);
   });
 
-  it('advances UTC time by one second per cycle', () => {
-    wireGpsTo('arduino-uno', '0');
-    const sim = makeByteSim();
-    const logic = PartSimulationRegistry.get('gps-neo6m')!;
-    const cleanup = logic.attachEvents!(
-      makeElement(),
-      sim as never,
-      (name) => (name === 'TX' ? 0 : null),
-      GPS_ID,
-    );
+  it("ESP32 devkit: TX on the GPIO Serial2.begin routed U2RXD to (GPIO4) is UART2's RX, and the console (UART0) hears nothing", () => {
+    // The ESP32 ports report their pads live from the GPIO matrix, as the
+    // engine's ports do; here UART0 sits on its IO_MUX pads and Serial2 has
+    // been opened where the current arduino-esp32 core puts it on the classic
+    // chip, RX2 = GPIO4 and TX2 = GPIO25 (measured on the real engine in the
+    // pro gps-uart-esp32js test).
+    const r = rig({
+      kind: 'esp32',
+      units: [[0, 'UART0', { tx: 1, rx: 3 }], [1, 'UART1', {}], [2, 'UART2', { tx: 25, rx: 4 }]],
+    });
+    r.attach(boardPin(4));
+    expect(busRegistry.uartPlacement(GPS_ID)?.tx).toEqual({ boardId: BOARD, pin: 4, controller: 'UART2' });
+    r.run(1300);
+    expect(r.ports[2].text()).toMatch(/^\$GPGGA,/);
+    expect(r.ports[0].rx).toEqual([]);
+    expect(r.ports[1].rx).toEqual([]);
+  });
 
-    vi.advanceTimersByTime(1000);
-    drainFeed();
-    vi.advanceTimersByTime(1000);
-    drainFeed();
-    cleanup();
+  it('the descriptor carries 9600 baud: a USART the sketch runs at 115200 gets garbage and uart-baud-mismatch', () => {
+    const r = rig();
+    r.port.cfg = { baud: 115200, frame: '8N1' };
+    r.attach(boardPin(0));
+    r.run(1300);
+    expect(r.diags.map((d) => d.code)).toContain('uart-baud-mismatch');
+    expect(r.port.rx.length).toBeGreaterThan(0);
+    expect(r.port.text()).not.toContain('$GPGGA');
+  });
 
-    const text = sim.fed.map((c) => c.data).join('');
-    const times = [...text.matchAll(/\$GPGGA,(\d{6})\.00,/g)].map((m) => m[1]);
+  it('a receiver never listens: the descriptor has no RX leg, whatever the RX pad is wired to', () => {
+    const r = rig();
+    r.attach(boardPin(0), boardPin(1));
+    expect(busRegistry.uartPlacement(GPS_ID)).toEqual({
+      rx: null,
+      tx: { boardId: BOARD, pin: 0, controller: 'USART0' },
+    });
+    expect(r.diags).toEqual([]);
+  });
+});
+
+describe('gps-neo6m on the fabric: a plain GPIO (SoftwareSerial)', () => {
+  it("TX on the Uno's D4: the cycle leaves as 8N1 edges at 9600 baud on the guest clock, and USART0 hears none of it", () => {
+    const r = rig();
+    r.attach(boardPin(4));
+    expect(busRegistry.uartPlacement(GPS_ID)?.tx).toEqual({ boardId: BOARD, pin: 4, controller: null });
+    // The wire rests high before anything is sent: a receiver waits for a falling edge.
+    expect(r.pins.driven).toContainEqual({ pin: 4, level: true });
+    r.run(1400);
+    const text = decodeEdges(r.clock.edges, 4, r.clock.hz, GPS_BAUD);
+    const ls = lines(text);
+    expect(ls).toHaveLength(2);
+    expect(ls[0]).toMatch(/^\$GPGGA,/);
+    expect(ls[1]).toMatch(/^\$GPRMC,/);
+    for (const l of ls) expectValidSentence(l);
+    expect(text).toContain('4025.00800,N');
+    expect(r.port.rx).toEqual([]);
+    // Every edge is on the module's wire and in guest time, after the first second.
+    expect(r.clock.edges.every((e) => e.pin === 4)).toBe(true);
+    expect(Math.min(...r.clock.edges.map((e) => e.at))).toBeGreaterThanOrEqual(r.clock.hz);
+    expect(r.diags).toEqual([]);
+  });
+});
+
+describe('gps-neo6m on the fabric: the wrong pin, and no pin', () => {
+  it("TX on the Uno's D1 (its TX): two drivers on one wire, reported as uart-tx-contention, and USART0's RX hears nothing", () => {
+    const r = rig();
+    r.attach(boardPin(1));
+    expect(busRegistry.uartPlacement(GPS_ID)?.tx).toEqual({ boardId: BOARD, pin: 1, controller: null });
+    const contention = r.diags.filter((d) => d.code === 'uart-tx-contention');
+    expect(contention).toHaveLength(1);
+    expect(contention[0].owners).toEqual([GPS_ID]);
+    expect(contention[0].message).toContain('USART0');
+    r.run(2500);
+    expect(r.port.rx).toEqual([]);
+  });
+
+  it('TX wired to nothing: on no wire, no diagnostic, and not a byte on UART0 (the old fallback)', () => {
+    const r = rig();
+    r.attach(null);
+    expect(busRegistry.uartPlacement(GPS_ID)).toEqual({ rx: null, tx: null });
+    r.run(2500);
+    expect(r.port.rx).toEqual([]);
+    expect(r.clock.edges).toEqual([]);
+    expect(r.diags).toEqual([]);
+    // The receiver still runs: its PPS marks the cycle nobody is wired to hear.
+    expect(r.el.pps).toBeDefined();
+  });
+});
+
+describe('gps-neo6m: time, position, PPS, power', () => {
+  it('the UTC field advances one second per cycle, and cycles come one guest second apart', () => {
+    const r = rig();
+    r.attach(boardPin(0));
+    r.run(1040);
+    expect(r.port.rx.length).toBeGreaterThan(0);
+    r.run(400);
+    // The first cycle is complete and nothing else has come: the wire is idle
+    // until the next second is up.
+    const first = r.port.text();
+    expect(lines(first)).toHaveLength(2);
+    expect(cycleMs(first)).toBeLessThan(400);
+    r.run(600);
+    expect(r.port.rx.length).toBeGreaterThan(first.length);
+    r.run(400);
+    const times = [...r.port.text().matchAll(/\$GPGGA,(\d{6})\.00,/g)].map((m) => m[1]);
     expect(times).toHaveLength(2);
     const toSec = (t: string) =>
       parseInt(t.slice(0, 2), 10) * 3600 + parseInt(t.slice(2, 4), 10) * 60 + parseInt(t.slice(4), 10);
     expect((toSec(times[1]) - toSec(times[0]) + 86400) % 86400).toBe(1);
+    expect(lines(r.port.text())).toHaveLength(4);
   });
 
   it('SensorControlPanel updates change the emitted position live', () => {
-    wireGpsTo('arduino-uno', '0');
-    const sim = makeByteSim();
-    const logic = PartSimulationRegistry.get('gps-neo6m')!;
-    const cleanup = logic.attachEvents!(
-      makeElement(),
-      sim as never,
-      (name) => (name === 'TX' ? 0 : null),
-      GPS_ID,
-    );
-
-    vi.advanceTimersByTime(1000);
-    drainFeed();
-    sim.fed.length = 0;
-
+    const r = rig();
+    r.attach(boardPin(0));
+    r.run(1300);
+    expect(r.port.text()).toContain('4025.00800,N');
+    r.port.rx.length = 0;
     dispatchSensorUpdate(GPS_ID, { lat: -33.4489, lng: -70.6693 }); // Santiago
-    vi.advanceTimersByTime(1000);
-    drainFeed();
-    cleanup();
-
-    const text = sim.fed.map((c) => c.data).join('');
-    expect(text).toContain(',S,');
-    expect(text).toContain('3326.93400,S');
+    r.run(1300);
+    expect(r.port.text()).toContain('3326.93400,S');
+    expect(r.port.text()).toContain('07040.15800,W');
+    expect(r.el.lat).toBe(-33.4489);
   });
 
-  it('pulses the PPS LED once per emission', () => {
-    wireGpsTo('arduino-uno', '0');
-    const sim = makeByteSim();
-    const el = makeElement() as unknown as { pps?: boolean };
-    const logic = PartSimulationRegistry.get('gps-neo6m')!;
-    const cleanup = logic.attachEvents!(
-      el as unknown as HTMLElement,
-      sim as never,
-      (name) => (name === 'TX' ? 0 : null),
-      GPS_ID,
-    );
-
-    vi.advanceTimersByTime(1000);
-    expect(el.pps).toBe(true);
-    vi.advanceTimersByTime(200);
-    expect(el.pps).toBe(false);
-    cleanup();
-  });
-});
-
-// ─── Bit-banged waveform (SoftwareSerial path) ───────────────────────────────
-
-interface Transition {
-  pin: number;
-  state: boolean;
-  cycle: number;
-}
-
-function makeBitbangSim() {
-  const scheduled: Transition[] = [];
-  return {
-    isRunning: () => true,
-    setPinState: vi.fn(),
-    pinManager: { onPinChange: vi.fn().mockReturnValue(() => {}) },
-    getCurrentCycles: () => 0,
-    getClockHz: () => 16_000_000,
-    schedulePinChange: vi.fn((pin: number, state: boolean, cycle: number) => {
-      scheduled.push({ pin, state, cycle });
-    }),
-    scheduled,
-  };
-}
-
-/**
- * Decode a contiguous 8N1 bitstream from scheduled transitions. Bytes are
- * back-to-back: byte k's start bit begins at `t0 + k * 10 * cyclesPerBit`
- * where t0 is the first LOW transition. Bits are sampled at bit centres.
- */
-function decodeUart(transitions: Transition[], cyclesPerBit: number, count: number): string {
-  const sorted = [...transitions].sort((a, b) => a.cycle - b.cycle);
-  const lineState = (cycle: number): boolean => {
-    let state = true; // idle HIGH
-    for (const t of sorted) {
-      if (t.cycle <= cycle) state = t.state;
-      else break;
-    }
-    return state;
-  };
-  const t0 = sorted.find((t) => !t.state)!.cycle;
-  let out = '';
-  for (let k = 0; k < count; k++) {
-    const byteStart = t0 + k * 10 * cyclesPerBit;
-    expect(lineState(byteStart + 0.5 * cyclesPerBit)).toBe(false); // start bit
-    let byte = 0;
-    for (let b = 0; b < 8; b++) {
-      if (lineState(byteStart + (1.5 + b) * cyclesPerBit)) byte |= 1 << b;
-    }
-    expect(lineState(byteStart + 9.5 * cyclesPerBit)).toBe(true); // stop bit
-    out += String.fromCharCode(byte);
-  }
-  return out;
-}
-
-describe('gps-neo6m — bit-banged SoftwareSerial path', () => {
-  it('scheduleUartBitstream produces a decodable 9600-baud 8N1 frame', () => {
-    const sim = makeBitbangSim();
-    const tail = { cycle: 0, lastNow: 0 };
-    scheduleUartBitstream(sim, 4, '$GP', tail);
-
-    const cyclesPerBit = 16_000_000 / GPS_BAUD;
-    expect(decodeUart(sim.scheduled, cyclesPerBit, 3)).toBe('$GP');
-    expect(sim.scheduled.every((t) => t.pin === 4)).toBe(true);
-    // Tail advanced by 3 bytes × 10 bits.
-    expect(tail.cycle).toBeGreaterThanOrEqual(30 * cyclesPerBit);
+  it('the PPS marker lights when a cycle opens and goes out 120 ms of guest time later', () => {
+    const r = rig();
+    r.attach(boardPin(0));
+    r.run(1000);
+    expect(r.el.pps).toBeUndefined();
+    r.run(GPS_TICK_MS);
+    expect(r.el.pps).toBe(true);
+    r.run(GPS_PPS_MS - GPS_TICK_MS);
+    expect(r.el.pps).toBe(true);
+    r.run(GPS_TICK_MS);
+    expect(r.el.pps).toBe(false);
   });
 
-  it('skips emission instead of growing an unbounded backlog', () => {
-    const sim = makeBitbangSim();
-    const tail = { cycle: 100 * 16_000_000, lastNow: 0 };
-    scheduleUartBitstream(sim, 4, 'X', tail);
-    // now(0) < lastNow(0) is false and tail is > now + 2 s → skip.
-    expect(sim.schedulePinChange).not.toHaveBeenCalled();
+  it('a stopped board is an unpowered module: nothing leaves, and the first fix after Run comes a second later', () => {
+    const r = rig();
+    r.running.value = false;
+    r.attach(boardPin(0));
+    r.run(3000);
+    expect(r.port.rx).toEqual([]);
+    expect(r.el.pps).toBeUndefined();
+    r.running.value = true;
+    r.run(1000);
+    expect(r.port.rx).toEqual([]);
+    r.run(60);
+    expect(r.port.text()).toMatch(/^\$GPGGA,/);
+    // Stop mid-cycle: the rest of the sentence never arrives after the next Run.
+    const got = r.port.rx.length;
+    r.running.value = false;
+    r.run(500);
+    r.running.value = true;
+    r.run(500);
+    expect(r.port.rx.length).toBe(got);
   });
 
-  it('resets the tail after a CPU reset (cycle counter went backwards)', () => {
-    const sim = makeBitbangSim();
-    const tail = { cycle: 100 * 16_000_000, lastNow: 99 * 16_000_000 };
-    scheduleUartBitstream(sim, 4, 'A', tail); // now = 0 < lastNow → reset tail
-    expect(sim.schedulePinChange).toHaveBeenCalled();
-    const first = sim.scheduled[0];
-    expect(first.cycle).toBeLessThan(16_000_000); // scheduled near now, not at 100 s
-  });
-
-  it('falls back to bit-bang when feedUart rejects the UART (Mega RX1)', () => {
-    // Mega pin 19 = RX1 (USART1) — avr8js only models USART0, so the AVR
-    // sim's feedUart returns false. The part must degrade to the bit-banged
-    // waveform so SoftwareSerial on pin 19 still receives the stream.
-    wireGpsTo('arduino-mega', '19');
-    const sim = {
-      ...makeBitbangSim(),
-      feedUart: vi.fn(() => false),
-    };
-    const logic = PartSimulationRegistry.get('gps-neo6m')!;
-    const cleanup = logic.attachEvents!(
-      makeElement(),
-      sim as never,
-      (name) => (name === 'TX' ? 19 : null),
-      GPS_ID,
-    );
-
-    // Cycle 1: byte path tried once, rejected, queue dropped.
-    vi.advanceTimersByTime(1000);
-    drainFeed();
-    expect(sim.feedUart).toHaveBeenCalledWith(1, expect.any(String));
-    expect(sim.schedulePinChange).not.toHaveBeenCalled();
-
-    // Cycle 2 onward: bit-banged on pin 19.
-    vi.advanceTimersByTime(1000);
-    cleanup();
-    expect(sim.schedulePinChange).toHaveBeenCalled();
-    expect(sim.scheduled.every((t) => t.pin === 19)).toBe(true);
-    const cyclesPerBit = 16_000_000 / GPS_BAUD;
-    expect(decodeUart(sim.scheduled, cyclesPerBit, 6)).toBe('$GPGGA');
-  });
-
-  it('TX wired to a plain digital pin bit-bangs the NMEA cycle', () => {
-    wireGpsTo('arduino-uno', '4');
-    const sim = makeBitbangSim();
-    const logic = PartSimulationRegistry.get('gps-neo6m')!;
-    const cleanup = logic.attachEvents!(
-      makeElement(),
-      sim as never,
-      (name) => (name === 'TX' ? 4 : null),
-      GPS_ID,
-    );
-
-    // Line seeded at idle HIGH for SoftwareSerial.
-    expect(sim.setPinState).toHaveBeenCalledWith(4, true);
-
-    vi.advanceTimersByTime(1000);
-    cleanup();
-
-    expect(sim.schedulePinChange).toHaveBeenCalled();
-    const cyclesPerBit = 16_000_000 / GPS_BAUD;
-    const head = decodeUart(sim.scheduled, cyclesPerBit, 6);
-    expect(head).toBe('$GPGGA');
+  it('cleanup takes the module off the wire', () => {
+    const r = rig();
+    r.attach(boardPin(0));
+    r.run(1300);
+    const got = r.port.rx.length;
+    expect(got).toBeGreaterThan(0);
+    r.cleanup();
+    expect(busRegistry.uartPlacement(GPS_ID)).toBeNull();
+    r.run(3000);
+    expect(r.port.rx.length).toBe(got);
   });
 });

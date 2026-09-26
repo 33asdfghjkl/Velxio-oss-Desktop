@@ -488,18 +488,20 @@ export function classifyPin(boardKind: string, pinName: string): PinRole {
 }
 
 /**
- * Returns true if both endpoints of a wire are UART pins on the same
- * UART number (one TX, one RX). Used to enable byte-level shortcut.
+ * The two ends of a wire that joins a hardware UART TX pin to a hardware
+ * UART RX pin, by the boards' static pin tables: each side's UART unit and
+ * which side transmits. Null for any other wire. The Interconnect's byte
+ * fan-out is built from it for the boards the bus fabric does not serve.
  */
 export function isUartWire(
   boardA: string,
   pinA: string,
   boardB: string,
   pinB: string,
-): { uartA: number; uartB: number } | null {
+): { uartA: number; uartB: number; txSide: 'a' | 'b' } | null {
   const ra = classifyPin(boardA, pinA);
   const rb = classifyPin(boardB, pinB);
-  if (ra.kind === 'uart-tx' && rb.kind === 'uart-rx') return { uartA: ra.uart, uartB: rb.uart };
-  if (ra.kind === 'uart-rx' && rb.kind === 'uart-tx') return { uartA: ra.uart, uartB: rb.uart };
+  if (ra.kind === 'uart-tx' && rb.kind === 'uart-rx') return { uartA: ra.uart, uartB: rb.uart, txSide: 'a' };
+  if (ra.kind === 'uart-rx' && rb.kind === 'uart-tx') return { uartA: ra.uart, uartB: rb.uart, txSide: 'b' };
   return null;
 }

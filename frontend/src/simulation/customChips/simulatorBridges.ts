@@ -3,12 +3,13 @@
  *
  * Each simulator family exposes its peripherals differently:
  *   - AVR (avr8js)   — `simulator.usart` / `simulator.i2cBus`
- *   - RP2040 (rp2040js) — `simulator.serialWriteByte` / `simulator.getBusBinding`
  *   - ESP32 (bridge shim) — `simulator.sendPinEvent`. The shim wraps either
  *     the backend QEMU bridge, which hosts custom chips in its worker
  *     (CustomChipPart hands the WASM over and no browser instance exists),
  *     or an overlay's in-browser engine, which answers `hostsCustomChips()`
  *     false so the chip runs here, GPIO through the shim's PinManager.
+ *   - RP2040 family (rp2040js, rp2350js, the XIAO ARM engines, the Pi shim):
+ *     `simulator.getBusBinding` and nothing of the two above.
  *
  * What is left here is the family fingerprint and the worker question. No
  * bus dispatcher lives here any more: a chip joins a bus from vx_spi_attach,
@@ -23,21 +24,20 @@ export type SimulatorKind = 'avr' | 'rp2040' | 'esp32' | 'unknown';
  * I2C and UART bytes all come from the bus fabric.
  *
  * They used to read `spi` and `setSPIHandler` (the F2 transition bridge,
- * gone with F3), then `addI2CDevice` (the I2C one, gone with F5), and the
- * UART bridge went with F6. The RP family answers to `serialWriteByte` (the
- * monitor's byte seam, which the AVR lacks and the ESP32 shim lacks too)
- * plus `getBusBinding`, the fabric's way in.
+ * gone with F3), then `addI2CDevice` (the I2C one, gone with F5), then
+ * `serialWriteByte` (the monitor's byte seam, which the UART bridge of F6
+ * needed and nothing needs since; the method is gone). What is left is the
+ * fabric's way in, `getBusBinding`, which every engine of the product
+ * exposes: the shims are told apart first by `sendPinEvent`, the AVR by its
+ * peripherals, and everything else that exposes its buses is the RP family
+ * (rp2040js, rp2350js, the XIAO ARM engines, the Pi shim), which for a chip
+ * host means "runs in the browser, hosts nothing in a worker".
  */
 export function detectSimulatorKind(simulator: any): SimulatorKind {
   if (!simulator) return 'unknown';
   if (simulator.usart && simulator.i2cBus) return 'avr';
-  if (
-    typeof simulator.serialWriteByte === 'function' &&
-    typeof simulator.getBusBinding === 'function'
-  ) {
-    return 'rp2040';
-  }
   if (typeof simulator.sendPinEvent === 'function') return 'esp32';
+  if (typeof simulator.getBusBinding === 'function') return 'rp2040';
   return 'unknown';
 }
 
@@ -62,10 +62,12 @@ export function hostsChipsInWorker(simulator: any): boolean {
 // ── UART ────────────────────────────────────────────────────────────────────
 //
 // There is no UART bridge any more either. A chip is on a board's UART wires
-// from vx_uart_attach, by the pads of its own config (CustomChipPart puts it
-// on the bus fabric of simulation/buses), and the fabric decides from the
-// nets which controller of which board each pad reaches, or follows a plain
-// GPIO on the guest's clock. What stood here installed ONE dispatcher per
+// from vx_uart_attach, by the pads of its own config (ChipRuntime puts it on
+// the bus fabric of simulation/buses in that very call, on every engine
+// kind), and the fabric decides from the nets which controller of which board
+// each pad reaches, or follows a plain GPIO on the guest's clock. A chip a
+// QEMU worker hosts is placed the same way by its part, from the pads read
+// off an inert copy (chipUartPads.ts). What stood here installed ONE dispatcher per
 // SIMULATOR on its USART0 (rebuilt by every reset and reload, so the chip
 // went deaf: findings avr-uart-dispatcher-lost-after-recompile-or-stop and
 // avr-uart-dispatcher-lost-on-reload), made a chip on RP2040-family hosts

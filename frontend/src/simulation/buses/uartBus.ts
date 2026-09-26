@@ -14,6 +14,14 @@
  * tolerates, the listener gets what silicon would read at its own rate from
  * the sender's frame (see resampleUartFrame), and the mismatch is reported
  * once. A listener that declares no rate takes bytes as they are.
+ *
+ * Between boards: a wire from one board's pin to another's is one net on the
+ * bench and one UartNet per board here, and the registry links those nets as
+ * PEERS (a clique: every net of the wire names every other). A byte a driver
+ * puts on any of them reaches the listeners and the controller RX of all of
+ * them, and the wiring checks count every board's drivers, so a Pico's UART1
+ * TX wired to an Uno's RX0 is a controller on each end of one wire, and a TX
+ * wired to a TX between boards is the same contention it is on one board.
  */
 
 import type { DiagnosticSink } from './spiBus';
@@ -89,6 +97,13 @@ export class UartNet {
    * directly, or when the board cannot time edges.
    */
   emit: ((byte: number, baud: number, spec: UartFrameSpec) => void) | null = null;
+  /**
+   * The nets of OTHER boards on this wire (see the header). Maintained by the
+   * registry, which relinks every board-to-board wire whenever the circuit,
+   * a controller's routing or a board's engine changes; a net with peers and
+   * no member of its own is kept alive by them.
+   */
+  readonly peers = new Set<UartNet>();
 
   readonly boardId: string;
   readonly pin: number;
@@ -102,6 +117,11 @@ export class UartNet {
 
   get size(): number {
     return this.listeners.size + this.drivers.size;
+  }
+
+  /** Nothing of this board's and no peer board on the wire: the net can go. */
+  get idle(): boolean {
+    return this.size === 0 && this.peers.size === 0;
   }
 
   add(m: UartMember): void {
@@ -127,11 +147,13 @@ export class UartNet {
     for (const m of this.sortedListeners()) this.deliver(m, byte, baud, spec, ctl.name);
     // A board's TX wired to one of its own RX pins: a loopback, as on the bench.
     if (this.controllerRx) this.toController(this.controllerRx, byte, baud, spec, ctl.name);
+    for (const p of this.peers) p.fromPeer(byte, baud, spec, ctl.name);
   }
 
   /** A byte an endpoint whose TX leg is here transmits. */
   fromEndpoint(m: UartMember, byte: number): void {
     for (const l of this.sortedListeners()) this.deliver(l, byte, m.baud, m.spec, m.owner);
+    for (const p of this.peers) p.fromPeer(byte, m.baud, m.spec, m.owner);
     if (this.controllerRx) {
       this.toController(this.controllerRx, byte, m.baud, m.spec, m.owner);
       return;
@@ -140,6 +162,30 @@ export class UartNet {
     // The wire is a GPIO the guest samples itself: the byte goes out as edges.
     if (m.baud === undefined) return; // reported at placement (uart-no-baud)
     this.emit(byte & 0xff, m.baud, m.spec);
+  }
+
+  /**
+   * A byte a driver on a PEER board's net put on the wire: this board's end
+   * of it. Its listeners, its controller's RX, or (a plain GPIO the guest
+   * samples) its emitter, at the sender's rate. Never forwarded further: the
+   * peers are a clique, so the sender's net already reached every board.
+   */
+  private fromPeer(
+    byte: number,
+    baud: number | undefined,
+    spec: UartFrameSpec | undefined,
+    srcName: string,
+  ): void {
+    for (const l of this.sortedListeners()) this.deliver(l, byte, baud, spec, srcName);
+    if (this.controllerRx) {
+      this.toController(this.controllerRx, byte, baud, spec, srcName);
+      return;
+    }
+    // A sender with no known rate cannot be clocked onto a GPIO (a remote
+    // port that does not report its termios): the byte stays on the sender's
+    // board, as it does for an endpoint with no rate (uart-no-baud).
+    if (!this.emit || baud === undefined) return;
+    this.emit(byte & 0xff, baud, spec ?? DEFAULT_UART_FRAME);
   }
 
   /**
@@ -224,36 +270,76 @@ export class UartNet {
   }
 
   /**
+   * Whether this net is the one that speaks for the whole wire. A wire
+   * between boards is checked from every one of its nets; only the first by
+   * board id (then pin) reports, so a wiring mistake is said once, not once
+   * per board.
+   */
+  private speaksForWire(): boolean {
+    for (const p of this.peers) {
+      if (p.boardId < this.boardId || (p.boardId === this.boardId && p.pin < this.pin)) return false;
+    }
+    return true;
+  }
+
+  /** `<controller> of <board> (pin n)`, for a wire that spans boards. */
+  private endName(net: UartNet, name: string): string {
+    return this.peers.size ? `${name} of ${net.boardId} (pin ${net.pin})` : name;
+  }
+
+  /** Something on the wire transmits: a driver or a controller's TX, here or on a peer board. */
+  private wireHasDriver(): boolean {
+    if (this.controllerTx || this.drivers.size > 0) return true;
+    for (const p of this.peers) if (p.controllerTx || p.drivers.size > 0) return true;
+    return false;
+  }
+
+  /**
    * Two drivers on one wire. Checked when membership or routing changes,
-   * never per byte: the wiring is wrong before anything is sent.
+   * never per byte: the wiring is wrong before anything is sent. A wire
+   * between boards counts every board's drivers: a TX wired to a TX is the
+   * classic mistake of the two-board bench.
    */
   checkDrivers(): void {
-    const owners = Array.from(this.drivers.keys()).sort();
-    const names = [...owners];
-    if (this.controllerTx) names.push(this.controllerTx.name);
+    if (!this.speaksForWire()) return;
+    const owners = Array.from(this.drivers.keys());
+    const controllers: string[] = [];
+    if (this.controllerTx) controllers.push(this.endName(this, this.controllerTx.name));
+    for (const p of this.peers) {
+      owners.push(...p.drivers.keys());
+      if (p.controllerTx) controllers.push(this.endName(p, p.controllerTx.name));
+    }
+    owners.sort();
+    const names = [...owners, ...controllers];
     if (names.length < 2) return;
-    const crossed = this.controllerTx !== null;
+    const where = this.peers.size ? 'one wire' : `pin ${this.pin}`;
+    let advice: string;
+    if (controllers.length >= 2) {
+      advice = `and neither board hears the other. Wire each board's TX to the other board's RX pin.`;
+    } else if (controllers.length === 1) {
+      advice = `and the board cannot hear the module. Wire the module's TX to the board's RX pin.`;
+    } else {
+      advice = `and the board reads a mix of both. Give each module its own RX pin.`;
+    }
     this.report({
       code: 'uart-tx-contention',
       bus: 'uart',
       boardId: this.boardId,
       owners,
-      message:
-        `${names.join(' and ')} all transmit on pin ${this.pin}: two TX on one wire fight each other ` +
-        (crossed
-          ? `and the board cannot hear the module. Wire the module's TX to the board's RX pin.`
-          : `and the board reads a mix of both. Give each module its own RX pin.`),
+      message: `${names.join(' and ')} all transmit on ${where}: two TX on one wire fight each other ${advice}`,
     });
   }
 
   /**
-   * An endpoint listening on the pin the controller listens on: nobody
-   * drives that wire, so the module hears nothing. RX to RX is the crossed
-   * half of the classic UART wiring mistake (TX to TX is the contention).
+   * A listener on a wire nothing drives: an endpoint whose RX is on the pin
+   * the controller listens on, or, between boards, two controllers' RX on
+   * one wire. Nobody transmits, so nobody hears anything. RX to RX is the
+   * crossed half of the classic UART wiring mistake (TX to TX is the
+   * contention).
    */
   checkListeners(): void {
     const ctl = this.controllerRx;
-    if (!ctl || this.controllerTx) return;
+    if (!ctl || this.wireHasDriver()) return;
     for (const m of this.sortedListeners()) {
       this.report({
         code: 'uart-wiring',
@@ -264,6 +350,20 @@ export class UartNet {
           `${m.owner}: its RX is on pin ${this.pin}, which ${ctl.name} uses as its own RX, so nothing ` +
           `on that wire ever transmits and the module hears nothing. Wire the module's RX to the ` +
           `board's TX pin.`,
+      });
+    }
+    if (!this.speaksForWire()) return;
+    for (const p of this.peers) {
+      if (!p.controllerRx) continue;
+      this.report({
+        code: 'uart-wiring',
+        bus: 'uart',
+        boardId: this.boardId,
+        owners: [],
+        message:
+          `${this.endName(this, ctl.name)} and ${this.endName(p, p.controllerRx.name)} are both RX ends ` +
+          `of one wire: nothing on it transmits, so neither board hears anything. Wire one board's TX ` +
+          `to the other board's RX pin.`,
       });
     }
   }

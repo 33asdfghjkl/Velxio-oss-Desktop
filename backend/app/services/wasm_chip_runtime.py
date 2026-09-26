@@ -72,10 +72,6 @@ def _probe_fast_call():
 _FAST_CALL = _probe_fast_call()
 
 
-# The UART a chip talks on. UART0 is the serial monitor on every ESP32
-# family, so a chip there collides with the console in both directions.
-CHIP_UART = 1
-
 
 
 # I2C config struct layout (must match velxio-chip.h's vx_i2c_config — 64 bytes)
@@ -341,11 +337,10 @@ class WasmChipRuntime:
         pin_map: dict[str, int] | None = None,
         pin_writer: Optional[Callable[[int, int], None]] = None,
         pin_reader: Optional[Callable[[int], int]] = None,
-        uart_writer: Optional[Callable[[int, bytes], None]] = None,
+        uart_writer: Optional[Callable[[bytes], None]] = None,
         timer_scheduler: Optional[Callable[["WasmChipRuntime"], None]] = None,
         net_map: dict[str, str] | None = None,
         net_bus: Optional[ChipNetBus] = None,
-        uart_map: dict[int, int] | None = None,
         display: dict | None = None,
         component_id: str | None = None,
         blobs: dict[str, bytes] | None = None,
@@ -360,9 +355,11 @@ class WasmChipRuntime:
                         Called by vx_pin_write when the chip's pin is mapped.
             pin_reader: (gpio) → 0/1 — reads current GPIO state from QEMU. If absent,
                         vx_pin_read returns the runtime's last-known cached value.
-            uart_writer: (uart_id, bytes) → void — injects bytes into the firmware's
-                         UART RX. Called by vx_uart_write with the UART this chip
-                         resolved to (see uart_map), CHIP_UART when none does.
+            uart_writer: (bytes) -> void: what the chip transmits (vx_uart_write).
+                         Which guest UART the bytes land in is not the chip's
+                         to say: the worker's bus table answers per write from
+                         the tab's wiring map (uart_bus_table.py), and a chip
+                         the map puts on no controller writes into the air.
             timer_scheduler: callback invoked when the chip arms a timer; the worker
                              starts the actual scheduling thread.
             net_map:    {chip_pin_name: net_id} - chip pins that share a diagram net
@@ -371,9 +368,6 @@ class WasmChipRuntime:
                         by older frontends, which is why it defaults to empty.
             net_bus:    the shared ChipNetBus every chip in this worker registers
                         its net pins on.
-            uart_map:   {gpio: uart_id} for the UART pins this chip is wired to,
-                        from the board's UART pin table in the frontend. Decides
-                        which UART vx_uart_attach binds to; empty keeps CHIP_UART.
             display:    chip.json's `display: {width, height}` - the framebuffer
                         vx_framebuffer_init hands the chip. Same default as the
                         browser runtime (128x64) when the chip declares none.
@@ -420,7 +414,6 @@ class WasmChipRuntime:
         self._timer_scheduler = timer_scheduler
         self._net_map = {str(k): str(v) for k, v in (net_map or {}).items()}
         self._net_bus = net_bus
-        self._uart_map = {int(k): int(v) for k, v in (uart_map or {}).items()}
 
         # Per-instance state
         self._pins: list[dict] = []           # [{name, mode, value, gpio, net}]
@@ -447,9 +440,9 @@ class WasmChipRuntime:
 
         # UART state — at most one UART per chip in MVP
         self.uart_config: dict | None = None      # {rx, tx, baud_rate, on_rx_byte, on_tx_done, user_data}
-        # Which of the board's UARTs this chip is on. Resolved from the wired
-        # pins at vx_uart_attach; CHIP_UART until then and when nothing resolves.
-        self.uart_id: int = CHIP_UART
+        # Which of the board's UARTs the chip is on is not kept here: the
+        # worker's bus table decides per byte from the tab's wiring map
+        # (uart_bus_table.py), and a chip on no controller is silent.
 
         # SPI state
         self.spi_config: dict | None = None       # {sck, mosi, miso, cs, mode, on_done, user_data}
@@ -687,32 +680,6 @@ class WasmChipRuntime:
             "rx": rx, "tx": tx, "baud_rate": baud,
             "on_rx_byte": on_rx, "on_tx_done": on_tx_done, "user_data": user_data,
         }
-
-    def _resolve_uart_id(self, cfg: dict) -> int:
-        """Which board UART this chip's vx_uart_attach binds to.
-
-        `cfg["rx"]` and `cfg["tx"]` are pin handles from vx_pin_register, so
-        they resolve through this chip's own pin list to the GPIOs the diagram
-        wired. `uart_map` says which UART each of those GPIOs belongs to. A
-        chip's RX is wired to the board's TX and its TX to the board's RX, so
-        either end names the same UART and the first one that resolves wins.
-
-        With no map and no wire (a chip whose UART pins go nowhere) the answer
-        is CHIP_UART, which is where every chip used to land unconditionally.
-        """
-        if not self._uart_map:
-            return CHIP_UART
-        for key in ("rx", "tx"):
-            handle = int(cfg.get(key, -1))
-            if not (0 <= handle < len(self._pins)):
-                continue
-            gpio = self._pins[handle]["gpio"]
-            if gpio is None:
-                continue
-            uart = self._uart_map.get(int(gpio))
-            if uart is not None:
-                return int(uart)
-        return CHIP_UART
 
     def _read_spi_config(self, ptr: int) -> dict:
         raw = self._read_bytes(ptr, struct.calcsize(_SPI_CONFIG_FMT))
@@ -976,7 +943,6 @@ class WasmChipRuntime:
         # ── UART ──
         def vx_uart_attach(cfg_ptr: int) -> int:
             self.uart_config = self._read_uart_config(cfg_ptr)
-            self.uart_id = self._resolve_uart_id(self.uart_config)
             return 0
 
         def vx_uart_write(_handle: int, buf_ptr: int, count: int) -> int:
@@ -985,15 +951,12 @@ class WasmChipRuntime:
             data = self._read_bytes(buf_ptr, count)
             if self._uart_writer is not None:
                 try:
-                    # The UART whose TX/RX the diagram wires to this chip, so a
-                    # module on Serial2 is read by Serial2 and not by the
-                    # console. When no wire resolves this stays CHIP_UART, not
-                    # UART0: UART0 is the serial monitor on every ESP32 family,
-                    # so a chip writing there appears in the console as garbage
-                    # and reads the sketch's own prints back. Chips default to
-                    # Serial1, which the browser bridge
-                    # (simulatorBridges.ts CHIP_UART) agrees with.
-                    self._uart_writer(self.uart_id, data)
+                    # The bytes only: the worker's bus table puts them in the
+                    # guest UART whose RX the chip's TX pad is wired to, as the
+                    # tab mapped it, or nowhere. Until board-buses F6 the chip
+                    # resolved a UART itself from a static table the tab sent,
+                    # and landed on Serial1 when nothing matched.
+                    self._uart_writer(data)
                 except Exception as e:
                     self._emit({"type": "chip_error", "where": "uart_write", "error": str(e)})
                     return 0

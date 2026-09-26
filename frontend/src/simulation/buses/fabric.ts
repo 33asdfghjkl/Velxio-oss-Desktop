@@ -373,26 +373,65 @@ export class BoardBusFabric {
     if (!net) {
       net = new UartNet(this.boardId, pin, this.report);
       this.uartNets.set(pin, net);
-      this.routeUart();
+      // The controllers routed to this pin take the new net; the other nets
+      // are untouched by its birth, so nothing else is re-routed.
+      this.pointControllersAt(net);
     }
     return net;
   }
 
   /**
-   * The registry put a leg on `net` or took one off: the wire may now need
-   * a decoder or an emitter, or neither, and an empty net goes away.
+   * Where every UART controller is routed, read again now. A port with
+   * static routing takes its pins from the board's table, and the board's
+   * kind is not always known when the engine binds (the store binds the
+   * simulator before it adds the board), so the pins are re-derived every
+   * time a net is created, a leg lands or the links are recomputed, which is
+   * when they are needed.
+   */
+  private refreshUartSlots(): void {
+    for (const slot of this.uartSlots) this.uartRoutingOf(slot);
+  }
+
+  /**
+   * The registry put a leg on `net` or took one off, or linked it to (or
+   * cut it from) a peer board's net: the wire may now need a decoder or an
+   * emitter, or neither, and a net with nothing of this board's and no peer
+   * goes away.
    */
   uartMembershipChanged(net: UartNet): void {
     if (this.uartNets.get(net.pin) !== net) return;
-    if (net.size === 0) {
+    if (net.idle) {
       this.uartNets.delete(net.pin);
       this.dropUartDecoders(net.pin);
       this.dropUartEmitter(net.pin);
       this.uartChanged();
       return;
     }
-    this.refreshUart(net);
+    // A controller whose pins were unknown when the net was born (see
+    // refreshUartSlots) is pointed at it now.
+    net.controllerTx = null;
+    net.controllerRx = null;
+    this.pointControllersAt(net);
+    // The registry hears first: a leg that just landed may be on a wire
+    // another board's controller drives, and the wiring checks in refreshUart
+    // must see that peer, or a module on a peer-driven wire would be reported
+    // as hearing nothing.
     this.uartChanged();
+    this.refreshUart(net);
+  }
+
+  /**
+   * Every board pin a UART controller is routed to right now (TX and RX),
+   * for the registry's board-to-board links. Empty while no engine is bound.
+   */
+  uartControllerPins(): number[] {
+    this.refreshUartSlots();
+    const pins: number[] = [];
+    for (const slot of this.uartSlots) {
+      if (slot.tx !== undefined) pins.push(slot.tx);
+      if (slot.rx !== undefined) pins.push(slot.rx);
+    }
+    return pins;
   }
 
   /**
@@ -441,9 +480,13 @@ export class BoardBusFabric {
       }
       return true;
     };
-    // Decoders: the MCU may bit-bang this wire only if no controller drives it.
+    // Decoders: the MCU may bit-bang this wire only if no controller drives
+    // it, this board's or a peer board's: a wire another board transmits on
+    // is an input to this one, not a pin it wiggles.
+    let peerDrives = false;
+    for (const p of net.peers) if (p.controllerTx || p.drivers.size > 0) peerDrives = true;
     const wanted = new Map<string, UartMember>();
-    if (net.controllerTx === null) {
+    if (net.controllerTx === null && !peerDrives) {
       for (const m of net.listeners.values()) if (soft(m)) wanted.set(listenerKey(m), m);
     }
     let decoders = this.uartDecoders.get(pin);
@@ -468,9 +511,27 @@ export class BoardBusFabric {
     }
     if (decoders && decoders.size === 0) this.uartDecoders.delete(pin);
     // Emitter: an endpoint's bytes go out as edges only if no controller reads them.
+    let peerListens = false;
+    for (const p of net.peers) if (p.controllerRx) peerListens = true;
     let wantEmitter = false;
     if (net.controllerRx === null) {
-      for (const m of net.drivers.values()) if (soft(m)) wantEmitter = true;
+      for (const m of net.drivers.values()) {
+        // A wire a peer board's controller reads already carries the module's
+        // bytes to it; this board may still sample the pin, if it can time
+        // it, but a board that cannot is not told to rewire a module that is
+        // heard.
+        if (peerListens) {
+          if (pins && clock && m.baud !== undefined) wantEmitter = true;
+        } else if (soft(m)) {
+          wantEmitter = true;
+        }
+      }
+      // A peer board transmits on this wire (its controller, or a module on
+      // its canvas) and this board reads the pin as a plain GPIO: the bytes
+      // go out here as edges at the sender's rate. A board that cannot time
+      // its pads keeps them on the sender's board, with no report: the
+      // uart-no-clock diagnostic names a module, and this is another board.
+      if (pins && clock && peerDrives) wantEmitter = true;
     }
     if (wantEmitter && pins && clock) {
       let emitter = this.uartEmitters.get(pin);
@@ -523,27 +584,33 @@ export class BoardBusFabric {
       net.controllerTx = null;
       net.controllerRx = null;
     }
+    for (const net of this.uartNets.values()) this.pointControllersAt(net);
+    // The registry hears before the checks run, for the same reason as in
+    // uartMembershipChanged: a controller that just moved onto a pin wired
+    // to another board is linked to that board's net first.
+    this.uartChanged();
+    for (const net of this.uartNets.values()) this.refreshUart(net);
+  }
+
+  /** Give `net` the controllers whose routed TX or RX pin is its pin. */
+  private pointControllersAt(net: UartNet): void {
+    this.refreshUartSlots();
     for (const slot of this.uartSlots) {
-      this.uartRoutingOf(slot);
-      const txNet = slot.tx !== undefined ? this.uartNets.get(slot.tx) : undefined;
-      if (txNet) {
-        if (txNet.controllerTx) {
+      if (slot.tx === net.pin) {
+        if (net.controllerTx && net.controllerTx !== slot.ref) {
           this.report({
             code: 'uart-wiring',
             bus: 'uart',
             boardId: this.boardId,
             owners: [],
-            message: `${txNet.controllerTx.name} and ${slot.port.name} are both routed to TX pin ${txNet.pin}.`,
+            message: `${net.controllerTx.name} and ${slot.port.name} are both routed to TX pin ${net.pin}.`,
           });
         }
-        txNet.controllerTx = slot.ref;
+        net.controllerTx = slot.ref;
       }
-      const rxNet = slot.rx !== undefined ? this.uartNets.get(slot.rx) : undefined;
       // Two controllers listening on one pin is one TX to two RX: legal.
-      if (rxNet) rxNet.controllerRx = slot.ref;
+      if (slot.rx === net.pin) net.controllerRx = slot.ref;
     }
-    for (const net of this.uartNets.values()) this.refreshUart(net);
-    this.uartChanged();
   }
 
   /**

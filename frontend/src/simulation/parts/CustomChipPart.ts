@@ -18,10 +18,11 @@ import { useElectricalStore } from '../../store/useElectricalStore';
 import { normalizeChipPinNames } from '../customChips/chipJson';
 import { clearChipDrives } from '../customChips/chipPinDrives';
 import { isSyntheticChipPin } from '../customChips/syntheticPins';
-import { resolveChipNetMembers, resolveChipOwnerBoardId } from '../customChips/chipNets';
-import { classifyPin } from '../../utils/boardProtocols';
+import { resolveChipNetMembers } from '../customChips/chipNets';
 import { requestElectricalResolve } from '../spice/electricalResolveHook';
 import { runChipAttachExtensions } from '../customChips/chipAttachExtensions';
+import { chipUartOwner } from '../customChips/ChipRuntime';
+import { readChipUartPads } from '../customChips/chipUartPads';
 import { setAdcVoltage, analogRailVolts } from './partUtils';
 import { attachUartEndpoint } from '../buses';
 import type { UartHandle } from '../buses/types';
@@ -194,27 +195,6 @@ PartSimulationRegistry.register('custom-chip', {
       // different board (a second QEMU worker) for the interconnect to bridge.
       const nets = resolveChipNetMembers(useSimulatorStore.getState(), componentId);
 
-      // Which board UART each wired GPIO belongs to. The chip's vx_uart_attach
-      // names its own RX/TX pins, and the backend runtime turns those into
-      // GPIOs through pinMap; this table is the last hop, GPIO to UART number,
-      // and it is board-specific so it has to come from here. Without it every
-      // chip landed on one fixed UART whatever the diagram said, which put a
-      // module wired to Serial2 on the wrong end of the board.
-      const uartMap: Record<number, number> = {};
-      {
-        const st = useSimulatorStore.getState();
-        const ownerId = resolveChipOwnerBoardId(st, componentId);
-        const ownerKind = st.boards.find((b) => b.id === ownerId)?.boardKind;
-        if (ownerKind) {
-          for (const gpio of Object.values(pinMap)) {
-            const role = classifyPin(ownerKind, String(gpio));
-            if (role.kind === 'uart-tx' || role.kind === 'uart-rx') {
-              uartMap[gpio] = role.uart;
-            }
-          }
-        }
-      }
-
       // The worker keys sensor records by pin and a chip has none: each chip
       // gets its own synthetic slot (see chipVirtualPin), so live attribute
       // updates and a detach reach this chip and not the last one registered.
@@ -225,18 +205,60 @@ PartSimulationRegistry.register('custom-chip', {
           attrs: attrsObj,
           pin_map: pinMap,
           nets,
-          uart_map: uartMap,
           // The worker allocates the framebuffer vx_framebuffer_init hands the
-          // chip, and needs the id to send the rows back to THIS element.
+          // chip, and needs the id to send the rows back to THIS element. It
+          // is also the chip's identity in the bus map the shim sends
+          // (uart_bus_table.owner_of), see the UART registration below.
           component_id: componentId,
           display: display ?? undefined,
         });
         console.info(
-          `[custom-chip:${componentId}] sent to backend ESP32 worker (chip runs synchronously inside QEMU process). pinMap=${JSON.stringify(pinMap)} nets=${JSON.stringify(nets)} uartMap=${JSON.stringify(uartMap)}`,
+          `[custom-chip:${componentId}] sent to backend ESP32 worker (chip runs synchronously inside QEMU process). pinMap=${JSON.stringify(pinMap)} nets=${JSON.stringify(nets)}`,
         );
       } catch (e) {
         console.error(`[custom-chip:${componentId}] failed to register on ESP32 backend:`, e);
       }
+
+      // Which of the guest's UARTs the chip is on is the circuit's business,
+      // and the circuit is in this tab (board-buses F6). The chip's RX and TX
+      // pads go on the bus fabric under the chip's own id, the identity its
+      // record carries to the worker, and the UART half of the bus map the
+      // shim sends names the controller on each pad's wire (RemoteUartLane,
+      // busRegistry.uartMap); the worker's table reads that per byte, after
+      // the live GPIO matrix (uart_bus_table.py). The pads are the ones the
+      // chip's own vx_uart_attach names, and the chip runs in the worker, so
+      // they are read off an inert copy of the WASM here (readChipUartPads).
+      // The endpoint itself answers nothing: the worker's copy of the chip
+      // does, beside the guest, and this tab only says where it is wired.
+      //
+      // What stood here classified the wired GPIOs against a static pin table
+      // and sent the worker a {gpio: uart} map it took as the chip's own
+      // word: the classic ESP32's table for every variant, so a module on an
+      // S3's UART1 pins was placed on UART2 (esp32-variant-uart-table-wrong),
+      // and a chip wired to nothing landed on Serial1 instead of on no wire.
+      let uartHandles: UartHandle[] = [];
+      let uartGone = false;
+      void readChipUartPads(decodeWasmBase64(wasmBase64), {
+        attrs: attrsObj,
+        strAttrs: strAttrsObj,
+        romBytes,
+      }).then((uarts) => {
+        if (uartGone) return;
+        uartHandles = uarts.map((u, handle) =>
+          attachUartEndpoint(
+            {
+              owner: chipUartOwner(componentId, handle),
+              componentId,
+              pins: {
+                ...(u.rxPad ? { rx: u.rxPad } : {}),
+                ...(u.txPad ? { tx: u.txPad } : {}),
+              },
+              baud: u.baud,
+            },
+            { receive: () => {} },
+          ),
+        );
+      });
       // A display chip's pixels come back from the worker as `chip_framebuffer`
       // rows (see Esp32Bridge.onChipFramebuffer). Kept in a full RGBA image here
       // so a partial frame (the rows a driver's window touched) lands on top of
@@ -309,6 +331,10 @@ PartSimulationRegistry.register('custom-chip', {
       return () => {
         offFramebuffer();
         cleanupExtensions();
+        // Off the wires, so the map the shim sends next no longer names it.
+        uartGone = true;
+        for (const h of uartHandles) h.dispose();
+        uartHandles = [];
         try {
           sim.unregisterSensor?.(virtualPin);
         } catch {
@@ -333,14 +359,14 @@ PartSimulationRegistry.register('custom-chip', {
     const strAttrs = new Map<string, string>(Object.entries(strAttrsObj));
 
     // Nothing to install on the simulator for any bus: the chip joins the
-    // board's SPI and I2C from vx_spi_attach and vx_i2c_attach, with the pins
-    // of its own config, and its UART is put on the bus fabric below by its
-    // own RX and TX pads. A chip that never calls them stays off those buses.
+    // board's SPI, I2C and UART wires from its own vx_spi_attach,
+    // vx_i2c_attach and vx_uart_attach, with the pins of its config, on
+    // every engine kind alike (the in-browser ESP32 engines included). A chip
+    // that never calls them stays off those buses.
 
     // Async create — wrap so we can dispose even if create is still in-flight
     // when the user stops the simulation.
     let instance: ChipInstance | null = null;
-    let uartHandle: UartHandle | null = null;
     let rafHandle = 0;
     let disposed = false;
     let keyboardCleanup: (() => void) | undefined;
@@ -402,39 +428,6 @@ PartSimulationRegistry.register('custom-chip', {
           instance: inst,
           wires,
         });
-
-        // UART: the chip is on the bus fabric by its own pads (project
-        // board-buses-2026-09, F6). Its RX pad hears whatever transmits on the
-        // board pin it is wired to and its TX pad drives the wire it is wired
-        // to; the fabric decides from the nets which of the board's UARTs, if
-        // any, is on each, or follows a plain GPIO on the guest's clock
-        // (SoftwareSerial). An unwired pad is on no wire, and there is no
-        // USART0 to fall back to. The rate is the chip's own
-        // (vx_uart_config.baud_rate): what the fabric checks the board's UART
-        // against, and the bit time a pad on a plain GPIO is decoded and
-        // driven at. What stood here hung a dispatcher on the simulator's
-        // USART0 (rebuilt and lost on every reset, deaf to the Mega's other
-        // USARTs) and injected replies into USART0 whatever the wiring.
-        //
-        // The overlay's in-browser ESP32 engines are left to the attach
-        // extensions, which put the chip on the same fabric from the overlay.
-        if (inst.hasUart && detectSimulatorKind(sim) !== 'esp32') {
-          const pads = inst.getUartPads();
-          const route = inst.getUartTxRoute();
-          const handle = attachUartEndpoint(
-            {
-              owner: componentId,
-              pins: {
-                ...(pads?.rxPad ? { rx: pads.rxPad } : {}),
-                ...(pads?.txPad ? { tx: pads.txPad } : {}),
-              },
-              ...(route ? { baud: route.baud } : {}),
-            },
-            { receive: (byte) => inst.feedUart(byte) },
-          );
-          uartHandle = handle;
-          inst.onUartTx((byte) => handle.transmit(byte));
-        }
 
         // Bridge framebuffer → chip's web component canvas (when chip has display).
         // The runtime reports every vx_buffer_write; a driver painting a 480x320
@@ -548,10 +541,6 @@ PartSimulationRegistry.register('custom-chip', {
       if (extensionCleanup) extensionCleanup();
       if (rafHandle) cancelAnimationFrame(rafHandle);
       rafHandle = 0;
-      if (uartHandle) {
-        uartHandle.dispose();
-        uartHandle = null;
-      }
       if (keyboardCleanup) keyboardCleanup();
       if (instance) instance.dispose();
       instance = null;
