@@ -11,6 +11,22 @@ parameterised by `panelKind`; the decoder is selected from the panel's
 > (B/W, B/W/Red, and 7-colour ACeP). See "Decoder internals" and the sections
 > after it for the rotation / paging / tri-colour / BUSY details, and
 > "Roadmap" for what's still deferred.
+>
+> **Read with a date in mind (2026-09, board-buses F8).** The panel is a sink
+> of the per-board SPI fabric on every engine: `EPaperPart.ts` attaches it
+> with `attachSpiDevice` and the same browser decoder paints it whether the
+> CPU runs in the tab or in a backend worker (see
+> [board-buses.md](./board-buses.md)). The worker-side twins this page used
+> to name (`esp32_spi_slaves.py`, the `*EpaperSlave` classes, the
+> `epaper_update` event) are gone: on the ESP32 and STM32 QEMU boards the
+> worker relays the panel's bytes to the tab while its chip select is listed
+> in the bus map's `sinks` entry and holds no panel model. The one difference
+> on that lane is that the BUSY pulse reaches the guest a socket round trip
+> after the worker relayed `0x20`, so a driver polling BUSY there may not
+> wait (same picture, shorter wait). The `test/test_epaper/` golden Python
+> decoder this page cites is not in the tree any more; the vectors live in
+> `frontend/src/__tests__/ssd168x-decoder.test.ts`,
+> `epaper-part-integration.test.ts` and `uc8179_vectors.json`.
 
 ## Supported panels
 
@@ -26,14 +42,14 @@ parameterised by `panelKind`; the decoder is selected from the panel's
 | `epaper-5in65-7c`  | 5.65" | 600×448 | **ACeP 7-colour** | **UC8159c** | ❌ flash | ⚠️ tight | ✅ |
 
 Three of those panels use a **non-SSD168x controller** and have their own
-decoder; `EPaperPart.ts` (browser) and `esp32_worker.py` (ESP32) both pick
-the decoder from `cfg.controllerFamily`:
+decoder; `EPaperPart.ts` picks it from `cfg.controllerFamily` on every
+engine:
 
-| `controllerFamily` | Panels | Browser decoder | ESP32 worker slave |
-|---|---|---|---|
-| `ssd168x` | 1.54 / 2.13 / 2.9 / 4.2" (B/W + B/W/R) | `SSD168xDecoder.ts` | `Ssd168xEpaperSlave` |
-| `uc8159c` | 5.65" ACeP 7-colour | `UC8159cDecoder.ts` | `Uc8159cEpaperSlave` |
-| `uc8179`  | 7.5" 800×480 mono     | `Uc8179Decoder.ts`  | `Uc8179EpaperSlave`  |
+| `controllerFamily` | Panels | Decoder |
+|---|---|---|
+| `ssd168x` | 1.54 / 2.13 / 2.9 / 4.2" (B/W + B/W/R) | `SSD168xDecoder.ts` |
+| `uc8159c` | 5.65" ACeP 7-colour | `UC8159cDecoder.ts` |
+| `uc8179`  | 7.5" 800×480 mono     | `Uc8179Decoder.ts`  |
 
 > The 7.5" panel was originally mislabeled `controllerFamily: 'ssd168x'`
 > and rendered **blank** — GxEPD2_750_T7 is a UC8179, whose 0x10/0x13 DTM
@@ -66,16 +82,19 @@ exact pin numbers in the sketch.
 
 ## How the emulator works
 
-There are three rendering paths, picked automatically at runtime by
-`EPaperPart.attachEvents()` based on which simulator owns the board:
+There is one rendering path (since board-buses F3/F4; the three engine
+hooks this table used to list are gone): `EPaperPart.attachEvents()` joins
+the board's SPI fabric with `attachSpiDevice`, keyed by the panel's CS, and
+the decoder in `frontend/src/simulation/displays/` receives the bytes the
+controller port delivers while the panel is selected. CS / DC / RST are
+tracked through `pinManager.onPinChange`, on every engine.
 
-| Board family | Decoder location | Plumbing |
-|---|---|---|
-| **AVR** (Uno / Nano / Mega) | Browser, `frontend/src/simulation/displays/SSD168xDecoder.ts` | Hooks `simulator.spi.onByte`. CS / DC / RST tracked via `pinManager.onPinChange`. |
-| **RP2040** (Pico / Pico W) | Browser, same decoder | Hooks `rp2040.spi[bus].onTransmit`. Same pin tracking. |
-| **ESP32** family | Backend, `backend/app/services/esp32_spi_slaves.py::Ssd168xEpaperSlave` | Worker subprocess decodes SPI synchronously inside the QEMU thread; emits `epaper_update` WS event with the latched framebuffer (base64 palette buffer). |
+| Where the CPU runs | How the bytes reach the decoder |
+|---|---|
+| In the tab (AVR, RP2040, RP2350, the ESP32 JS engines, the XIAO ARM boards) | the engine's controller port, one byte at a time, in the same call |
+| In a backend worker (ESP32 and STM32 QEMU, the Raspberry Pi guest) | the worker relays them to the tab (`spi_batch`, framed by the CS and D/C edges), only while the panel's CS is listed in the bus map's `sinks` entry |
 
-For all three paths:
+On every engine:
 
 - **Latched RAM**: pixels written via `0x24 WRITE_BLACK_VRAM` and `0x26
   WRITE_RED_VRAM` only become visible after `0x20 MASTER_ACTIVATION`.
@@ -87,15 +106,12 @@ For all three paths:
 
 ## Decoder internals (SSD168x)
 
-The SSD168x decoder is implemented **three times and they must stay
-byte-for-byte identical** — change one, change all three:
-
-- `frontend/src/simulation/displays/SSD168xDecoder.ts` (TypeScript, AVR/RP2040)
-- `backend/app/services/esp32_spi_slaves.py::Ssd168xEpaperSlave` (Python, ESP32 worker)
-- `test/test_epaper/ssd168x_decoder.py` (the Python golden reference / spec)
-
-`test_ssd168x_protocol.py` + `ssd168x-decoder.test.ts` replay the same byte
-streams through them and assert identical framebuffers.
+The SSD168x decoder is implemented once,
+`frontend/src/simulation/displays/SSD168xDecoder.ts`, and paints the panel
+on every engine (the worker-side Python twin was retired in board-buses F8
+once the QEMU lane fed the same decoder). `ssd168x-decoder.test.ts` replays
+the byte streams that used to be shared with the Python golden reference
+and asserts the framebuffers.
 
 ### Native-window compose, then rotate
 
@@ -172,21 +188,20 @@ registration (`esp32_worker.py`, the `_init_sensors` path):
 | UltraChip (uc8159c, uc8179) | **HIGH** | LOW |
 
 Get this wrong and GxEPD2's first busy-wait never satisfies → a **10 s "Busy
-Timeout!"** on every refresh (the original 7.5" symptom). The ePaper panels
-register through the `_init_sensors` path, **not** the runtime `sensor_attach`
-twin (whose BUSY was hardcoded and whose `epaper_update` emit was the old
-double-`data` shape — both left as dead-but-fixed code).
+Timeout!"** on every refresh (the original 7.5" symptom). The panel is the
+one writer of BUSY on every engine: it seeds the idle level when it attaches
+and pulses the busy level for `refreshMs` after `0x20`; on the QEMU lane the
+seed and the pulse travel to the guest through the bridge's pin injection,
+so a driver that polls BUSY right after the refresh command may see it
+before the pulse lands (the wait is shorter, the picture is the same).
 
-## WS plumbing (ESP32 path)
+## WS plumbing (QEMU lane)
 
-The worker emits `epaper_update` events to the frontend **flat** — fields at
-the top level, NOT nested under `'data'` — because the backend's
-`qemu_callback` (`simulation.py`) re-wraps the post-`type` payload under
-`'data'`. A nested `'data'` here double-wraps, the frontend reads
-`msg.data.data.component_id` (undefined), `EPaperPart` bails on
-`id !== componentId`, and the panel **never renders** (the long-standing
-"ESP32 ePaper is blank" bug). Every other worker event is flat for the same
-reason.
+The worker sends no `epaper_update` any more. The bytes come as `spi_batch`
+events framed by the CS and D/C edges around them, the same shape every
+other tab-side sink receives (see [board-buses.md](./board-buses.md),
+"Sinks stay in the tab"), and `EPaperPart` decodes them through its
+`RemoteSpiPort` exactly as it decodes an in-tab engine's bytes.
 
 ## Library compatibility matrix
 
@@ -206,9 +221,10 @@ that lists them in `libraries: [...]`.
 2. Hit **Run**. After ~1 s the panel "refreshes" (you'll see the BUSY
    shimmer overlay) and the 1.54" canvas shows "Velxio / ePaper / OK!"
    in black on the off-white paper background.
-3. Try the **2.9" ESP32 Weather** example next — that path goes through
-   the backend SSD168x slave (`epaper_update` events arriving over the
-   WebSocket), not the in-browser decoder. Same UX from the user's POV.
+3. Try the **2.9" ESP32 Weather** example next. With the in-browser ESP32
+   engine the path is the same as the Uno's; with `?esp32sim=qemu` the CPU
+   runs in the backend worker and the bytes reach the same decoder over
+   the WebSocket (`spi_batch`). Same UX from the user's POV.
 
 ## Debugging gotchas
 
@@ -233,9 +249,9 @@ that lists them in `libraries: [...]`.
 
 | Feature | Why not yet |
 |---|---|
-| ~~Tri-colour SSD168x (B/W/R)~~ | **✅ shipped** — `epaper-2in13-bwr`, `epaper-2in9-bwr` panel kinds. The decoder's red RAM plane (`0x26 WRITE_RED_VRAM`) was always there; we just enabled it for the SSD1680 3-colour panels. |
-| ~~UC8159c 5.65" 7-colour ACeP~~ | **✅ shipped** — `epaper-5in65-7c` panel kind. New decoder family, same hook + Web Component. |
-| ~~UC8179 7.5" full driver~~ | **✅ shipped** — `epaper-7in5-bw` now uses the dedicated `Uc8179Decoder` / `Uc8179EpaperSlave` (controllerFamily `uc8179`) instead of being mis-decoded as SSD168x. |
+| ~~Tri-colour SSD168x (B/W/R)~~ | **shipped**: `epaper-2in13-bwr`, `epaper-2in9-bwr` panel kinds. The decoder's red RAM plane (`0x26 WRITE_RED_VRAM`) was always there; we just enabled it for the SSD1680 3-colour panels. |
+| ~~UC8159c 5.65" 7-colour ACeP~~ | **shipped**: `epaper-5in65-7c` panel kind. New decoder family, same hook + Web Component. |
+| ~~UC8179 7.5" full driver~~ | **shipped**: `epaper-7in5-bw` now uses the dedicated `Uc8179Decoder` (controllerFamily `uc8179`) instead of being mis-decoded as SSD168x. |
 | Other UC81xx panels (UC8176 4.2" alt) | The SSD168x driver covers the 4.2" GxEPD2_420 path today (it emits SSD168x-compatible traffic). Only matters if someone picks a panel whose GxEPD2 class strictly emits UC81xx commands a current decoder doesn't model. |
 | **E Ink Spectra 6 13.3" 1200×1600** (Seeed [6569](https://www.seeedstudio.com/13-3inch-Six-Color-eInk-ePaper-Display-with-1200x1600-Pixels-p-6569.html)) | Reverse-engineered command set; ship after Phase 1 proves the scaffold and we can capture real SPI traces from a Seeed EE02. |
 | IT8951 Carta panels | Different protocol entirely (SPI packet stream). |
@@ -256,8 +272,7 @@ that lists them in `libraries: [...]`.
 | `frontend/src/simulation/parts/EPaperPart.ts` | `attachEvents` factory — branches AVR / RP2040 / ESP32 + picks the decoder by `controllerFamily` |
 | `frontend/src/data/examples-displays-epaper.ts` | gallery examples |
 | `frontend/public/components-metadata.json` | picker entries (category: `displays`) |
-| `backend/app/services/esp32_spi_slaves.py` | `Ssd168xEpaperSlave` / `Uc8159cEpaperSlave` / `Uc8179EpaperSlave` for the ESP32 path |
-| `backend/app/services/esp32_worker.py` | dispatches the slave by `controller_family`; seeds the BUSY idle level; emits `epaper_update` |
+| `backend/app/services/esp32_worker.py` | relays the panel's SPI bytes to the tab (`spi_batch`) while its chip select is listed in the bus map's `sinks` entry; holds no panel model (the `esp32_spi_slaves.py` twins were retired in board-buses F8) |
 | `test/test_epaper/ssd168x_decoder.py` | Golden Python SSD168x decoder (the spec) |
 | `test/test_epaper/test_ssd168x_protocol.py` | pure-Python protocol tests |
 | `frontend/src/__tests__/ssd168x-decoder.test.ts` | Vitest port of the same tests |

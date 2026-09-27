@@ -107,14 +107,24 @@ export class SpiBus {
     return this.members.size;
   }
 
-  /** The fabric calls this on every chip-select edge of a member. */
+  /**
+   * The fabric calls this on every chip-select edge of a member.
+   *
+   * The device hears its edge BEFORE the bus re-reads what it drives: a chip
+   * that arms its first byte in its own CS watch (the idiom the API reference
+   * documents) has armed it by the time rebuildSelection() restarts the soft
+   * decoder, which puts the first MISO bit on the wire for a CPHA 0 master
+   * right there. The other way round the decoder asked an unarmed chip and
+   * drove the idle 1, and a first byte starting with 0 read back with its top
+   * bit set.
+   */
   setSelected(member: SpiMember, active: boolean): void {
     if (member.selected === active) return;
     member.selected = active;
     member.checked = false;
-    this.rebuildSelection();
     if (active) member.device.select?.();
     else member.device.deselect?.();
+    this.rebuildSelection();
   }
 
   private rebuildSelection(): void {

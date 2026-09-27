@@ -540,40 +540,6 @@ class EspLibManager:
         if inst and inst.running and inst.process.returncode is None:
             self._write_cmd(inst, {'cmd': 'sensor_detach', 'pin': pin})
 
-    # ── Cross-board I2C proxy ─────────────────────────────────────────────────
-    # Forwards a snapshot of a peer board's virtual I2C device into a
-    # `ProxySlave` registered server-side, so the ESP32 firmware's Wire
-    # master reads succeed synchronously inside QEMU.
-
-    def proxy_i2c_register(self, client_id: str, addr: int, regs_b64: str) -> None:
-        """Install a proxy slave at `addr` initialised with the given dump."""
-        with self._instances_lock:
-            inst = self._instances.get(client_id)
-        if inst and inst.running and inst.process.returncode is None:
-            self._write_cmd(inst, {
-                'cmd': 'proxy_i2c_register', 'addr': addr & 0x7F,
-                'regs_b64': regs_b64,
-            })
-
-    def proxy_i2c_update(self, client_id: str, addr: int, regs_b64: str) -> None:
-        """Refresh the register state of an existing proxy slave at `addr`."""
-        with self._instances_lock:
-            inst = self._instances.get(client_id)
-        if inst and inst.running and inst.process.returncode is None:
-            self._write_cmd(inst, {
-                'cmd': 'proxy_i2c_update', 'addr': addr & 0x7F,
-                'regs_b64': regs_b64,
-            })
-
-    def proxy_i2c_unregister(self, client_id: str, addr: int) -> None:
-        """Remove the proxy slave at `addr`."""
-        with self._instances_lock:
-            inst = self._instances.get(client_id)
-        if inst and inst.running and inst.process.returncode is None:
-            self._write_cmd(inst, {
-                'cmd': 'proxy_i2c_unregister', 'addr': addr & 0x7F,
-            })
-
     # ── ESP32-CAM: OV2640 frame injection ─────────────────────────────────────
     # The QEMU peripheral (hw/misc/esp32_i2s_cam.c) accepts host-pushed
     # frames via velxio_push_camera_frame(). We forward the JPEG/RGB565

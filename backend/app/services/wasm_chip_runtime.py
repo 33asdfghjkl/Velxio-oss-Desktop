@@ -34,6 +34,7 @@ import hashlib
 import heapq
 import json
 import struct
+import functools
 import threading
 import time
 from typing import Callable, Optional
@@ -360,6 +361,27 @@ def hosted_model_identity(model: dict, cs=None, bus_id=None) -> str:
     return digest.hexdigest()
 
 
+def _under_entry_lock(method):
+    """Serialise a public entry into the chip.
+
+    The runtime is not safe between threads by itself: a wasmtime Store is
+    entered by whichever thread calls, and the workers have two that do (the
+    QEMU thread delivering pin edges, bus bytes and UART bytes, and the chip
+    timer thread firing deadlines). The ESP32 worker serialises them under
+    QEMU's iothread lock; the STM32 worker has no such symbol, so there a chip
+    with a timer and a pin watch entered the same Store from two threads at
+    once (seen as a guest hang on the F7 rig without the BQL). One reentrant
+    lock per runtime around every entry closes it, in every host: a callback
+    that re-enters the runtime from inside the chip (a pin watch answering with
+    vx_pin_write, a timer arming another) is on the same thread and passes.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._entry_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class WasmChipRuntime:
     """Wraps a single chip WASM instance.
 
@@ -390,6 +412,7 @@ class WasmChipRuntime:
         component_id: str | None = None,
         blobs: dict[str, bytes] | None = None,
         clock: Optional[Callable[[], int]] = None,
+        pad_volts: dict[str, float | None] | None = None,
     ):
         """
         Args:
@@ -430,9 +453,19 @@ class WasmChipRuntime:
                         host's load (memory: parts run on the guest clock,
                         never the wall clock). None keeps host time, which
                         is all a host without a guest clock has.
+            pad_volts:  {chip_pin_name: volts} - the voltage the tab's circuit
+                        solve publishes for the net each pad is on, for every
+                        pad a wire reaches (the tab lists the pads in the air
+                        as None). What vx_pin_read_analog answers, and what
+                        vx_pin_wired reads; see update_pad_volts. The tab's
+                        padVolts.ts computes the same numbers the browser
+                        runtime reads, so both hosts answer alike.
         """
         self._engine = wasmtime.Engine()
         self._store = wasmtime.Store(self._engine)
+        # Every public entry takes this (see _under_entry_lock). Created before
+        # anything else so update_pad_volts and friends can run from __init__.
+        self._entry_lock = threading.RLock()
         self._module = wasmtime.Module(self._engine, wasm_bytes)
 
         # Provide the linear memory (the WASM is compiled with --import-memory)
@@ -468,6 +501,9 @@ class WasmChipRuntime:
         # Per-instance state
         self._pins: list[dict] = []           # [{name, mode, value, gpio, net}]
         self._attr_handles: list[dict] = []   # [{name, default}]
+        # Solved voltage per chip pin name, for the pads a wire reaches.
+        self._pad_volts: dict[str, float] = {}
+        self.update_pad_volts(pad_volts or {})
 
         # Named byte storage (vx_blob_*), per chip instance. Copied in, like the
         # browser runtime does, so the chip's writes stay inside the chip until
@@ -572,6 +608,7 @@ class WasmChipRuntime:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    @_under_entry_lock
     def run_chip_setup(self) -> None:
         """Invoke the chip's chip_setup export. Populates pins, attrs, I2C state."""
         chip_setup = self._exports["chip_setup"]
@@ -993,9 +1030,25 @@ class WasmChipRuntime:
                     self._emit({"type": "chip_error", "where": "net_write", "error": str(e)})
 
         def vx_pin_read_analog(handle: int) -> float:
+            # The voltage the tab's solve published for the pad's net (pad_volts),
+            # the same number the browser runtime reads off the electrical
+            # store; 0 for a pad in the air or on a net without a number. It
+            # used to answer the pin's DIGITAL level times five (finding
+            # vx-pin-read-analog-answers-neither-host-the-solve).
             if 0 <= handle < len(self._pins):
-                return float(self._pins[handle]["value"] * 5.0)
+                return float(self._pad_volts.get(self._pins[handle]["name"], 0.0))
             return 0.0
+
+        def vx_pin_wired(handle: int) -> int:
+            # A wire reaches the pad: the tab published a voltage for it, or
+            # mapped it to a guest GPIO or a chip net.
+            if not (0 <= handle < len(self._pins)):
+                return 0
+            p = self._pins[handle]
+            wired = (p["name"] in self._pad_volts
+                     or p.get("gpio") is not None
+                     or p.get("net") is not None)
+            return 1 if wired else 0
 
         def vx_pin_dac_write(_handle: int, _voltage: float) -> None:
             return
@@ -1315,6 +1368,7 @@ class WasmChipRuntime:
             "vx_pin_read":         (wasmtime.FuncType([i32], [i32]),      vx_pin_read),
             "vx_pin_write":        (wasmtime.FuncType([i32, i32], []),    vx_pin_write),
             "vx_pin_read_analog":  (wasmtime.FuncType([i32], [f64]),      vx_pin_read_analog),
+            "vx_pin_wired":        (wasmtime.FuncType([i32], [i32]),      vx_pin_wired),
             "vx_pin_dac_write":    (wasmtime.FuncType([i32, f64], []),    vx_pin_dac_write),
             "vx_pin_pwm_write":    (wasmtime.FuncType([i32, f64], []),    vx_pin_pwm_write),
             "vx_pin_set_mode":     (wasmtime.FuncType([i32, i32], []),    vx_pin_set_mode),
@@ -1406,6 +1460,7 @@ class WasmChipRuntime:
 
     # ── Exposed for the I2C slave adapter ────────────────────────────────────
 
+    @_under_entry_lock
     def call_i2c_callback(self, name: str, *args: int, address: int | None = None) -> int:
         """Invoke one of {on_connect, on_read, on_write, on_stop} via indirect
         call, on the target the transaction is for.
@@ -1451,6 +1506,7 @@ class WasmChipRuntime:
         return result
 
     # ── Live attribute updates (sensor control panel sliders) ───────────────
+    @_under_entry_lock
     def update_attrs(self, attrs: dict[str, float]) -> None:
         """Apply live control values. vx_attr_read reads self._attrs on every
         call, so the running chip sees the new values immediately — no reload.
@@ -1459,7 +1515,22 @@ class WasmChipRuntime:
         for name, value in attrs.items():
             self._attrs[str(name)] = float(value)
 
+    @_under_entry_lock
+    def update_pad_volts(self, volts: dict) -> None:
+        """Apply what the tab's solve says about the chip's pads: a number is
+        the voltage on that pad's net, None (a pad in the air, or a wire
+        removed since the last publication) takes the pad off the table. Keys
+        are the chip's own pin names, as vx_pin_register named them."""
+        for name, value in (volts or {}).items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                self._pad_volts[str(name)] = float(value)
+            else:
+                self._pad_volts.pop(str(name), None)
+
     # ── Named blob readback (the host ships the writes onwards) ─────────────
+    @_under_entry_lock
     def blob_bytes(self, name: str) -> bytes | None:
         """Current bytes of a named blob, None when the chip has no such blob."""
         blob = self._blobs.get(name)
@@ -1468,6 +1539,7 @@ class WasmChipRuntime:
         with self._blob_lock:
             return bytes(blob)
 
+    @_under_entry_lock
     def blob_span(self, name: str, lo: int, hi: int) -> bytes | None:
         """Bytes [lo, hi) of a named blob. What a host sends back after a
         write is the span the chip touched; copying the whole card image to
@@ -1478,6 +1550,7 @@ class WasmChipRuntime:
         with self._blob_lock:
             return bytes(blob[max(0, lo):max(0, hi)])
 
+    @_under_entry_lock
     def take_blob_dirty(self) -> dict[str, tuple[int, int]]:
         """The byte spans [lo, hi) the chip wrote since the last call, and
         clears them. A card image is megabytes, so what goes back to the panel
@@ -1494,6 +1567,7 @@ class WasmChipRuntime:
         """True once chip_setup called vx_framebuffer_init."""
         return self._fb is not None
 
+    @_under_entry_lock
     def flush_framebuffer(self) -> bool:
         """Ship the rows the chip touched since the last flush as ONE
         `chip_framebuffer` event: RGBA rows y0..y1 (inclusive), zlib-deflated,
@@ -1553,6 +1627,7 @@ class WasmChipRuntime:
                     new_state,
                 )
 
+    @_under_entry_lock
     def notify_net_change(self, handle: int, value: int, at_ns: int | None = None) -> None:
         """Called by ChipNetBus when another chip drives a net this chip's pin
         `handle` sits on. Edge detection is per watch entry, so a member that
@@ -1573,6 +1648,7 @@ class WasmChipRuntime:
             self._now_override_ns = None
         self._flush_stdout()
 
+    @_under_entry_lock
     def notify_pin_change(self, gpio: int, value: int) -> None:
         """Called by the worker for every QEMU GPIO transition. Fires any
         chip-side watches whose edge condition matches.
@@ -1596,6 +1672,7 @@ class WasmChipRuntime:
         self._flush_stdout()
 
     # ── UART hook (chip ← firmware) ──────────────────────────────────────────
+    @_under_entry_lock
     def feed_uart_byte(self, byte: int) -> None:
         """Called by the worker when the firmware transmits a UART byte —
         delivers it to the chip's vx_uart_attach `on_rx_byte` callback."""
@@ -1608,6 +1685,7 @@ class WasmChipRuntime:
         self._flush_stdout()
 
     # ── Pins ────────────────────────────────────────────────────────────────
+    @_under_entry_lock
     def pin_level(self, handle: int) -> int:
         """The level on one of the chip's own pins, as vx_pin_read sees it.
 
@@ -1652,6 +1730,7 @@ class WasmChipRuntime:
         return p["value"] & 1
 
     # ── SPI hook (chip ← firmware) ───────────────────────────────────────────
+    @_under_entry_lock
     def spi_cs_active(self, handle: int = 0) -> bool:
         """Whether the select line of SPI handle `handle` is asserted now.
 
@@ -1690,6 +1769,7 @@ class WasmChipRuntime:
         except Exception:
             return False
 
+    @_under_entry_lock
     def spi_transfer_byte(self, mosi: int, handle: int = 0) -> int:
         """Called by the worker when the firmware clocks one SPI byte to the
         device that SPI handle `handle` is. Returns the byte the chip put in
@@ -1759,12 +1839,14 @@ class WasmChipRuntime:
         return miso_byte
 
     # ── Timers ──────────────────────────────────────────────────────────────
+    @_under_entry_lock
     def next_timer_deadline(self) -> int | None:
         """Return the soonest active timer's fire time (ns). None if no timers."""
         with self._timer_lock:
             deadlines = [t["next_fire_ns"] for t in self._timers if t["active"]]
         return min(deadlines) if deadlines else None
 
+    @_under_entry_lock
     def fire_due_timers(self) -> None:
         """Fire every timer whose deadline has passed. Called by the scheduler
         thread after acquiring the QEMU iothread lock."""

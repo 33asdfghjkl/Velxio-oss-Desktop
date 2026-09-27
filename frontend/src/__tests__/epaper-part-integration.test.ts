@@ -135,6 +135,23 @@ class TestSimulator {
   }
 }
 
+/**
+ * The surface a QEMU shim has on top of the pins and its (remote) controller
+ * port: the bridge, and the worker's sensor records. A panel used to read
+ * that shape as "the worker owns the model" and register a slave there.
+ */
+class QemuShapedSimulator extends TestSimulator {
+  readonly registered: Array<[string, number]> = [];
+  getBridge(): { sendSensorAttach: () => void; sendPinEvent: () => void } {
+    return { sendSensorAttach: () => {}, sendPinEvent: () => {} };
+  }
+  registerSensor(type: string, pin: number): boolean {
+    this.registered.push([type, pin]);
+    return true;
+  }
+  unregisterSensor(): void {}
+}
+
 // ── Element + DOM setup (jsdom) ─────────────────────────────────────────────
 
 beforeAll(async () => {
@@ -199,7 +216,7 @@ interface Rig {
  */
 function rig(
   panelKind = 'epaper-1in54-bw',
-  opts: { refreshMs?: string; wiring?: Record<string, number | null> } = {},
+  opts: { refreshMs?: string; wiring?: Record<string, number | null>; shim?: boolean } = {},
 ): Rig {
   const boardId = `uno-epd${++seq}`;
   const componentId = `${boardId}-epd`;
@@ -227,7 +244,7 @@ function rig(
   document.body.appendChild(el);
 
   const pins = getBoardPinManager(boardId)!;
-  const sim = new TestSimulator(pins);
+  const sim = opts.shim ? new QemuShapedSimulator(pins) : new TestSimulator(pins);
   busRegistry.bindBoard(boardId, sim);
 
   const getPin = (name: string) =>
@@ -433,44 +450,20 @@ describe('EPaperPart — on the board bus', () => {
   });
 });
 
-describe('EPaperPart — the QEMU lane (the worker owns the model)', () => {
-  it('on a board with no controller port the part registers a worker slave and never drives BUSY', () => {
-    // Two writers on one pin, and for an UltraChip panel they disagreed.
-    const driven: Array<[number, boolean]> = [];
-    type Update = (id: string, f: { width: number; height: number; b64: string; refreshMs: number }) => void;
-    const theBridge: { onEpaperUpdate: Update | null; sendSensorAttach: () => void; sendPinEvent: () => void } = {
-      onEpaperUpdate: null,
-      sendSensorAttach: () => {},
-      sendPinEvent: () => {},
-    };
-    const registered: Array<[string, number]> = [];
-    const esp = {
-      pinManager: { onPinChange: () => () => {} },
-      // What a QEMU shim answers until F4: the board's pins, no SPI port.
-      getBusBinding: () => ({ pins: { onPinChange: () => () => {}, peekPinState: () => undefined }, spi: [] }),
-      getBridge: () => theBridge,
-      registerSensor: (type: string, pin: number) => {
-        registered.push([type, pin]);
-        return true;
-      },
-      unregisterSensor: () => {},
-      setPinState: (pin: number, state: boolean) => driven.push([pin, state]),
-    };
-    const el = document.createElement('velxio-epaper') as HTMLElement;
-    el.setAttribute('panel-kind', 'epaper-7in5-bw');
-    document.body.appendChild(el);
-    const off = PartSimulationRegistry.get('epaper-7in5-bw')!.attachEvents!(
-      el, esp as never, (name: string) => (name === 'BUSY' ? 4 : 5), 'epd-esp',
-    ) as () => void;
-    try {
-      expect(registered).toEqual([['epaper-ssd168x', 5]]);
-      // A frame the worker rendered: the element shows it, the pad is not ours.
-      theBridge.onEpaperUpdate!('epd-esp', { width: 8, height: 1, b64: btoa('\x01'.repeat(8)), refreshMs: 1 });
-      expect((el as unknown as { busy: boolean }).busy).toBe(true);
-      expect(driven).toEqual([]);
-    } finally {
-      off();
-    }
+describe('EPaperPart on the QEMU lane: a sink of the board\'s remote controller port', () => {
+  it('registers no worker slave, decodes what the port delivers and drives BUSY itself', () => {
+    // A QEMU shim always has the remote port (every kind that gets one has a
+    // pin table), so the panel is a device of the fabric there like anywhere
+    // else: no model of it runs in the worker, and the tab is the one writer
+    // of BUSY (a worker driving the pad too disagreed on an UltraChip's level).
+    const r = rig('epaper-1in54-bw', { shim: true });
+    const sim = r.sim as QemuShapedSimulator;
+    expect(sim.registered, 'sensor records sent to the worker').toEqual([]);
+    expect(r.sim.driven, 'BUSY rests idle from the moment the panel is wired').toEqual([[PIN_BUSY, false]]);
+    pump(r, TINY_REFRESH);
+    expect(glassPixel(r.el, 0, 0)).toEqual(INK);
+    expect((r.el as unknown as { busy: boolean }).busy).toBe(true);
+    expect(r.sim.driven.at(-1)).toEqual([PIN_BUSY, true]);
   });
 });
 

@@ -58,7 +58,7 @@
   │           runtime = WasmChipRuntime(wasm_bytes, attrs, _emit)          │
   │           runtime.run_chip_setup()       ← chip declares pins+I2C addr │
   │           slave = WasmChipI2CSlave(runtime.i2c_address, runtime)       │
-  │           _i2c_slaves[runtime.i2c_address] = slave                     │
+  │           _i2c_add(gpio, s, slave, runtime.i2c_addresses)              │
   │                                                                        │
   │   QEMU calls _on_i2c_event(addr, event)  [SYNC, in QEMU thread]        │
   │      → slave.handle_event(event)                                       │
@@ -140,11 +140,21 @@ Inside `esp32_worker.py`, the existing sensor-registration loop gains a new bran
 elif sensor_type == 'custom-chip':
     runtime = WasmChipRuntime(base64.b64decode(s['wasm_b64']),
                               s.get('attrs', {}), _emit)
-    runtime.run_chip_setup()          # populates runtime.i2c_address
+    runtime.run_chip_setup()          # populates runtime.i2c_address and runtime.i2c_addresses
     if runtime.i2c_address is not None:
+        # One slave for every address the chip attached: the table hands
+        # each event the address it names.
         slave = WasmChipI2CSlave(runtime.i2c_address, runtime)
-        _i2c_slaves[runtime.i2c_address] = slave
+        _i2c_add(gpio, s, slave, runtime.i2c_addresses)
 ```
+
+`_i2c_table` is an `I2cBusTable` (`backend/app/services/i2c_bus_table.py`,
+board-buses F5): a registration is an identity, never an address, it holds
+every address the chip attached, and it answers only on the controller the
+tab's bus map (`bus_map.i2c`) says the chip's SDA is wired to (or, when the
+map names a board pin, the one the live GPIO matrix routes there). Two chips
+at one address on one controller both ACK and reads are their wired-AND, with
+an `i2c-address-conflict` diagnostic, as on the bench.
 
 `WasmChipRuntime` uses `wasmtime` to load the WASM with our host imports
 (matching `velxio-chip.h`). Calling `run_chip_setup()` invokes the chip's
@@ -152,17 +162,18 @@ elif sensor_type == 'custom-chip':
 
 - Calls `vx_pin_register` for each pin → handles allocated in Python state
 - Calls `vx_i2c_attach(&cfg)` → host parses the 32-byte config struct from
-  WASM memory and stores `i2c_address` plus the four callback indices
-  (function table indices for `on_connect`/`on_read`/`on_write`/`on_stop`)
+  WASM memory and stores the address plus the four callback indices
+  (function table indices for `on_connect`/`on_read`/`on_write`/`on_stop`);
+  one `vx_i2c_attach` per address a chip answers
 
 ### 3. QEMU dispatches I2C events synchronously
 
 When firmware does `Wire.beginTransmission(0x50)`, QEMU calls:
 
 ```python
-# In _on_i2c_event, after the existing built-in slaves:
-slave = _i2c_slaves.get(addr)        # ← finds our WasmChipI2CSlave
-return slave.handle_event(event)     # SYNC — no thread hop, no WS
+# In _on_i2c_event (bus_id is the controller the guest clocked, I2C0 or I2C1):
+found = _i2c_table.targets(bus_id, addr)             # the slaves on THAT controller at addr
+return _i2c_table.event(bus_id, addr, event, found)  # SYNC: no thread hop, no WS
 ```
 
 `WasmChipI2CSlave.handle_event` decodes the picsimlab op code:
@@ -218,15 +229,19 @@ firmware's critical path.
 - ✅ **`vx_pin_read` → live QEMU GPIO state** via the worker's `_pin_state`
   cache (updated from every `_on_pin_change` event).
 - ✅ `vx_attr_register` / `vx_attr_read` (frontend pushes attrs into the sensor payload)
-- ✅ `vx_i2c_attach` with the 4 callbacks → registers as a `_i2c_slaves[addr]` entry
-- ✅ **`vx_uart_attach` / `vx_uart_write`** — the chip binds to the UART
-  whose TX/RX pins the diagram wires to it (`uart_map` from the frontend),
-  falling back to `CHIP_UART` (Serial1) when nothing is wired. UART0 is never
-  the default: it is the serial monitor. Firmware writes on that UART trigger
-  the chip's `on_rx_byte` synchronously via `_on_uart_tx`; the chip's
-  `vx_uart_write` injects bytes back via `qemu_picsimlab_uart_receive`
+- `vx_i2c_attach` with the 4 callbacks: registers in the `I2cBusTable` by
+  (controller, address), every address the chip attaches, on the controller
+  its SDA is wired to
+- **`vx_uart_attach` / `vx_uart_write`**: the chip is on the guest UART the
+  worker's `uart_bus_table` resolves from the wiring (the live GPIO matrix
+  of the pad its RX leg is on, else the tab's `bus_map.uart`); a chip on no
+  controller hears nothing and is heard by nobody. There is no default unit,
+  neither UART0 (the serial monitor) nor Serial1. Firmware writes on that
+  UART trigger the chip's `on_rx_byte` synchronously via `_on_uart_tx`; the
+  chip's `vx_uart_write` injects bytes back via `qemu_picsimlab_uart_receive`
   (acquiring the IO-thread lock). See
-  [custom-chips-chip-nets.md](./custom-chips-chip-nets.md#uart-binding).
+  [custom-chips-chip-nets.md](./custom-chips-chip-nets.md#uart-binding) and
+  [board-buses.md](./board-buses.md).
 - ✅ **Chip-to-chip nets** — a chip pin wired only to another chip's pin is
   carried by the worker's `ChipNetBus` (`nets` in the payload), and a net
   whose members live in two ESP32 workers is bridged through the frontend
@@ -268,7 +283,7 @@ on ESP32.
 ## How to extend it
 
 Every supported peripheral follows the same shape — pick the matching list
-from the worker (`_chip_i2c_*`, `_chip_uart_runtimes`, `_chip_spi_runtimes`,
+from the worker (`_i2c_table`, `_uart_table`, `_chip_spi_runtimes`,
 `_chip_pin_watch_runtimes`, `_chip_timer_runtimes`), and the runtime exposes
 a public dispatch method that the worker calls synchronously from the QEMU
 thread. To add a new peripheral:

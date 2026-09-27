@@ -4,7 +4,9 @@
  * It follows the pattern the custom-chip API reference documents: arm on CS
  * falling, stop on CS rising, one byte at a time.
  *
- *   MISO  byte n of a transaction is 0xC0 + n (0xC0, 0xC1, ...)
+ *   MISO  byte n of a transaction is `first` + n (0xC0, 0xC1, ... by default;
+ *         the `first` attribute moves the whole run, so a test can arm a
+ *         byte whose top bit is 0 in the CS watch)
  *   MOSI  every byte received is logged when CS rises: "probe rx=11 22"
  *   GROW  a rising edge allocates 320 KB, which grows the WASM memory while
  *         a transfer is armed (a radio or flash model growing a packet buffer)
@@ -21,13 +23,14 @@ typedef struct {
   vx_pin cs, sck, mosi, miso, grow;
   vx_spi spi;
   uint8_t buf[1];
+  uint8_t first;
   uint8_t seq;
   uint8_t rx[32];
   uint32_t n;
 } probe_t;
 
 static void arm(probe_t* s) {
-  s->buf[0] = (uint8_t)(0xC0 + s->seq);
+  s->buf[0] = (uint8_t)(s->first + s->seq);
   vx_spi_start(s->spi, s->buf, 1);
 }
 
@@ -74,6 +77,7 @@ void chip_setup(void) {
   s->grow = vx_pin_register("GROW", VX_INPUT);
   vx_attr mode_attr = vx_attr_register("mode", 0);
   uint32_t mode = (uint32_t)vx_attr_read(mode_attr);
+  s->first = (uint8_t)vx_attr_read(vx_attr_register("first", 0xC0));
 
   vx_spi_config cfg = {
     .sck = s->sck,

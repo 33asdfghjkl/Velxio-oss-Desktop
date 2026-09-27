@@ -77,7 +77,6 @@ export const simulatorMocks = () => {
     this.onBleStatus = null;
     this.onI2cEvent = null;
     this.onI2cTransaction = null;
-    this.onSpiEvent = null;
     this.connect = vi.fn();
     this.disconnect = vi.fn();
     this.connected = true;

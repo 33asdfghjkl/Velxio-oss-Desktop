@@ -19,9 +19,9 @@
  *     uart-tx-contention, and the board hears nothing;
  *   - nothing: the module is on no wire, and no byte reaches any UART.
  *
- * Nothing here classifies pins, picks a UART or falls back to UART0; the old
- * `classifyPin` route did all three (a module on an unknown pin answered on
- * the console) and went with the fabric.
+ * Nothing here classifies pins, picks a UART or falls back to UART0: a module
+ * on a pin no table knew used to answer on the console, and now it is on
+ * whatever wire its TX pad reaches.
  *
  * Time is the GUEST's. The cycle cadence and the byte spacing are measured on
  * the clock the sketch sees (guestMillis: the cycle counter on AVR/RP2040, the

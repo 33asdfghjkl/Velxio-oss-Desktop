@@ -63,8 +63,21 @@ extern int    vx_pin_read(vx_pin p);
  */
 extern void   vx_pin_write(vx_pin p, int value);
 
-/** Read the analog voltage (0.0 .. supply_volts) of a pin. */
+/**
+ * Read the analog voltage of a pin: the voltage the circuit solve publishes
+ * for the net the pin's pad is on (a potentiometer's wiper, a sensor's
+ * output, a board pin the MCU drives), the same number in every host. A pad
+ * on no net, or on a net the solve has no number for, reads 0.0.
+ */
 extern double vx_pin_read_analog(vx_pin p);
+
+/**
+ * 1 when a wire reaches the pin's pad (the diagram puts it on a net), 0 when
+ * the pad is in the air. A model with a UI control that stands in for a
+ * missing wire (an ADC's per-channel slider) reads the control only when this
+ * answers 0: a wired channel is the circuit's, whatever the slider says.
+ */
+extern int    vx_pin_wired(vx_pin p);
 
 /** Drive an analog voltage (volts) on an OUTPUT/ANALOG pin (DAC). */
 extern void   vx_pin_dac_write(vx_pin p, double voltage);

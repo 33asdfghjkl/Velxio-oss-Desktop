@@ -157,7 +157,7 @@ export type I2cMapListener = (boardId: string) => void;
 export type UartMapListener = (boardId: string) => void;
 
 /**
- * One endpoint of the UART map a remote worker is sent (`uart_map`): the
+ * One endpoint of the UART half of the bus map a remote worker is sent: the
  * controller unit that feeds its RX and the one that reads its TX, as the
  * circuit wires them, or null for a leg on no controller (unwired, or on a
  * plain GPIO). Field names are the wire's, which is Python's.

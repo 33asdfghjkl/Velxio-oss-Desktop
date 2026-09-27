@@ -34,6 +34,7 @@ import '../../simulation/parts/CustomChipPart';
 import '../../simulation/parts/EPaperPart';
 import '../../simulation/parts/ComplexParts';
 import { useSimulatorStore } from '../../store/useSimulatorStore';
+import { useElectricalStore } from '../../store/useElectricalStore';
 import { busRegistry } from '../../simulation/buses/registry';
 import type { BusDiagnostic, NetResolver, PinRef, ResolvedPin } from '../../simulation/buses/types';
 
@@ -247,6 +248,7 @@ afterEach(() => {
   frameCallbacks.clear();
   chipLines.length = 0;
   useSimulatorStore.setState({ components: [] } as never);
+  useElectricalStore.getState().reset();
   busRegistry.clear();
   circuit = new Circuit();
   busRegistry.setResolver(circuit);
@@ -673,6 +675,22 @@ describe('a chip on software SPI (Uno)', () => {
     expect({ miso, log: chipLog('probe').at(-1) }).toEqual({ miso: 'C0', log: 'probe rx=5a' });
   });
 
+  // Closed by F8: the bus told the soft decoder to restart, and the decoder
+  // put the first MISO bit on the wire, BEFORE the chip heard its select
+  // edge, so a chip that arms in its CS watch had nothing armed when it was
+  // asked and the idle 1 went out. The probe's 0xC0 has that bit set and
+  // hid it; a first byte of 0x3C read back as 0xBC.
+  it('spibus-setselected-before-device-select: a chip that arms 0x3C in its CS watch puts a 0 on MISO before the first clock', async () => {
+    const { sim, con } = uno();
+    await attachChip(sim, 'probe', 'spi-probe', PROBE_JSON, BITBANG_PROBE, { first: 0x3c });
+    run(sim, con);
+    deselect(con, 4);
+    con.cmd('l 4');
+    const miso = con.cmd('b 5 6 7 5A');
+    con.cmd('h 4');
+    expect({ miso, log: chipLog('probe').at(-1) }).toEqual({ miso: '3C', log: 'probe rx=5a' });
+  });
+
   it('no-bitbang-spi-miso-undriven setup: shiftOut() clocks SRCLK (D3) eight times with the byte on SER (D2), and the sketch reads the Q pins back', async () => {
     const { sim, con } = uno();
     await attachChip(sim, 'sr', 'sn74hc595', galleryJson('sn74hc595'), SR_GPIO);
@@ -721,17 +739,27 @@ describe('a chip on software SPI (Uno)', () => {
 // ── Gallery MCP3008 ─────────────────────────────────────────────────────────
 
 describe('the gallery MCP3008 chip (Uno)', () => {
-  // CS D10, hardware SPI; CH0 wired to D9 (PWM, which is what a chip's analog
-  // input reads), CH1 wired to GND.
+  // CS D10, hardware SPI; CH0 wired to D9, CH1 wired to GND.
   const ADC = { CS: 10, SCK: 13, MOSI: 11, MISO: 12, CH0: 9, CH1: -1 };
+  /** The circuit solve's word on the chip's inputs: CH0's net at `volts`,
+   *  CH1's net is ground. What vx_pin_read_analog answers (padVolts.ts). */
+  const solve = (volts: number, id = 'adc') =>
+    useElectricalStore.setState({
+      pinNetMap: new Map([
+        [`${id}:CH0`, 'pot'],
+        [`${id}:CH1`, '0'],
+      ]),
+      nodeVoltages: { pot: volts },
+    } as never);
+  const V_HALF = (128 / 255) * 5;
+  const counts = (volts: number) => Math.floor((volts / 5) * 1023 + 0.5);
 
-  it('mcp3008-example-returns-1023 setup: the MCP3008 is selected by its CS, decodes a CH0 read and samples CH0 at the PWM level', async () => {
+  it('mcp3008-example-returns-1023 setup: the MCP3008 is selected by its CS, decodes a CH0 read and samples CH0 at the solved voltage', async () => {
     const { sim, con } = uno();
     await attachChip(sim, 'adc', 'mcp3008', galleryJson('mcp3008'), ADC);
     run(sim, con);
-    con.cmd('a 9 128');
+    solve(V_HALF);
     con.cmd('h 10');
-    expect(sim.pinManager.getPwmValue(9)).toBeCloseTo(128 / 255, 5);
     // Six bytes in one CS frame. The chip decodes the CH0 command and puts the
     // conversion, 514 = 0x202, on MISO as 02 02 (the example used to answer
     // it in the frame AFTER the command, which was the finding). "Not the
@@ -754,13 +782,35 @@ describe('the gallery MCP3008 chip (Uno)', () => {
     const { sim, con } = uno();
     await attachChip(sim, 'adc', 'mcp3008', galleryJson('mcp3008'), ADC);
     run(sim, con);
-    con.cmd('a 9 128');
+    solve(V_HALF);
     con.cmd('h 10');
-    const expected = Math.floor((128 / 255) * 1023 + 0.5);
+    const expected = counts(V_HALF);
     expect([mcp3008Read(con, 10, 0), mcp3008Read(con, 10, 1)]).toEqual([expected, 0]);
     // And the same code on the next frame, and the next: the CS edge resets
     // the conversion, nothing of the previous frame carries over.
     expect([mcp3008Read(con, 10, 0), mcp3008Read(con, 10, 0)]).toEqual([expected, expected]);
+  });
+
+  // Closed by F8: the browser runtime used to answer vx_pin_read_analog with
+  // the pad's PWM duty times five, so an ADC chip read a number that is not
+  // the voltage of anything on the canvas (and the worker read the digital
+  // level times five). Both hosts now answer the voltage the circuit solve
+  // publishes for the pad's net, the number VirtualMcp3008 reads.
+  it('vx-pin-read-analog-answers-neither-host-the-solve: with a 50 % PWM on D9, the MCP3008 reads the 2.00 V the solve puts on CH0, not the duty times five', async () => {
+    const { sim, con } = uno();
+    await attachChip(sim, 'adc', 'mcp3008', galleryJson('mcp3008'), ADC);
+    run(sim, con);
+    con.cmd('a 9 128');
+    expect(sim.pinManager.getPwmValue(9)).toBeCloseTo(128 / 255, 5);
+    solve(2.0);
+    con.cmd('h 10');
+    expect(mcp3008Read(con, 10, 0)).toBe(counts(2.0));
+    // The knob turns: the solve moves, and so does the reading.
+    solve(3.5);
+    expect(mcp3008Read(con, 10, 0)).toBe(counts(3.5));
+    // A pad the solve has no number for reads 0 V, as the header says.
+    useElectricalStore.setState({ pinNetMap: new Map(), nodeVoltages: {} } as never);
+    expect(mcp3008Read(con, 10, 0)).toBe(0);
   });
 
   // The chip keeps a transfer armed across the CS edge (its look-ahead byte
@@ -772,9 +822,9 @@ describe('the gallery MCP3008 chip (Uno)', () => {
     attachSd(sim, 8);
     await attachChip(sim, 'adc', 'mcp3008', galleryJson('mcp3008'), ADC);
     run(sim, con);
-    con.cmd('a 9 128');
+    solve(V_HALF);
     deselect(con, 8, 10);
-    const expected = Math.floor((128 / 255) * 1023 + 0.5);
+    const expected = counts(V_HALF);
     // The card's answer would be ANDed with the ADC's 00 bytes if the ADC took
     // the card's frames; the ADC then reads its own frame right after.
     expect({ sd: sdHandshake(con, 8), adc: mcp3008Read(con, 10, 0) }).toEqual({ sd: SD_OK, adc: expected });
@@ -787,10 +837,10 @@ describe('the gallery MCP3008 chip (Uno)', () => {
   // each byte of the master is complete.
   it('no-bitbang-spi-miso-undriven: the gallery MCP3008 answers a bit-banged readadc() on MISO', async () => {
     const { sim, con } = uno();
-    // CS D4, SCK D5, MOSI D6, MISO D7; CH0 on the D9 PWM, CH1 on GND.
+    // CS D4, SCK D5, MOSI D6, MISO D7; CH0 on D9, CH1 on GND.
     await attachChip(sim, 'adc', 'mcp3008', galleryJson('mcp3008'), { CS: 4, SCK: 5, MOSI: 6, MISO: 7, CH0: 9, CH1: -1 });
     run(sim, con);
-    con.cmd('a 9 128');
+    solve(V_HALF);
     con.cmd('r 7');
     deselect(con, 4);
     const readadc = (ch: number): number => {
@@ -801,7 +851,7 @@ describe('the gallery MCP3008 chip (Uno)', () => {
       con.cmd('h 4');
       return ((hi << 4) | (lo >> 4)) & 0x3ff;
     };
-    const expected = Math.floor((128 / 255) * 1023 + 0.5);
+    const expected = counts(V_HALF);
     expect([readadc(0), readadc(1), readadc(0)]).toEqual([expected, 0, expected]);
   });
 });

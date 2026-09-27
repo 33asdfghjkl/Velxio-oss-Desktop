@@ -218,6 +218,11 @@ class WorkerHost:
     def attr(self, name: str, value: float) -> None:
         self.rt.update_attrs({name: float(value)})
 
+    def volts(self, pin: str, volts) -> None:
+        """The tab's solve on a pad, as the worker receives it: a pad_volts
+        table keyed by the chip's pin names, None for a wire that is gone."""
+        self.rt.update_pad_volts({pin: volts})
+
 
 HOST_KEY = "worker"
 
@@ -308,6 +313,8 @@ def replay(host, scenario: dict, host_key: str = HOST_KEY) -> list[str]:
             host.clock(int(st["ns"]))
         elif op == "attr":
             host.attr(st["name"], float(st["value"]))
+        elif op == "volts":
+            host.volts(st["pin"], st.get("volts"))
         elif op == "poke":
             probe.poke(bytes.fromhex(st["hex"]))
         elif op == "trace":

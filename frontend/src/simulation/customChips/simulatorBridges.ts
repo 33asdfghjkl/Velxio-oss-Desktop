@@ -2,8 +2,8 @@
  * Per-simulator bridge state for custom chips.
  *
  * Each simulator family exposes its peripherals differently:
- *   - AVR (avr8js)   — `simulator.usart` / `simulator.i2cBus`
- *   - ESP32 (bridge shim) — `simulator.sendPinEvent`. The shim wraps either
+ *   - AVR (avr8js): `simulator.usart` / `simulator.i2cBus`
+ *   - ESP32 (bridge shim): `simulator.sendPinEvent`. The shim wraps either
  *     the backend QEMU bridge, which hosts custom chips in its worker
  *     (CustomChipPart hands the WASM over and no browser instance exists),
  *     or an overlay's in-browser engine, which answers `hostsCustomChips()`
@@ -23,15 +23,13 @@ export type SimulatorKind = 'avr' | 'rp2040' | 'esp32' | 'unknown';
  * are FINGERPRINTS of the family, never a place to hang a chip: a chip's SPI,
  * I2C and UART bytes all come from the bus fabric.
  *
- * They used to read `spi` and `setSPIHandler` (the F2 transition bridge,
- * gone with F3), then `addI2CDevice` (the I2C one, gone with F5), then
- * `serialWriteByte` (the monitor's byte seam, which the UART bridge of F6
- * needed and nothing needs since; the method is gone). What is left is the
- * fabric's way in, `getBusBinding`, which every engine of the product
- * exposes: the shims are told apart first by `sendPinEvent`, the AVR by its
- * peripherals, and everything else that exposes its buses is the RP family
- * (rp2040js, rp2350js, the XIAO ARM engines, the Pi shim), which for a chip
- * host means "runs in the browser, hosts nothing in a worker".
+ * The fingerprint is the fabric's way in, `getBusBinding`, which every engine
+ * of the product exposes: the shims are told apart first by `sendPinEvent`,
+ * the AVR by its peripherals, and everything else that exposes its buses is
+ * the RP family (rp2040js, rp2350js, the XIAO ARM engines, the Pi shim),
+ * which for a chip host means "runs in the browser, hosts nothing in a
+ * worker". It sniffs no bus method on purpose: those come and go with the
+ * bus model, the binding is the contract.
  */
 export function detectSimulatorKind(simulator: any): SimulatorKind {
   if (!simulator) return 'unknown';

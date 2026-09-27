@@ -131,8 +131,8 @@ describe('sensor records on the ESP32 bridge', () => {
 
   it('only single-wire kinds own pads', async () => {
     const { sensorRecordOwnsPin } = await import('../simulation/Esp32Bridge');
-    // An ePaper panel registers real GPIOs too; the host must keep driving them.
-    expect(sensorRecordOwnsPin({ sensor_type: 'epaper-ssd168x', pin: 10, dc_pin: 9 }, 9)).toBe(false);
+    // A record of a kind that is no sensor at all owns nothing, whatever pins it names.
+    expect(sensorRecordOwnsPin({ sensor_type: 'custom-chip', pin: 10, dc_pin: 9 }, 9)).toBe(false);
     expect(sensorRecordOwnsPin({ sensor_type: 'hc-sr04', pin: 21, echo_pin: 41 }, 41)).toBe(true);
   });
 });
@@ -175,14 +175,6 @@ describe('models that own a pad without being single-wire', () => {
     const kp = { sensor_type: 'matrix-keypad', pin: 13, rows: [13, 12, 14, 27], cols: [26, 25, 33, 32] };
     for (const p of [13, 12, 14, 27, 26, 25, 33, 32]) expect(sensorRecordOwnsPin(kp, p)).toBe(true);
     expect(sensorRecordOwnsPin(kp, 4)).toBe(false); // not a keypad wire
-  });
-
-  it('an ePaper panel owns BUSY and nothing else', async () => {
-    const { sensorRecordOwnsPin } = await import('../simulation/sensorModels');
-    // DC / CS / RST are host-driven — blocking those would strand the panel.
-    const ep = { sensor_type: 'epaper-ssd168x', pin: 17, dc_pin: 17, cs_pin: 5, rst_pin: 16, busy_pin: 4 };
-    expect(sensorRecordOwnsPin(ep, 4)).toBe(true);
-    for (const p of [17, 5, 16]) expect(sensorRecordOwnsPin(ep, p)).toBe(false);
   });
 
   it('a kind that owns nothing answers false for every pad', async () => {

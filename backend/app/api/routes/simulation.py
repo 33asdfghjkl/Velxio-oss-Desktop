@@ -301,29 +301,6 @@ async def simulation_websocket(websocket: WebSocket, client_id: str):
                 else:
                     esp_qemu_manager.sensor_detach(client_id, pin)
 
-            # ── Cross-board I2C proxy: register a peer board's device on QEMU ──
-            # Used when an ESP32 is wired to another board's I2C bus (Uno, Pico,
-            # …) and that peer board has a virtual device the ESP32 firmware
-            # should be able to read.  The frontend snapshots the device's
-            # register state and pushes it here; the worker installs a
-            # ProxySlave at the address.
-            elif msg_type == 'esp32_proxy_i2c_register':
-                addr = int(msg_data.get('addr', 0)) & 0x7F
-                regs_b64 = msg_data.get('regs_b64', '')
-                if _use_lib():
-                    esp_lib_manager.proxy_i2c_register(client_id, addr, regs_b64)
-
-            elif msg_type == 'esp32_proxy_i2c_update':
-                addr = int(msg_data.get('addr', 0)) & 0x7F
-                regs_b64 = msg_data.get('regs_b64', '')
-                if _use_lib():
-                    esp_lib_manager.proxy_i2c_update(client_id, addr, regs_b64)
-
-            elif msg_type == 'esp32_proxy_i2c_unregister':
-                addr = int(msg_data.get('addr', 0)) & 0x7F
-                if _use_lib():
-                    esp_lib_manager.proxy_i2c_unregister(client_id, addr)
-
             # ── ESP32-CAM camera frame injection ───────────────────────────
             # Browser pushes JPEGs from getUserMedia. Backend forwards to the
             # worker which writes them into the I²S camera peripheral.

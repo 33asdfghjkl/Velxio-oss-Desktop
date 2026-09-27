@@ -17,6 +17,7 @@ import { requestElectricalResolve } from '../spice/electricalResolveHook';
 import { chipBusEnabled } from './chipNets';
 import { setBusDrive, setBoardPinDrive, clearBusDriversForChip } from './busNets';
 import { modeToDrive, Strength, HIGHZ_DRIVE } from './busLogic';
+import { padNet, padVolts } from './padVolts';
 
 function readCString(memory: WebAssembly.Memory, ptr: number): string {
   const u8 = new Uint8Array(memory.buffer);
@@ -187,22 +188,10 @@ export function chipUartOwner(componentId: string, handle: number): string {
   return handle === 0 ? componentId : `${componentId}:uart${handle}`;
 }
 
-/**
- * A test's stand-in for the bus fabric: it takes the chip's I2C devices, one
- * per vx_i2c_attach, and drives them byte by byte itself. The canvas hosts
- * never pass one; with it, the chip's wiring decides nothing.
- */
-export interface ChipI2cTestHost {
-  addDevice(device: ChipI2cDevice): void;
-  removeDevice(address: number): void;
-}
-
 export interface ChipInstanceOptions {
   /** Compiled chip.wasm — either bytes, ArrayBuffer, or pre-compiled Module. */
   wasm: Uint8Array | ArrayBuffer | WebAssembly.Module;
   pinManager: PinManager;
-  /** A unit test's host for the chip's I2C devices (see ChipI2cTestHost). */
-  i2cBus?: ChipI2cTestHost | null;
   /**
    * The canvas pad each chip pin is, when the two are named apart (a Grove
    * module whose chip calls its second address's pins SDA2/SCL2, both on the
@@ -217,6 +206,16 @@ export interface ChipInstanceOptions {
    * a remote bus as missing unless the worker holds one of these for it.
    */
   remoteModel?: string | null;
+  /**
+   * Whether this copy of the chip drives what it puts on a wire itself, read
+   * per byte. False while a worker's copy of the same chip answers the guest
+   * (the QEMU fallback of a delegating ESP32 engine): this copy still hears
+   * the bytes, and paints from them, but a second answer on the wire would be
+   * a second driver. Today that is the UART bytes of vx_uart_write; a pin
+   * level reaches the board through the host's own hooks, which gate
+   * themselves. Absent: always.
+   */
+  drivesWires?: () => boolean;
   /** Logical chip pin name → real Arduino pin number (resolved from wires). */
   wires?: Map<string, number>;
   /** User-editable attributes — keyed by name. */
@@ -262,9 +261,9 @@ export class ChipInstance {
 
   private wasm: ChipInstanceOptions['wasm'];
   private pinManager: PinManager;
-  private i2cBus: ChipI2cTestHost | null;
   private busPads: Record<string, string>;
   private remoteModel: string | undefined;
+  private drivesWires: (() => boolean) | null;
   private wires: Map<string, number>;
   private attrs: Map<string, number>;
   private strAttrs: Map<string, string>;
@@ -347,7 +346,7 @@ export class ChipInstance {
   constructor(opts: ChipInstanceOptions) {
     this.wasm = opts.wasm;
     this.pinManager = opts.pinManager;
-    this.i2cBus = opts.i2cBus ?? null;
+    this.drivesWires = opts.drivesWires ?? null;
     this.busPads = opts.busPads ?? {};
     this.remoteModel = opts.remoteModel ?? undefined;
     this.wires = opts.wires ?? new Map();
@@ -581,7 +580,6 @@ export class ChipInstance {
     this.timers = [];
     for (const g of this.i2cGroups) g.bus?.dispose();
     this.i2cGroups = [];
-    if (this.i2cBus) for (const e of this.i2cDevices) this.i2cBus.removeDevice(e.device.address);
     this.i2cDevices = [];
     for (const e of this.spiDevices) e.bus?.dispose();
     this.spiDevices = [];
@@ -601,6 +599,7 @@ export class ChipInstance {
       vx_pin_read:        (handle: number) => this._pin_read(handle),
       vx_pin_write:       (handle: number, value: number) => this._pin_write(handle, value),
       vx_pin_read_analog: (handle: number) => this._pin_read_analog(handle),
+      vx_pin_wired: (handle: number) => this._pin_wired(handle),
       vx_pin_dac_write:   (handle: number, voltage: number) => this._pin_dac_write(handle, voltage),
       vx_pin_pwm_write:   (handle: number, duty: number) => this._pin_pwm_write(handle, duty),
       vx_pin_set_mode:    (handle: number, mode: number) => this._pin_set_mode(handle, mode),
@@ -886,10 +885,37 @@ export class ChipInstance {
     this._syncSpiceDrive(p);
   }
 
+  /**
+   * The voltage on the pin's pad, as the circuit solve publishes it for the
+   * pad's net (padVolts): what an ADC model samples. 0 for a pad on no net,
+   * or on a net the solve has no number for. It used to answer the pad's PWM
+   * duty times five, which is not a voltage of anything on the canvas, while
+   * the worker answered the digital level times five (finding
+   * vx-pin-read-analog-answers-neither-host-the-solve); both hosts now read
+   * the same published number.
+   */
   private _pin_read_analog(handle: number): number {
     const p = this.pins[handle];
-    if (!p || p.arduinoPin == null) return 0;
-    return this.pinManager.getPwmValue(p.arduinoPin) * 5.0;
+    if (!p) return 0;
+    return padVolts(this.componentId, this._padOf(p)) ?? 0;
+  }
+
+  /**
+   * 1 when a wire reaches the pin's pad: the diagram puts it on a net, or the
+   * host's wiring map resolved it to a board or chip-net pin. A model whose
+   * UI control stands in for a missing wire reads the control only when this
+   * answers 0.
+   */
+  private _pin_wired(handle: number): number {
+    const p = this.pins[handle];
+    if (!p) return 0;
+    if (p.arduinoPin != null) return 1;
+    return padNet(this.componentId, this._padOf(p)) !== undefined ? 1 : 0;
+  }
+
+  /** The component pad a chip pin is (see ChipInstanceOptions.busPads). */
+  private _padOf(p: PinEntry): string {
+    return this.busPads[p.name] ?? p.name;
   }
 
   private _pin_dac_write(handle: number, voltage: number): void {
@@ -1066,9 +1092,9 @@ export class ChipInstance {
        display waits for its command byte, a memory stages the bytes it is
        about to hand over.
        The bus fabric announces it: every START and repeated START that names
-       this address calls connect(). A test host handed in as `i2cBus` may
-       not, so the phase is also read off the byte stream, which carries it
-       exactly:
+       this address calls connect(). The byte stream carries it exactly as
+       well, and the phase is read off it too, so no caller of the device can
+       skip it:
        the first write after anything else IS the write phase starting, and
        the first read after a write IS a REPEATED START, the master keeping
        the bus and turning it around.
@@ -1121,10 +1147,6 @@ export class ChipInstance {
       device,
     };
     this.i2cDevices.push(entry);
-    if (this.i2cBus) {
-      this.i2cBus.addDevice(device);
-      return 0;
-    }
     if (!entry.scl || !entry.sda) {
       // No pad to resolve: nothing on a bench would ever clock it either.
       this.wasi.writeStdout(
@@ -1275,8 +1297,9 @@ export class ChipInstance {
     const bytes = u8.slice(bufPtr, bufPtr + count);
     for (const b of bytes) {
       // The wire: the fabric puts the byte on the TX pad's net (into the
-      // controller whose RX is there, or as edges on a plain GPIO).
-      u.bus?.transmit(b);
+      // controller whose RX is there, or as edges on a plain GPIO), unless
+      // another copy of this chip is the one driving it right now.
+      if (!this.drivesWires || this.drivesWires()) u.bus?.transmit(b);
       // The host's ear, if it has one.
       this._uartTxListener?.(b);
     }

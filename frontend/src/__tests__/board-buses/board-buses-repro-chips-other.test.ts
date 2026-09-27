@@ -31,6 +31,7 @@ import type { Root } from 'react-dom/client';
 import { JSDOM } from 'jsdom';
 import { populateGlobal } from 'vitest/runtime';
 import { AVRSimulator } from '../../simulation/AVRSimulator';
+import { RP2040Simulator } from '../../simulation/RP2040Simulator';
 import { PinManager } from '../../simulation/PinManager';
 import { PartSimulationRegistry } from '../../simulation/parts';
 import { ChipInstance } from '../../simulation/customChips/ChipRuntime';
@@ -72,6 +73,8 @@ const chipB64 = (name: string) =>
   readFileSync(fx(`chips-other-chips/${name}.wasm`)).toString('base64');
 const chipBytes = (name: string) => new Uint8Array(readFileSync(fx(`chips-other-chips/${name}.wasm`)));
 
+/** The same pulse-snoop sketch built for the Pico (fixtures/chips-other-pulse-snoop/pico/). */
+const PICO_PULSE_SNOOP = readFileSync(fx('chips-other-pulse-snoop/pico/pulse-snoop.ino.bin')).toString('base64');
 const HEX = {
   uartPing: sketch('uart-ping', 'uart-ping'),
   clock: sketch('clock', 'clock-probe'),
@@ -79,6 +82,7 @@ const HEX = {
   pulseSnoop: sketch('pulse-snoop', 'pulse-snoop'),
   i2cScan: sketch('i2c-scan', 'i2c-scan'),
   spiRead: sketch('spi-read', 'spi-read'),
+  latchDance: sketch('latch-dance', 'latch-dance'),
 };
 
 // ── Harness ─────────────────────────────────────────────────────────────────
@@ -616,6 +620,113 @@ describe('chip reads a board pin another part drives', () => {
   });
 
   it(`${ID}: the chip counts the four edges the tilt switch puts on D2, and OVF toggles back to 0`, async () => {
+    const { phase2 } = await scenario();
+    expect(phase2).toContain('rise 4');
+    expect(phase2).toContain('ovf=0');
+  });
+});
+
+// ── 5a. An input pin's latch is not a level on the wire ─────────────────────
+//
+// Uno + the plain-output chip holding D2 LOW from the moment it is placed
+// (its B leg is VX_OUTPUT_LOW) + the gallery pulse counter (threshold 1)
+// watching D2, OVF on D4. The sketch enables INPUT_PULLUP on D2 and disables
+// it again: a PORT write on a pin whose DDR says input. The wire never moves
+// (a push-pull output beats the pull-up), so the watcher must see no edge.
+// PinManager.updatePort used to write the latch onto the level channel after
+// reporting the pad, and the AVR's pull seed wrote it once more before, so
+// the counter saw two rising edges per pinMode(INPUT_PULLUP) while the sketch
+// read 0 throughout.
+
+describe('an input pin latch on a pin a chip holds', () => {
+  const ID = 'pinmanager-updateport-input-latch-glitch';
+
+  async function scenario() {
+    const board = uno(HEX.latchDance);
+    await attachChip(board.sim, 'hold', 'plain-output', ['A', 'B', 'T', 'GND', 'VCC'], { B: 2 });
+    await attachChip(
+      board.sim,
+      'pc-latch',
+      'pulse-counter',
+      ['PULSE', 'OVF', 'RST', 'GND', 'VCC'],
+      { PULSE: 2, OVF: 4 },
+      { threshold: 1 },
+    );
+    const wire: boolean[] = [];
+    const ovf: boolean[] = [];
+    cleanups.push(board.sim.pinManager.onPinChange(2, (_p, st) => wire.push(st)));
+    cleanups.push(board.sim.pinManager.onPinChange(4, (_p, st) => ovf.push(st)));
+    runUntil(board.sim, 200, () => board.out().includes('DONE'));
+    return { out: board.out(), wire, ovf };
+  }
+
+  it(`${ID} setup: the sketch runs, reads D2 low under its own pull-up, and the chip holds D2`, async () => {
+    const { out } = await scenario();
+    expect(out).toContain('READY');
+    expect(out).toContain('v=0');
+    expect(out).toContain('DONE');
+  });
+
+  it(`${ID}: enabling INPUT_PULLUP on the held pin puts no edge on the wire, and the counter never fires`, async () => {
+    const { wire, ovf } = await scenario();
+    expect(wire.filter((s) => s)).toEqual([]);
+    expect(ovf).toEqual([]);
+  });
+});
+
+// ── 5b. The same, on the Pico ───────────────────────────────────────────────
+//
+// The RP2040 port of the row above: pulse-snoop built for the Pico (GP2 in,
+// GP4 out), the gallery pulse counter and the same tilt-switch part. The
+// injection door is RP2040Simulator.setPinState, which used to move the
+// pad's input register and nothing else (the AVR was the only engine whose
+// door reached the level channel), so the sketch saw every edge and the chip
+// none.
+
+describe('chip reads a board pin another part drives (Pico)', () => {
+  const ID = 'chip-board-pin-read-blind-to-other-parts';
+
+  async function scenario() {
+    const sim = new RP2040Simulator(new PinManager());
+    sim.loadBinary(PICO_PULSE_SNOOP);
+    let out = '';
+    sim.onSerialData = (ch) => {
+      out += ch;
+    };
+    cleanups.push(() => sim.stop());
+    await attachChip(sim, 'pc-pico', 'pulse-counter', ['PULSE', 'OVF', 'RST', 'GND', 'VCC'], {
+      PULSE: 2,
+      OVF: 4,
+    });
+    const tilt = document.createElement('div');
+    const detachTilt = PartSimulationRegistry.get('tilt-switch')!.attachEvents!(
+      tilt,
+      sim as never,
+      (pin: string) => (pin === 'OUT' ? 2 : null),
+      'tilt-pico',
+    );
+    if (detachTilt) cleanups.push(detachTilt);
+    // The production scheduler's 10 ms frames, on simulated time.
+    for (let t = 0; t < 1500 && !out.includes('phase2'); t += 10) sim.runFrameForTime(10);
+    sim.runFrameForTime(5);
+    const phase1 = out;
+    out = '';
+    for (let i = 0; i < 8; i++) {
+      tilt.dispatchEvent(new Event('click'));
+      sim.runFrameForTime(5);
+    }
+    sim.runFrameForTime(10);
+    return { phase1, phase2: out };
+  }
+
+  it(`${ID} setup (Pico): the chip counts MCU-driven edges, and the sketch sees the tilt switch's edges`, async () => {
+    const { phase1, phase2 } = await scenario();
+    expect(phase1).toContain('READY');
+    expect(phase1).toContain('mcu ovf=1');
+    expect(phase2).toContain('rise 4');
+  });
+
+  it(`${ID} (Pico): the chip counts the four edges the tilt switch puts on GP2, and OVF toggles back to 0`, async () => {
     const { phase2 } = await scenario();
     expect(phase2).toContain('rise 4');
     expect(phase2).toContain('ovf=0');

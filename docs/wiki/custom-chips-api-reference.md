@@ -125,8 +125,29 @@ TX into a plain level in an IO mode relies on that).
 double vx_pin_read_analog(vx_pin p);
 ```
 
-Read the analog voltage of a pin (0.0 V – 5.0 V on AVR, 0.0 V – 3.3 V on
-ESP32). Used by ADC chips to sample voltages from potentiometers or sensors.
+Read the analog voltage of a pin: the voltage the circuit solve publishes
+for the net the pin's pad is on (a potentiometer's wiper, a sensor's output,
+a board pin the MCU drives), the same number in every host. A pad on no
+net, or on a net the solve has no number for, reads `0.0`. In the browser
+the runtime reads the electrical store's solve for the pad's net; a chip
+hosted in a QEMU worker or beside the Raspberry Pi guest is handed the same
+numbers as `pad_volts`, published by the tab with the chip's record and
+again on every solve that moves one of its pads (`null` for a wire that was
+removed). Before 2026-09 (board-buses F8) the browser answered the pin's PWM
+duty times five and the worker its digital level times five, so an ADC
+model written against either read the wrong voltage on a real wiper.
+
+### `vx_pin_wired`
+
+```c
+int vx_pin_wired(vx_pin p);
+```
+
+`1` when a wire reaches the pin's pad (the diagram puts it on a net), `0`
+when the pad is in the air. A model with a UI control that stands in for a
+missing wire (an ADC with a slider per channel) reads the control only when
+this answers `0`: a wired channel is the circuit's, whatever the slider
+says.
 
 ### `vx_pin_dac_write`
 

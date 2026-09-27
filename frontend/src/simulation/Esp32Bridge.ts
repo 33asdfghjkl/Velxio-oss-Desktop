@@ -287,45 +287,21 @@ export class Esp32Bridge {
   onWs2812Update: ((channel: number, pixels: Ws2812Pixel[], pin?: number | null) => void) | null =
     null;
   /**
-   * ePaper SSD168x backend rendering. Backend decodes SPI traffic in
-   * `Ssd168xEpaperSlave` and emits this event on every 0x20
-   * MASTER_ACTIVATION with a base64-encoded palette buffer (1 byte/pixel:
-   * 0=black, 1=white, 2=red). One subscriber per `componentId`; multiple
-   * panels on the same board are routed by ID.
-   */
-  onEpaperUpdate:
-    | ((
-        componentId: string,
-        frame: { width: number; height: number; b64: string; refreshMs: number },
-      ) => void)
-    | null = null;
-  /**
    * A worker-hosted custom chip painted its framebuffer. The QEMU path runs the
    * chip's WASM next to the guest, so its pixels arrive here: the RGBA rows
    * y0..y1 (inclusive) the chip touched since the last flush, zlib-deflated
    * and base64 (esp32_worker `chip_framebuffer`, ~20 fps ceiling). Routed by
-   * componentId to the chip's element, like ePaper frames.
+   * componentId to the chip's element.
    */
   onChipFramebuffer: ((componentId: string, frame: ChipFramebufferFrame) => void) | null = null;
   onI2cEvent: ((addr: number, data: number) => void) | null = null;
   onI2cTransaction: ((addr: number, data: number[]) => void) | null = null;
   /**
-   * Fires when the backend's `ProxySlave` emits a completed write
-   * transaction (one full master write phase, terminated by STOP or
-   * repeated-START).  Used by Interconnect / Esp32BridgeShim to
-   * replay the bytes onto the actual frontend peer device so its
-   * state stays consistent with what the ESP32 firmware "wrote".
-   */
-  onProxyI2cComplete: ((addr: number, data: number[]) => void) | null = null;
-  onSpiEvent: ((data: number) => void) | null = null;
-  /** Same as onSpiEvent but more explicit (a single MOSI byte). */
-  onSpiByte: ((mosi: number) => void) | null = null;
-  /**
-   * A whole batch of MOSI bytes the guest clocked, in order. Preferred over
-   * onSpiByte: the bus fabric takes a block in one call (its selection cannot
-   * change inside a batch, because the worker flushes before every chip-select
-   * and pin edge), which is what keeps a full-screen TFT redraw off the
-   * per-byte path.
+   * A whole batch of MOSI bytes the guest clocked, in order: the bus fabric
+   * takes a block in one call (its selection cannot change inside a batch,
+   * because the worker flushes before every chip-select and pin edge), which
+   * is what keeps a full-screen TFT redraw off a per-byte path. Bytes reach
+   * the tab through this and nothing else.
    */
   onSpiBatch: ((mosi: Uint8Array) => void) | null = null;
   /** Fires on every CS line change emitted by the SoC's SPI peripheral.
@@ -630,16 +606,6 @@ export class Esp32Bridge {
           this.onWs2812Update?.(channel, pixels, pin ?? null);
           break;
         }
-        case 'epaper_update': {
-          const componentId = msg.data.component_id as string;
-          this.onEpaperUpdate?.(componentId, {
-            width: msg.data.width as number,
-            height: msg.data.height as number,
-            b64: msg.data.frame_b64 as string,
-            refreshMs: (msg.data.refresh_ms as number) ?? 50,
-          });
-          break;
-        }
         case 'chip_framebuffer': {
           const componentId = msg.data.component_id as string;
           if (!componentId) break; // an older worker payload: nowhere to route it
@@ -664,40 +630,17 @@ export class Esp32Bridge {
           this.onI2cTransaction?.(addr, data);
           break;
         }
-        case 'proxy_i2c_complete': {
-          // Backend `ProxySlave` saw a full I2C write transaction from
-          // the ESP32 firmware and is forwarding the bytes back so the
-          // frontend can replay them on the actual peer device.  The
-          // peer's `I2CDevice.writeByte` handles its own state machine
-          // (pointer-byte first, then data) — we just hand off the
-          // sequence in order.
-          const addr = msg.data.addr as number;
-          const data = msg.data.data as number[];
-          this.onProxyI2cComplete?.(addr, data);
-          break;
-        }
         case 'spi_batch': {
-          // Worker batches consecutive MOSI bytes from a single SPI
-          // transaction into one base64-encoded message. Replays each
-          // byte through the same callbacks the per-byte spi_event path
-          // uses — parts that subscribed to onSpiByte don't notice. See
-          // backend/app/services/esp32_worker.py::_on_spi_event for the
-          // batching policy (flush on CS HIGH or buffer cap).
+          // Every MOSI byte the guest clocked since the worker last flushed
+          // (before a chip-select or pin edge, or at its buffer cap: see
+          // backend/app/services/esp32_worker.py::_on_spi_event), as one
+          // block for the fabric's remote port.
           const b64 = msg.data.b64 as string;
-          if (b64) {
+          if (b64 && this.onSpiBatch) {
             const bin = atob(b64);
-            if (this.onSpiBatch) {
-              const bytes = new Uint8Array(bin.length);
-              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-              this.onSpiBatch(bytes);
-            }
-            const handler = this.onSpiByte ?? this.onSpiEvent;
-            if (handler) {
-              for (let i = 0; i < bin.length; i++) {
-                const m = bin.charCodeAt(i);
-                handler(m);
-              }
-            }
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            this.onSpiBatch(bytes);
           }
           break;
         }
@@ -707,16 +650,13 @@ export class Esp32Bridge {
           //   event = ((cs<<1)|level) << 8 | 0x01 (op == 0x01)     → CS line change
           // See backend/app/services/esp32_worker.py::_on_spi_event.
           //
-          // After the batching change, the byte transfer path goes
-          // through 'spi_batch' instead. This branch now only fires for
-          // CS-line changes (op == 0x01), but we keep the byte branch
-          // for backwards compatibility with older worker builds.
+          // Bytes travel in 'spi_batch'; a worker of this build sends only
+          // chip-select edges here. A single byte from an older worker is a
+          // block of one, so it still reaches the fabric in order.
           const event = msg.data.event as number;
           const op = (event ?? 0) & 0xff;
           if (op === 0x00) {
-            const mosi = (event >> 8) & 0xff;
-            this.onSpiEvent?.(mosi);
-            this.onSpiByte?.(mosi);
+            this.onSpiBatch?.(Uint8Array.of((event >> 8) & 0xff));
           } else if (op === 0x01) {
             const csIdx = (event >> 9) & 0x3;
             const level = (event >> 8) & 0x1;
@@ -816,11 +756,11 @@ export class Esp32Bridge {
    * pin are kept, entries with the same pin are replaced.  An earlier
    * implementation did `this._pendingSensors = sensors` (full replace) which
    * blew away anything PartSimulationRegistry handlers had already
-   * registered via `sendSensorAttach` (e.g. the ePaper SPI slaves on
-   * virtual pins) the moment `startBoard` later called `setSensors` with
-   * only the wire-resolved sensors it knew about (DHT22, HC-SR04, …).
-   * That dropped the ePaper slave registration on every Run click, and the
-   * 5.65" UC8159c panel sat unresponsive while its firmware busy-waited.
+   * registered via `sendSensorAttach` (a device on a virtual pin) the moment
+   * `startBoard` later called `setSensors` with only the wire-resolved
+   * sensors it knew about (DHT22, HC-SR04, ...). That dropped every early
+   * registration on every Run click; the first victim was a display whose
+   * firmware then busy-waited on a model the worker never built.
    */
   setSensors(sensors: Array<Record<string, unknown>>): void {
     this._pendingSensors = upsertSensorRecords(this._pendingSensors, sensors);
@@ -883,8 +823,9 @@ export class Esp32Bridge {
 
   ownsSensorPin(gpioPin: number): boolean {
     // ONLY the single-wire sensors own a pad. The same channel registers plenty
-    // of other things — an ePaper panel's DC/BUSY pins, every I2C device on a virtual 200+addr pin — and those still need
-    // the host to drive their real GPIOs. Blocking those was the difference
+    // of other things (every I2C device on a virtual 200+addr pin, a
+    // worker-hosted chip) and those still need the host to drive their real
+    // GPIOs. Blocking those was the difference
     // between this guard and the in-browser engines' narrow
     // SingleWireSensorHub.ownsPin, which is the behaviour to match.
     return this._pendingSensors.some((s) => recordOwnsPin(s, gpioPin));
@@ -966,53 +907,16 @@ export class Esp32Bridge {
     this._send({ type: 'esp32_i2c_response', data: { addr, response } });
   }
 
-  // ── Cross-board I2C proxy ─────────────────────────────────────────────────
-  // The backend hosts a `ProxySlave` at each registered address that responds
-  // with the register dump pushed by the frontend.  Used when an ESP32 is
-  // wired to another board's I2C bus and that peer board owns a virtual
-  // device — the ESP32 firmware needs to read it synchronously inside QEMU,
-  // which a WebSocket round-trip per byte can't deliver.  The proxy snapshot
-  // is good enough for chip-id reads, calibration constants, and any device
-  // whose state changes slowly relative to the ESP32 firmware's poll cadence.
-
-  /**
-   * Install a proxy I2C slave at `addr` initialised with the given register
-   * dump (up to 256 bytes).  Pushed lazily — buffered until WS opens.
-   */
-  registerProxyI2c(addr: number, registers: Uint8Array): void {
-    const regs_b64 = btoa(String.fromCharCode(...registers));
-    this._send({
-      type: 'esp32_proxy_i2c_register',
-      data: { addr: addr & 0x7f, regs_b64 },
-    });
-  }
-
-  /** Refresh the register state of an existing proxy slave at `addr`. */
-  updateProxyI2c(addr: number, registers: Uint8Array): void {
-    const regs_b64 = btoa(String.fromCharCode(...registers));
-    this._send({
-      type: 'esp32_proxy_i2c_update',
-      data: { addr: addr & 0x7f, regs_b64 },
-    });
-  }
-
-  /** Remove the proxy slave at `addr` (called on bridge teardown). */
-  unregisterProxyI2c(addr: number): void {
-    this._send({
-      type: 'esp32_proxy_i2c_unregister',
-      data: { addr: addr & 0x7f },
-    });
-  }
-
   /**
    * Who is on this board's SPI bus and how each one is selected (project
    * board-buses-2026-09, F4). The whole map travels every time, so a device
    * the user deleted is gone by being absent rather than by a second message
    * nobody can be sure arrived.
    *
-   * It replaced setSpiResponse, which sent one MISO byte per socket message
-   * for a byte the guest had already clocked: the worker applied it to
-   * whatever byte it happened to be clocking when it arrived.
+   * A per-byte answer over the socket cannot do this job: it leaves after the
+   * byte it answers was clocked, and the worker would apply it to whatever
+   * byte it happened to be clocking when it arrived. So what answers travels
+   * as a model, in the map.
    */
   sendBusMap(spi: unknown[], i2c?: unknown[], uart?: unknown[]): void {
     this._busMap = spi;
@@ -1061,10 +965,10 @@ export class Esp32Bridge {
   /** The last map, replayed after a reconnect: the worker starts empty. */
   private _busMap: unknown[] = [];
   /** The last I2C half, or null when none was ever given (a worker then keeps
-   *  every I2C target on every controller, as before F5). */
+   *  every I2C target on every controller). */
   private _busMapI2c: unknown[] | null = null;
   /** The last UART half, or null when none was ever given (a worker then
-   *  leaves every chip on the UART its own record named, as before F6). */
+   *  keeps every UART chip silent: a record no map places is on no unit). */
   private _busMapUart: unknown[] | null = null;
 
   private startBusMap(): { spi: unknown[]; i2c?: unknown[]; uart?: unknown[] } {

@@ -253,7 +253,7 @@ async function chip(
   boardId: string,
   componentId: string,
   wires: Record<string, number>,
-  extra: { busPads?: Record<string, string> } = {},
+  extra: { busPads?: Record<string, string>; drivesWires?: () => boolean } = {},
 ): Promise<{ inst: ChipInstance; said: string[] }> {
   const said: string[] = [];
   const inst = await ChipInstance.create({
@@ -307,6 +307,26 @@ describe('ChipRuntime: a chip is on the wires its vx_uart_config pads reach', ()
     uart2.transmit([G]);
     expect(ear.length).toBe(96);
     expect(uart2.received).toEqual(ear);
+  });
+
+  it('drivesWires false keeps the chip off the wire while it still hears it: a copy whose worker twin answers', async () => {
+    // The QEMU fallback of a delegating ESP32 engine: the worker runs a copy
+    // of this chip and answers the guest; this copy paints from what it hears
+    // and must not answer a second time. The gate is the runtime's, read per
+    // byte, so a host flips it without registering a second endpoint.
+    const { id, uart2 } = browserEsp32();
+    wire(id, 'chip-a', { RX: 'D17', TX: 'D16' });
+    let owns = false;
+    const { inst, said } = await chip(id, 'chip-a', { RX: 17, TX: 16 }, { drivesWires: () => owns });
+    const ear: number[] = [];
+    inst.onUartTx((b) => ear.push(b));
+    uart2.transmit([G]);
+    expect(heard(said)).toEqual([G]);
+    expect(ear.length, 'the ear hears the burst').toBe(96);
+    expect(uart2.received, 'the wire carries nothing while another copy drives it').toEqual([]);
+    owns = true;
+    uart2.transmit([G]);
+    expect(uart2.received.length).toBe(96);
   });
 
   it('pads wired to nothing are on no wire: no controller feeds the chip and nothing it writes lands anywhere', async () => {

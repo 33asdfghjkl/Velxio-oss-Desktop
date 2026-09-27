@@ -160,15 +160,6 @@ async function runFirmware(
   firmwareB64: string,
   timeoutMs: number,
   stopWhen?: (r: RunResult) => boolean,
-  options?: {
-    /**
-     * Proxy I2C devices to install on the backend ProxySlave registry
-     * once the worker reports `booted`.  Each entry mirrors the
-     * register dump of a peer board's virtual device so the ESP32
-     * firmware can read it synchronously inside QEMU.
-     */
-    proxyI2c?: Array<{ addr: number; registers: Uint8Array }>;
-  },
 ): Promise<RunResult> {
   const url = BACKEND_URL.replace(/^http/, 'ws') + `/api/simulation/ws/test-${Date.now()}`;
   const ws = new WebSocket(url);
@@ -191,22 +182,8 @@ async function runFirmware(
     }),
   );
 
-  function sendProxies(): void {
-    const entries = options?.proxyI2c ?? [];
-    for (const e of entries) {
-      const regs_b64 = Buffer.from(e.registers).toString('base64');
-      ws.send(
-        JSON.stringify({
-          type: 'esp32_proxy_i2c_register',
-          data: { addr: e.addr & 0x7f, regs_b64 },
-        }),
-      );
-    }
-  }
-
   await new Promise<void>((resolve) => {
     const deadline = Date.now() + timeoutMs;
-    let proxiesSent = false;
     const tick = setInterval(() => {
       if (Date.now() >= deadline || (stopWhen && stopWhen(result))) {
         clearInterval(tick);
@@ -240,12 +217,6 @@ async function runFirmware(
         case 'system': {
           const event = (msg.data as { event?: string })?.event;
           if (event) result.systemEvents.push(event);
-          // Once the worker is booted, push any proxy I2C registrations
-          // so they land before the firmware's setup() does Wire.begin().
-          if (event === 'booted' && !proxiesSent) {
-            proxiesSent = true;
-            sendProxies();
-          }
           break;
         }
         case 'error':
@@ -328,199 +299,6 @@ describe('ESP32 I2C — backend + WebSocket + QEMU end-to-end', () => {
 
       expect(result.systemEvents[0]).toBe('booting');
       expect(result.systemEvents).toContain('booted');
-    },
-    900_000,
-  );
-});
-
-// ─── Reverse direction: ESP32 master reads a peer board's I2C device ─────────
-//
-// Tests the cross-board proxy mechanism end-to-end:
-//   1. A peer board (e.g. Uno) has a virtual I2CMemoryDevice with a known
-//      register dump at address 0x50.
-//   2. Interconnect would normally install a ProxySlave on the ESP32's
-//      backend via the SDA+SCL bridge.  In this isolated test we simulate
-//      Interconnect's behaviour by passing `proxyI2c` to runFirmware,
-//      which the test harness pushes to the worker right after `booted`.
-//   3. The ESP32 firmware does Wire.requestFrom(0x50, 4) and echoes the
-//      bytes via Serial.  Verifying the echo confirms the proxy responded
-//      with the right snapshot.
-
-const READER_SKETCH_PATH = resolve(
-  __dirname,
-  '../../../test/test_custom_chips/sketches/esp32_i2c_reader/esp32_i2c_reader.ino',
-);
-const READER_SKETCH_AVAILABLE = existsSync(READER_SKETCH_PATH);
-
-describe('ESP32 I2C — reverse-direction proxy (ESP32 master reads peer device)', () => {
-  it.runIf(READER_SKETCH_AVAILABLE && BACKEND_AVAILABLE)(
-    'reads 0xDE/0xAD/0xBE/0xEF from a ProxySlave-mirrored peer device',
-    async () => {
-      const source = readFileSync(READER_SKETCH_PATH, 'utf-8');
-      // Reuse compileViaBackend cache infra — different sketch, fresh hash.
-      const compiled = await (async () => {
-        // Inline minimal version of compileViaBackend so we don't have to
-        // refactor — same protocol calls, different sketch path.
-        let hash = 0;
-        for (let i = 0; i < source.length; i++) {
-          hash = (hash * 31 + source.charCodeAt(i)) | 0;
-        }
-        const cachePath = join(
-          tmpdir(),
-          `velxio-esp32-fw-${FQBN.replace(/[^a-z0-9]/gi, '_')}-${hash >>> 0}.b64`,
-        );
-        if (existsSync(cachePath)) {
-          return { success: true, binary_content: readFileSync(cachePath, 'utf-8') };
-        }
-        const r = await compileViaBackend(source);
-        return r;
-      })();
-      expect(compiled.success).toBe(true);
-
-      // Pre-load a 256-byte register snapshot — the I2CMemoryDevice on
-      // the peer board has registers[0..3] = {0xDE, 0xAD, 0xBE, 0xEF}.
-      const regs = new Uint8Array(256);
-      regs[0] = 0xde;
-      regs[1] = 0xad;
-      regs[2] = 0xbe;
-      regs[3] = 0xef;
-
-      const result = await runFirmware(
-        compiled.binary_content!,
-        30_000,
-        (r) => r.serial.join('').includes('DONE'),
-        { proxyI2c: [{ addr: 0x50, registers: regs }] },
-      );
-
-      expect(result.errors).toEqual([]);
-      const ser = result.serial.join('');
-      expect(ser).toContain('BYTE[0]=0xDE');
-      expect(ser).toContain('BYTE[1]=0xAD');
-      expect(ser).toContain('BYTE[2]=0xBE');
-      expect(ser).toContain('BYTE[3]=0xEF');
-      expect(ser).toContain('DONE');
-    },
-    900_000,
-  );
-
-  it.runIf(READER_SKETCH_AVAILABLE && BACKEND_AVAILABLE)(
-    'no proxy registered → firmware reads garbage / NACK (control case)',
-    async () => {
-      const source = readFileSync(READER_SKETCH_PATH, 'utf-8');
-      const compiled = await compileViaBackend(source);
-      expect(compiled.success).toBe(true);
-
-      const result = await runFirmware(
-        compiled.binary_content!,
-        25_000,
-        (r) => r.serial.join('').includes('DONE'),
-        // No proxyI2c → no slave at 0x50 → firmware sees NACK / 0xFF.
-      );
-
-      const ser = result.serial.join('');
-      // Either the firmware printed garbage 0xFFs (NACK convention) or
-      // skipped the prints because Wire.available() returned 0.  Both
-      // are valid "no proxy" outcomes — the key assertion is that we
-      // do NOT see the expected 0xDE/0xAD/0xBE/0xEF pattern.
-      expect(ser).not.toContain('BYTE[0]=0xDE');
-      expect(ser).not.toContain('BYTE[1]=0xAD');
-    },
-    900_000,
-  );
-});
-
-// ─── Phase 5: write-forwarding via proxy_i2c_complete event ─────────────────
-
-const WRITER_TO_PEER_SKETCH_PATH = resolve(
-  __dirname,
-  '../../../test/test_custom_chips/sketches/esp32_i2c_write_to_peer/esp32_i2c_write_to_peer.ino',
-);
-const WRITER_TO_PEER_SKETCH_AVAILABLE = existsSync(WRITER_TO_PEER_SKETCH_PATH);
-
-describe('ESP32 I2C — write-forwarding from QEMU back to frontend peer device', () => {
-  it.runIf(WRITER_TO_PEER_SKETCH_AVAILABLE && BACKEND_AVAILABLE)(
-    'firmware Wire.write(0xAA) to 0x27 reaches the proxy_i2c_complete handler',
-    async () => {
-      const source = readFileSync(WRITER_TO_PEER_SKETCH_PATH, 'utf-8');
-      const compiled = await compileViaBackend(source);
-      expect(compiled.success).toBe(true);
-
-      // We register a ProxySlave at 0x27 and watch for the
-      // proxy_i2c_complete event arriving when the firmware emits its
-      // STOP.  The data array should include the byte the firmware
-      // wrote (0xAA).
-      const regs = new Uint8Array(256);
-
-      const url =
-        BACKEND_URL.replace(/^http/, 'ws') +
-        `/api/simulation/ws/test-${Date.now()}`;
-      const ws = new WebSocket(url);
-      const proxyCompletes: Array<{ addr: number; data: number[] }> = [];
-      let booted = false;
-
-      await new Promise<void>((resolve, reject) => {
-        ws.onopen = () => resolve();
-        ws.onerror = (e: any) => reject(new Error(`ws: ${e?.message ?? e}`));
-        setTimeout(() => reject(new Error('ws open timeout')), 5000);
-      });
-
-      ws.send(
-        JSON.stringify({
-          type: 'start_esp32',
-          data: { board: 'esp32', firmware_b64: compiled.binary_content! },
-        }),
-      );
-
-      await new Promise<void>((resolve) => {
-        const deadline = Date.now() + 30_000;
-        const tick = setInterval(() => {
-          const done = proxyCompletes.some(
-            (p) => p.addr === 0x27 && p.data.includes(0xaa),
-          );
-          if (done || Date.now() >= deadline) {
-            clearInterval(tick);
-            try {
-              ws.send(JSON.stringify({ type: 'stop_esp32' }));
-            } catch {
-              /* ignore */
-            }
-            ws.close();
-            resolve();
-          }
-        }, 200);
-
-        ws.onmessage = (ev) => {
-          let msg: any;
-          try {
-            msg = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString());
-          } catch {
-            return;
-          }
-          if (msg.type === 'system' && msg.data?.event === 'booted' && !booted) {
-            booted = true;
-            const regs_b64 = Buffer.from(regs).toString('base64');
-            ws.send(
-              JSON.stringify({
-                type: 'esp32_proxy_i2c_register',
-                data: { addr: 0x27, regs_b64 },
-              }),
-            );
-          } else if (msg.type === 'proxy_i2c_complete') {
-            proxyCompletes.push({
-              addr: msg.data.addr,
-              data: msg.data.data,
-            });
-          }
-        };
-        ws.onclose = () => {
-          clearInterval(tick);
-          resolve();
-        };
-      });
-
-      const writes = proxyCompletes.filter((p) => p.addr === 0x27);
-      expect(writes.length).toBeGreaterThan(0);
-      expect(writes.some((w) => w.data.includes(0xaa))).toBe(true);
     },
     900_000,
   );

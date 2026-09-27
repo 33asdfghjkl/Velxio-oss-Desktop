@@ -44,6 +44,11 @@ export interface BoardPinHost extends PinManagerLike {
   onPinChange?(pin: number, cb: (pin: number, state: boolean) => void): () => void;
   peekPad?(pin: number): { drive: 'low' | 'high' | 'z'; pull: 0 | 1 | 2 } | undefined;
   onPadChange?(pin: number, cb: () => void): () => void;
+  /** The net answers every level proposed for the pin (PinManager.claimLevel). */
+  claimLevel?(
+    pin: number,
+    resolve: (proposed: boolean, source: 'mcu' | 'external') => boolean | undefined,
+  ): () => void;
 }
 
 // netKey -> (driverId -> Drive). driverId = `${componentId}::${pinName}`.
@@ -126,6 +131,41 @@ function padDrive(host: BoardPinHost, pin: number): Drive {
   return HIGHZ_DRIVE;
 }
 
+/**
+ * What the wire holds with `proposed` put on it through `source`.
+ *
+ * A level the engine reports ('mcu') on a pad it drives is the wire's: it
+ * passes, and the chips' contention with it is reported by the pad channel's
+ * own resolution. An engine without a pad channel (the ESP32 bridges) reports
+ * only the pads its firmware drives, so its level is its drive too. Anything
+ * else (a part's injection, the pull of a pad the guest configured as an
+ * input) is a proposal the net's resolution answers, which a strong driver
+ * decides: undefined for an injection on a pad the guest drives (it moves
+ * nothing), the proposal itself when nothing on the net holds the wire.
+ */
+function proposeBoardPin(
+  host: BoardPinHost,
+  pin: number,
+  net: BoardNet,
+  proposed: boolean,
+  source: 'mcu' | 'external',
+): boolean | undefined {
+  const pad = padDrive(host, pin);
+  if (pad.strength === Strength.STRONG) return source === 'mcu' ? proposed : undefined;
+  if (source === 'mcu' && !host.peekPad?.(pin)) return proposed;
+  const resolved = resolveNet([...net.drivers.values(), pad]);
+  if (resolved.v === 'X' || resolved.v === 'Z') return proposed;
+  const level = resolved.v === '1';
+  net.lastLevel = level;
+  // An overridden proposal came through a door that moved the guest's input
+  // register before asking (the AVR's setPinState writes PIN first): put the
+  // wire's level back into the guest through every chip's sink, as the
+  // re-assertion after the write used to. The sink's own write comes back
+  // here with the resolved level and changes nothing.
+  if (level !== proposed) for (const sink of net.sinks.values()) sink(level);
+  return level;
+}
+
 function recomputeBoardPin(host: BoardPinHost, pin: number, net: BoardNet): void {
   const pad = padDrive(host, pin);
   const resolved = resolveNet([...net.drivers.values(), pad]);
@@ -196,18 +236,20 @@ export function setBoardPinDrive(
       lastLevel: undefined,
     };
     // The pad decides the resolution as much as the chips do, so a pinMode
-    // in the sketch re-resolves the pin. The level channel is watched too:
-    // an engine that writes an input pin's latch onto it (the AVR's PORT bit
-    // for INPUT_PULLUP) does so after reporting the pad, and the resolution
-    // has to be re-asserted after that write, or the channel keeps the latch
-    // while the guest holds what the chip drove. The net's own publication
-    // comes back through the same channel and is not a reason to resolve
-    // again.
+    // in the sketch re-resolves the pin. And the net claims the pin's level:
+    // an engine that writes an input pin's latch onto the channel (the AVR's
+    // PORT bit for INPUT_PULLUP), or a part injecting a level, is answered by
+    // the resolution before anything reaches the channel, so a second chip
+    // watching the pin never sees the latch as an edge. A host without the
+    // claim (a test double) is watched instead and re-asserted after the
+    // write, glitch included; the net's own publication comes back through
+    // the same channel and is not a reason to resolve again.
     const offPad = host.onPadChange?.(pin, () => recomputeBoardPin(host, pin, created)) ?? (() => {});
-    const offLevel =
-      host.onPinChange?.(pin, (_p, state) => {
-        if (state !== created.lastLevel) recomputeBoardPin(host, pin, created);
-      }) ?? (() => {});
+    const offLevel = host.claimLevel
+      ? host.claimLevel(pin, (proposed, source) => proposeBoardPin(host, pin, created, proposed, source))
+      : (host.onPinChange?.(pin, (_p, state) => {
+          if (state !== created.lastLevel) recomputeBoardPin(host, pin, created);
+        }) ?? (() => {}));
     created.unwatch = () => {
       offPad();
       offLevel();

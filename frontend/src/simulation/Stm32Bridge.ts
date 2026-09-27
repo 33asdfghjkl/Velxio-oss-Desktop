@@ -106,9 +106,6 @@ export class Stm32Bridge {
   /** Full I2C write transaction (addr + bytes) for write-only devices (SSD1306). */
   onI2cTransaction: ((addr: number, data: number[]) => void) | null = null;
   onSpiBatch: ((bytes: Uint8Array) => void) | null = null;
-  onEpaperUpdate:
-    | ((componentId: string, frame: { width: number; height: number; b64: string; refreshMs: number }) => void)
-    | null = null;
 
   private socket: WebSocket | null = null;
   private _connected = false;
@@ -249,18 +246,6 @@ export class Stm32Bridge {
           }
           break;
         }
-        case 'epaper_update': {
-          // The STM32 worker nests the frame under data.data (it emits
-          // {type:'epaper_update', data:{...}} and the manager re-wraps once).
-          const f = (msg.data.data as Record<string, unknown>) ?? msg.data;
-          this.onEpaperUpdate?.(f.component_id as string, {
-            width: f.width as number,
-            height: f.height as number,
-            b64: f.frame_b64 as string,
-            refreshMs: (f.refresh_ms as number) ?? 50,
-          });
-          break;
-        }
         case 'error':
           this.onError?.(msg.data.message as string, msg.data.code as string | undefined);
           break;
@@ -315,8 +300,8 @@ export class Stm32Bridge {
    * leaves them alone.
    *
    * Narrower than the ESP32 bridge's, which asks about every registered
-   * record: that worker drives an ePaper panel's BUSY line, and this one does
-   * not — its ePaper branch reads DC, CS and RST only. Claiming BUSY here
+   * record: the only record whose model drives a pad in this worker is the
+   * membrane keypad's. Claiming any other pad (an I2C device's virtual pin)
    * would take it off the solved circuit and leave it driven by nobody.
    */
   ownsSensorPin(gpioPin: number): boolean {
@@ -350,7 +335,7 @@ export class Stm32Bridge {
    * Pre-register devices so they are included in the start_stm32 payload.
    * Sent on connect (the common case: attachEvents fires before Run). Upsert
    * by `pin` so a later setSensors() from startBoard doesn't drop entries an
-   * earlier sendSensorAttach() (e.g. an ePaper SPI slave) already buffered.
+   * earlier sendSensorAttach() (a device registered at mount) already buffered.
    */
   setSensors(sensors: Array<Record<string, unknown>>): void {
     const merged = this._pendingSensors.slice();

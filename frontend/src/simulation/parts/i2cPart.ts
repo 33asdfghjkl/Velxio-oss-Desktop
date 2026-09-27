@@ -5,12 +5,12 @@
  * because it was handed a simulator: it registers once with its own pin names,
  * and the fabric puts it on the bus of its SDA net, keeps it there across every
  * reset of the SoC, moves it when a wire moves, and takes it off by identity.
- * That is what ends the three ways the old registration went wrong:
+ * That is what ends the three ways registration by address went wrong:
  *
- *   - `addI2CDevice(dev)` put every part on the board's bus 0, so a part on
+ *   - a device handed to the simulator went on the board's bus 0, so a part on
  *     Wire1 (or on the XIAO RP2040, whose Wire is I2C1) never answered, and a
  *     part wired to nothing answered anyway;
- *   - `removeDevice(address)` took off whichever device held that address,
+ *   - removal by address took off whichever device held that address,
  *     the part's replacement included;
  *   - the worker record of a QEMU board was keyed by 200 + address, so two
  *     parts at one address were one record, and deleting one deleted both.

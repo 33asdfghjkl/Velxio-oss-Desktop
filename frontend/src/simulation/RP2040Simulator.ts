@@ -1552,16 +1552,22 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
           // auto-apply the pad pull to the readable input register). The
           // connector overrides this whenever the pin's net is actually sourced
           // (rail / button / divider); an unwired pulled input keeps this level.
-          // Through setPinState, not gpio.setInputValue: the scope has to see
-          // this baseline too, or a channel probed on a pulled input stays
-          // empty until something in the circuit moves it.
+          // Into the input register and to the scope, which has to see this
+          // baseline too, or a channel probed on a pulled input stays empty
+          // until something in the circuit moves it. Not through setPinState:
+          // that door now puts a level on the wire's channel as well, and a
+          // pad's pull is not a level a part put there (the RP2350 and XIAO
+          // seed the register alone; the pull reaches the fabric through the
+          // pad channel below). Routed through the door, the pull-down the
+          // core enables when a sketch first touches a pin read as a chip
+          // select on the wire for the instant before pinMode(OUTPUT).
           //
           // Except under a bus target holding the line low: a weak pull-up
           // loses to it, as on the wire. Without this the master letting SDA
           // go for the ACK slot erased the ACK it was about to read.
-          if (this.busHeldLow.has(pin)) this.setPinState(pin, false);
-          else if (pull === 1) this.setPinState(pin, true);
-          else if (pull === 2) this.setPinState(pin, false);
+          if (this.busHeldLow.has(pin)) this.seedInputLevel(pin, false);
+          else if (pull === 1) this.seedInputLevel(pin, true);
+          else if (pull === 2) this.seedInputLevel(pin, false);
           requestElectricalResolve();
           // The pad was RELEASED. This is the event the level channel above
           // cannot carry (no level moved, so `triggerPinChange` must stay
@@ -1914,6 +1920,16 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
     }
   }
 
+  /** The level a released pad's own pull produces: the input register and
+   *  the scope, never the wire's level channel (see the pad listener). */
+  private seedInputLevel(pin: number, level: boolean): void {
+    const gpio = this.rp2040?.gpio[pin];
+    if (!gpio) return;
+    gpio.setInputValue(level);
+    if (gpio.outputEnable) return;
+    this.externalScope.emit(this.onPinChangeWithTime, pin, level);
+  }
+
   /**
    * Drive a GPIO pin externally (e.g. from a button or slider).
    * GPIO n = Arduino D(n) for Raspberry Pi Pico.
@@ -1931,6 +1947,14 @@ export class RP2040Simulator implements LineCapable, BusCapableSimulator {
     // would drop a bidirectional line's answer (a DHT22 replying after the
     // sketch released DATA) for the rest of the session.
     if (gpio.outputEnable) return;
+    // The wire's level channel hears it too: the PinManager's level is what
+    // a chip watching this pin reads (vx_pin_read, vx_pin_watch), and
+    // setInputValue moves only the pad's input register. Without this line
+    // a custom chip on a pin a tilt switch drives saw nothing on the Pico
+    // while the sketch's digitalRead saw every edge (finding
+    // chip-board-pin-read-blind-to-other-parts, closed on the AVR first).
+    // Left out while the core drives the pad, as the register is.
+    this.pinManager.triggerPinChange(arduinoPin, state, 'external');
     this.externalScope.emit(this.onPinChangeWithTime, arduinoPin, state);
   }
 

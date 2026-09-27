@@ -13,10 +13,10 @@
  * Everything that answers lives on the bus fabric (simulation/buses): a chip
  * is on this controller's bus because its SDA and SCL are on the nets the
  * controller is routed to, on this board or wired over from another one. The
- * manager holds no devices of its own any more: the device map that parts
- * used to register in by address (`addI2CDevice`), and the bridge graph that
- * forwarded an unknown address to a peer board's map, went with the last part
- * that used them (F5 third part). The `I2CDevice` shape below stays as the
+ * manager holds no devices of its own: a device registered here by address
+ * sat on this board's first bus whatever its wires reached, one part's cleanup
+ * could evict another at the same address, and a peer board's devices needed
+ * a bridge graph of their own. The `I2CDevice` shape below stays as the
  * register-file model the parts keep, adapted to the fabric by
  * parts/i2cPart.ts.
  */

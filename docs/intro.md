@@ -85,7 +85,12 @@ See [Supported Boards](../README.md#supported-boards) for the full table with CP
 - [Examples Walkthrough](./wiki/custom-chips-examples.md) — Gallery chips explained
 - [Build & Test](./wiki/custom-chips-build-and-test.md) — Toolchain, sandbox
 - [ESP32 Backend Runtime](./wiki/custom-chips-esp32-backend-runtime.md) — How chips load under QEMU
-- [Chip-to-chip nets on ESP32](./wiki/custom-chips-chip-nets.md) — Nets between chips, the cross-board bridge, UART binding
+- [Chip-to-chip nets on ESP32](./wiki/custom-chips-chip-nets.md): Nets between chips, the cross-board bridge, which UART a chip is on
+
+### Board buses (SPI, I2C, UART)
+
+- [Board buses](./wiki/board-buses.md): A bus is a net on a board: membership by wiring, arbitration by chip select, address and TX/RX, the engine and device contracts, the diagnostics, the remote hosts
+- [Part author guide](./wiki/board-buses-part-authoring.md): How to write an SPI, I2C or UART part, a board built-in, and the tests it must ship
 
 ### Electrical Simulation Deep-Dive
 

@@ -22,6 +22,7 @@ import { resolveChipNetMembers } from '../customChips/chipNets';
 import { requestElectricalResolve } from '../spice/electricalResolveHook';
 import { runChipAttachExtensions } from '../customChips/chipAttachExtensions';
 import { chipUartOwner } from '../customChips/ChipRuntime';
+import { padVoltsFor, samePadVolts } from '../customChips/padVolts';
 import { readChipUartPads } from '../customChips/chipUartPads';
 import { setAdcVoltage, analogRailVolts } from './partUtils';
 import { attachUartEndpoint } from '../buses';
@@ -208,11 +209,30 @@ PartSimulationRegistry.register('custom-chip', {
       // gets its own synthetic slot (see chipVirtualPin), so live attribute
       // updates and a detach reach this chip and not the last one registered.
       const virtualPin = chipVirtualPin(componentId);
+      // The solved voltage on each of the chip's pads, for its
+      // vx_pin_read_analog in the worker: the same numbers the browser runtime
+      // reads off the electrical store (padVolts.ts), sent with the chip and
+      // again whenever the solve moves one of them. A plain chip's pin names
+      // are its pad names.
+      const padPins: Array<[string, string]> = pins.map((name) => [name, name]);
+      let lastPadVolts: Record<string, number | null> | null = padVoltsFor(componentId, padPins);
+      const unsubscribePadVolts = useElectricalStore.subscribe((st, prev) => {
+        if (st.nodeVoltages === prev.nodeVoltages && st.pinNetMap === prev.pinNetMap) return;
+        const volts = padVoltsFor(componentId, padPins);
+        if (samePadVolts(lastPadVolts, volts)) return;
+        lastPadVolts = volts;
+        try {
+          sim.updateSensor?.(virtualPin, { pad_volts: volts });
+        } catch {
+          /* worker gone */
+        }
+      });
       try {
         sim.registerSensor('custom-chip', virtualPin, {
           wasm_b64: wasmBase64,
           attrs: attrsObj,
           pin_map: pinMap,
+          pad_volts: lastPadVolts,
           nets,
           // The worker allocates the framebuffer vx_framebuffer_init hands the
           // chip, and needs the id to send the rows back to THIS element. It
@@ -338,6 +358,7 @@ PartSimulationRegistry.register('custom-chip', {
       // list it would replay at the next Run, and the part re-registers when
       // it attaches again. The same cleanup as the ePaper part.
       return () => {
+        unsubscribePadVolts();
         offFramebuffer();
         cleanupExtensions();
         // Off the wires, so the map the shim sends next no longer names it.

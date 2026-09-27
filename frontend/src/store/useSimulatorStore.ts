@@ -298,6 +298,13 @@ export class Esp32BridgeShim {
     // sticky "has driven this session" set — the same gate the connector uses
     // to decide what to inject in the first place.
     if (this.pinManager.getOutputPins().has(pin)) return;
+    // The wire's level channel hears it too: a chip in this tab watching the
+    // pin (an in-browser ESP32 engine hosts chips here) reads the
+    // PinManager's level, and the injection only moved the guest's GPIO_IN
+    // (finding chip-board-pin-read-blind-to-other-parts; the AVR's
+    // setPinState is the model). Same gates as the scope: not for a pad the
+    // guest drives, nor for a line a backend sensor owns.
+    this.pinManager.triggerPinChange(pin, state, 'external');
     // The store hands the scope callback to the BRIDGE (that is where the
     // engine's own edges arrive), so that is the sink to reach for; the
     // shim's own slot is honoured first for the tests that fill it.
@@ -726,8 +733,8 @@ export class Esp32BridgeShim {
 
   /**
    * Expose the underlying Esp32Bridge so simulation parts can subscribe to
-   * board-specific WS events (e.g. `onEpaperUpdate` for the ePaper backend
-   * rendering path). Hooks should restore any handler they overwrite.
+   * board-specific WS events (a worker-hosted chip's framebuffer, a camera
+   * frame). Hooks should restore any handler they overwrite.
    */
   getBridge(): Esp32Bridge {
     return this.bridge;
@@ -1050,6 +1057,9 @@ class Stm32BridgeShim {
     // bridge, where the worker's own edges arrive, and carries the same
     // `performance.now()` clock they are stamped with.
     if (this.pinManager.getOutputPins().has(pin)) return;
+    // And the wire's level channel, as on every other board (see the ESP32
+    // shim above): a chip in this tab watching the pin reads it there.
+    this.pinManager.triggerPinChange(pin, state, 'external');
     this.externalScope.emit(this.onPinChangeWithTime ?? this.bridge.onPinChangeWithTime, pin, state);
   }
 
@@ -1155,7 +1165,7 @@ class Stm32BridgeShim {
     this.remoteLane.pushAttrs(owner, attrs);
   }
 
-  /** Expose the bridge so SPI/ePaper parts can subscribe to backend frames. */
+  /** Expose the bridge so a part can subscribe to the worker's own events. */
   getBridge(): Stm32Bridge {
     return this.bridge;
   }
@@ -2533,10 +2543,10 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
         if (sim && !isPiBoardKind(board.boardKind)) {
           try {
             // Only the firmware goes in. The I2C bus holds what the canvas
-            // wires to it and nothing else: a DS1307, a sensor and an EEPROM
-            // used to be added here on every load, answering on a bus with
-            // no parts and colliding with any real part at 0x48/0x50/0x68,
-            // including one on a board that is not the active one (D-010).
+            // wires to it and nothing else: a bus with no parts does not
+            // answer, and nothing is put on it that a real part at the same
+            // address, on this board or another, could collide with
+            // (board-buses D-010).
             if (sim instanceof AVRSimulator) {
               sim.loadHex(program);
             } else if (sim instanceof RP2040Simulator) {
@@ -3603,7 +3613,7 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
       const sim = getBoardSimulator(boardId);
       if (sim && sim instanceof AVRSimulator) {
         try {
-          sim.loadHex(hex); // no demo I2C devices: see compileBoardProgram
+          sim.loadHex(hex); // only the firmware: see compileBoardProgram
           set((s) => ({ compiledHex: hex, hexEpoch: s.hexEpoch + 1 }));
           console.log('HEX file loaded successfully');
         } catch (error) {
@@ -3620,7 +3630,7 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
       const sim = getBoardSimulator(boardId);
       if (sim && sim instanceof RP2040Simulator) {
         try {
-          sim.loadBinary(base64); // no demo I2C devices: see compileBoardProgram
+          sim.loadBinary(base64); // only the firmware: see compileBoardProgram
           set((s) => ({ compiledHex: base64, hexEpoch: s.hexEpoch + 1 }));
           console.log('Binary loaded into RP2040 successfully');
         } catch (error) {

@@ -29,7 +29,7 @@ import pytest
 from .test_board_buses_repro_worker import (  # noqa: F401  (worker fixture)
     CHIP_A_CS,
     CHIP_B_CS,
-    EPAPER,
+    EPAPER_SINK,
     EPD_CS,
     EPD_DC,
     MISO,
@@ -334,23 +334,24 @@ class TestTheBusIsNotSwallowed:
         _clock_tft(w)
         assert w.spi_stream() == bytes(CASET_CMD + CASET_DATA + PIXELS)
 
-    def test_a_mapped_responder_leaves_the_epaper_latching(self, worker):
-        """A panel the worker hosts and a responder the tab sent are members of
-        the same table; neither shuts the other out."""
-        w = worker(sensors=[EPAPER],
-                   bus_map={'spi': [probe_entry('a', pin_cs(CHIP_A_CS), 0xA0)]})
+    def test_a_mapped_responder_leaves_a_tab_sink_its_bytes(self, worker):
+        """A sink the tab keeps (the e-paper panel decodes there) and a
+        responder the tab sent are members of the same table; neither shuts
+        the other out: the responder answers, and the byte still reaches the
+        tab because the sink's select is low."""
+        w = worker(bus_map={'spi': [probe_entry('a', pin_cs(CHIP_A_CS), 0xA0), EPAPER_SINK]})
         select(w, CHIP_A_CS)
         w.pin(EPD_CS, 0)
         w.pin(EPD_DC, 0)
-        assert w.spi([0x20]) == [0xA0], 'the responder answers, the panel does not drive MISO'
+        assert w.spi([0x20]) == [0xA0], 'the responder answers, the sink does not drive MISO'
         w.pin(EPD_CS, 1)
-        assert w.wait_for(lambda: bool(w.events('epaper_update')), 2.0)
+        w.flush()
+        assert w.spi_stream() == bytes([0x20]), 'the sink in the tab got the byte'
 
     def test_a_bulk_write_reaches_every_selected_member_and_the_tab(self, worker):
-        """The block path has to end where byte-by-byte ends: the panel latches
-        and the browser gets the same bytes."""
-        w = worker(sensors=[EPAPER],
-                   bus_map={'spi': [probe_entry('a', pin_cs(CHIP_A_CS), 0xA0)]})
+        """The block path has to end where byte-by-byte ends: the browser gets
+        the same bytes, in order, under the sink's select."""
+        w = worker(bus_map={'spi': [probe_entry('a', pin_cs(CHIP_A_CS), 0xA0), EPAPER_SINK]})
         w.pin(CHIP_A_CS, 1)
         w.pin(EPD_CS, 0)
         w.pin(EPD_DC, 1)
@@ -360,7 +361,6 @@ class TestTheBusIsNotSwallowed:
         w.pin(EPD_CS, 1)
         w.flush()
         assert w.spi_stream() == bytes(PIXELS + [0x20])
-        assert w.wait_for(lambda: bool(w.events('epaper_update')), 2.0)
 
 
 class TestBadEntries:

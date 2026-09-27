@@ -6,6 +6,13 @@
 > return `true` so that the serial monitor shows real sensor data instead of "MPU6050 not found!" /
 > "BMP280 not found! Check wiring.".
 > Target audience: future maintainers who need to understand *why* the I2C slave code is the way it is.
+>
+> **Since 2026-09 (board-buses F5)**: the slaves described here no longer sit in one dict keyed by
+> address. The worker keeps them in an `I2cBusTable` (`backend/app/services/i2c_bus_table.py`) by
+> (controller, address) and by identity, placed on the controller the tab's bus map says the part's
+> SDA is wired to, so two identical sensors on `Wire` and `Wire1` are two devices and removing one
+> never evicts the other. The event constants, the ACK convention and the write-then-read sequence
+> below are unchanged. The model is in [board-buses.md](./board-buses.md).
 
 ---
 

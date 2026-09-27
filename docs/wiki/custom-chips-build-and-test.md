@@ -193,7 +193,7 @@ The chip tests that run in CI live next to the code:
 | Where | What | Run |
 |---|---|---|
 | `frontend/src/__tests__/chip*.test.ts`, `chipbus-*.test.ts`, `chipnets-*.test.ts`, `customchip-*.test.ts` | Browser runtime: chip.json normalisation, the bus kernel and nets, UART bit-bang, .vlx round trip, the ESP32 hosting seam, the net description sent to the ESP32 worker | `cd frontend && npx vitest run src/__tests__/chip` |
-| `test/backend/unit/test_chip_nets.py`, `test_chip_uart_binding.py` | Backend `WasmChipRuntime`: `ChipNetBus` semantics, two real chips over a net, the UART binding | `pytest test/backend/unit/test_chip_*.py` (needs `wasmtime`; the Docker image has it) |
+| `test/backend/unit/test_chip_nets.py`, `test_chip_uart_binding.py` | Backend `WasmChipRuntime`: `ChipNetBus` semantics, two real chips over a net, the UART attach (the config is kept, no UART number is chosen by the runtime, no `uart_map`) | `pytest test/backend/unit/test_chip_*.py` (needs `wasmtime`; the Docker image has it) |
 | `test/fixtures/chip-nets/` | The SX1262 and KQ-130F models those backend cases load, with sources and a standalone self test | see its README |
 
 ## The sandbox test suite (maintainers' checkout)
@@ -436,8 +436,8 @@ peripheral callbacks fire **synchronously** in the QEMU thread:
 | `vx_pin_write` | `qemu_picsimlab_set_pin(gpio + 1, value)` | Drives GPIO input |
 | `vx_pin_read` | Cached `_pin_state[gpio]` from `_on_pin_change` | Live |
 | `vx_pin_watch` | Dispatched from `_on_pin_change` (edge filtered) | Sync, lock held |
-| `vx_i2c_attach` | Registered as `_i2c_slaves[addr]` | `_on_i2c_event` |
-| `vx_uart_attach` / `vx_uart_write` | `_on_uart_tx` ↔ `qemu_picsimlab_uart_receive` | the UART the diagram wires (Serial1 when unwired) |
+| `vx_i2c_attach` | Registered in the `I2cBusTable` by (controller, address), every address of the chip | `_on_i2c_event` |
+| `vx_uart_attach` / `vx_uart_write` | `_on_uart_tx` ↔ `qemu_picsimlab_uart_receive` | the UART the wiring reaches (`uart_bus_table`); unwired means no UART, never Serial1 |
 | `vx_spi_attach` | Dispatched from `_on_spi_event` (op = `data << 8`) | Re-arm pattern supported |
 | `vx_timer_*` | Dedicated scheduler thread that takes the IO-thread lock | Wakes on soonest deadline |
 

@@ -2,12 +2,10 @@
  * The microSD card, SD-over-SPI: ONE JavaScript model for every host in this
  * tab (project board-buses-2026-09, F4).
  *
- * Until F4 this card existed three times: this model (born in the pro overlay
- * for the in-browser ESP32 engines), a second state machine inside the OSS
- * `microsd-card` part, and a third in Python for the QEMU worker
- * (`esp32_sd_slave.py`). They had already drifted: only this one had ACMD51
- * (without it no ESP-IDF app could mount), only the Python one tracked the
- * idle bit, and the Python one answered R1 one byte early, where IDF's fixed
+ * One model, because three had drifted apart before F4 (a JS one per overlay
+ * engine, one inside the OSS part, one in Python for the QEMU worker): only
+ * one had ACMD51 (without it no ESP-IDF app could mount), only one tracked the
+ * idle bit, and one answered R1 one byte early, where IDF's fixed
  * `sdspi_hw_cmd_t` layout cannot see it.
  *
  * So the most complete of the three was moved here, to OSS, where the canvas
@@ -40,9 +38,8 @@
  * Bus interface: the bus fabric's `SpiDevice`, through {@link sdSpiFabricDevice}.
  * The fabric is what decides the card is selected: it hands the model only the
  * frames clocked while the card's own chip select is active and calls
- * select()/deselect() on its edges, so the CS-keyed router this file used to
- * carry (`SdSpiBusRouter`, one card stacked in front of the display path in
- * every bridge) is gone, and with it the always-selected fallback that made a
+ * select()/deselect() on its edges. No router keyed on CS sits in front of the
+ * bridges' byte path, and so there is no always-selected fallback to make a
  * card with an unwired CS swallow the whole bus and blank the board's panel.
  *
  * `setCs()` stays as the model's own gate, driven by the fabric's select /

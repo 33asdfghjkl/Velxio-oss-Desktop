@@ -114,7 +114,6 @@ try:
         DS1307Slave  as _DS1307Slave,
         DS3231Slave  as _DS3231Slave,
         I2CWriteSink as _I2CWriteSink,
-        ProxySlave   as _ProxySlave,
     )
 except ImportError:
     # Fallback: direct import when running from backend/ directory as subprocess
@@ -131,7 +130,6 @@ except ImportError:
     _DS1307Slave  = _mod.DS1307Slave   # type: ignore[assignment]
     _DS3231Slave  = _mod.DS3231Slave   # type: ignore[assignment]
     _I2CWriteSink = _mod.I2CWriteSink  # type: ignore[assignment]
-    _ProxySlave   = _mod.ProxySlave    # type: ignore[assignment]
 
 # The table those slaves answer from, by (controller, address) and removed by
 # identity (project board-buses-2026-09, F5). Same fallback dance.
@@ -170,26 +168,6 @@ except ImportError:
     _UartBusTable = _mod.UartBusTable      # type: ignore[assignment]
     _UART_NOT_ROUTED = _mod.NOT_ROUTED     # type: ignore[assignment]
     _uart_owner_of = _mod.owner_of         # type: ignore[assignment]
-
-# SPI slaves (Phase 1: SSD168x ePaper). Same fallback dance — when the worker
-# runs as a subprocess from backend/ the package import won't resolve.
-try:
-    from app.services.esp32_spi_slaves import (
-        Ssd168xEpaperSlave as _Ssd168xEpaperSlave,
-        Uc8159cEpaperSlave as _Uc8159cEpaperSlave,
-        Uc8179EpaperSlave as _Uc8179EpaperSlave,
-    )
-except ImportError:
-    import importlib.util, pathlib, sys as _sys
-    _here = pathlib.Path(__file__).parent
-    _spec = importlib.util.spec_from_file_location('esp32_spi_slaves', _here / 'esp32_spi_slaves.py')
-    _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
-    # Same dataclass-needs-sys.modules fix as the i2c fallback above.
-    _sys.modules['esp32_spi_slaves'] = _mod
-    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
-    _Ssd168xEpaperSlave = _mod.Ssd168xEpaperSlave  # type: ignore[assignment]
-    _Uc8159cEpaperSlave = _mod.Uc8159cEpaperSlave  # type: ignore[assignment]
-    _Uc8179EpaperSlave = _mod.Uc8179EpaperSlave  # type: ignore[assignment]
 
 # The microSD has no slave of its own here any more (project
 # board-buses-2026-09, F4). It used to be `esp32_sd_slave.SdSpiSlave`, a third
@@ -843,8 +821,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     # registered under an identity and removed by it (project board-buses-2026-09,
     # F5). It replaced a dict keyed by address alone, which made Wire and Wire1
     # one bus and let the cleanup of one device evict another at its address.
-    # A sensor record registers under ('sensor', pin); the cross-board proxy
-    # under ('proxy', addr), since the tab installs and removes it by address.
+    # A sensor record registers under ('sensor', pin).
     _i2c_table = _I2cBusTable(emit=lambda ev: _emit(ev) if not _stopped.is_set() else None,
                               resolve_bus=lambda sda: _resolve_i2c_bus(sda))
 
@@ -907,16 +884,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     _chip_timer_runtimes: list = []         # runtimes with active timers
     _chip_pin_watch_runtimes: list = []     # runtimes that called vx_pin_watch
     _chip_fb_runtimes: list = []            # runtimes that called vx_framebuffer_init
-
-    # ePaper SSD168x slaves keyed by frontend component_id. The slave decodes
-    # SPI bytes; on MASTER_ACTIVATION it emits an `epaper_update` WS frame.
-    # `dc_pin` / `cs_pin` / `rst_pin` (gpio numbers) are tracked via
-    # `_on_pin_change`; an active slave is one whose `cs_low` is True.
-    _epaper_slaves: dict = {}
-    # Per-slave runtime state keyed identically: dict with keys
-    #   'slave', 'dc_pin', 'cs_pin', 'rst_pin', 'busy_pin', 'cs_low',
-    #   'dc_high', 'refresh_ms'.
-    _epaper_state: dict = {}
 
     # Live GPIO state tracked from QEMU's _on_pin_change callback. Custom-chip
     # runtimes' vx_pin_read consults this to see what the firmware just drove.
@@ -1584,19 +1551,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 except Exception as e:
                     _log(f'[custom-chip pin_watch] error: {e!r}')
 
-        # ePaper SSD168x: track DC / CS / RST pin states for every slave.
-        # CS rising re-arms the next byte; CS falling activates the slave.
-        # RST falling clears the controller's RAM (active LOW).
-        if _epaper_state:
-            for st in _epaper_state.values():
-                if gpio == st['dc_pin']:
-                    st['dc_high'] = bool(value & 1)
-                elif gpio == st['cs_pin']:
-                    st['cs_low'] = (value & 1) == 0
-                elif gpio == st['rst_pin']:
-                    if (value & 1) == 0:
-                        st['slave'].reset()
-
         # A chip select may have just moved. Selection is kept on edges, never
         # looked up per byte, so this is the one place it changes for a GPIO
         # select, and it runs on the QEMU thread before the guest can clock
@@ -1925,7 +1879,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         the symbol (CS events stay on, as before)."""
         try:
             lib.qemu_picsimlab_enable_spi_cs_events(
-                1 if (_epaper_state or _chip_spi_runtimes or _spi_models) else 0)
+                1 if (_chip_spi_runtimes or _spi_models) else 0)
         except Exception:
             pass
 
@@ -2063,22 +2017,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             lambda mosi, _rt=rt, _h=handle: _rt.spi_transfer_byte(mosi, _h) & 0xFF,
         )
 
-    def _epaper_responder(comp_id: str, st: dict) -> dict:
-        # Write-only: the panel reports status on BUSY and never drives MISO,
-        # so it answers None and the line's idle level stands. That is the
-        # `return 0xFF` this used to do for the whole bus, now scoped to the
-        # one device it belongs to.
-        def _feed(data, _st=st):
-            dc = _st['dc_high']
-            for mb in data:
-                _st['slave'].feed(mb, dc)
-
-        def _one(mosi, _st=st):
-            _st['slave'].feed(mosi, _st['dc_high'])
-            return None
-        return _responder(f'epaper:{comp_id}', None, False,
-                          lambda _st=st: bool(_st['cs_low']), _one, _feed)
-
     def _rebuild_spi_responders() -> None:
         """Every device that can be clocked on this board's SPI bus, in ONE
         list. Called whenever the population changes, never per byte."""
@@ -2086,8 +2024,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         for rt in _chip_spi_runtimes:
             for h in range(rt.spi_handle_count()):
                 resp.append(_chip_responder(rt, h))
-        for comp_id, st in _epaper_state.items():
-            resp.append(_epaper_responder(comp_id, st))
         _spi_resp[:] = resp
         _spi_any_bus_id[0] = any(r['bus_id'] is not None for r in resp)
 
@@ -2689,6 +2625,10 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     display=display,
                     component_id=comp_id,
                     clock=_guest_clock_ns,
+                    # The solved voltage on each wired pad (vx_pin_read_analog),
+                    # published by the tab beside the attrs; absent on older
+                    # frontends, and then every pad reads as in the air.
+                    pad_volts=s.get('pad_volts') if isinstance(s.get('pad_volts'), dict) else None,
                 )
                 runtime.run_chip_setup()
                 _rt_cell[0] = runtime
@@ -2789,130 +2729,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 _i2c_add(gpio, s, slave, i2c_addr)
                 sensor_data['i2c_addr'] = i2c_addr
                 sensor_data['slave'] = slave
-            elif sensor_type == 'epaper-ssd168x':
-                # ePaper panel: backend decodes SPI traffic and emits
-                # `epaper_update` events with the latched framebuffer.  The
-                # `controller_family` payload field selects the decoder
-                # ('ssd168x' or 'uc8159c') and ALSO determines the BUSY
-                # polarity, because the two controller families use opposite
-                # active levels in GxEPD2:
-                #
-                #   SSD168x family (1.54 / 2.13 / 2.9 / 4.2"):
-                #     `_busy_level = HIGH` → BUSY=HIGH means "busy",
-                #                            BUSY=LOW means "ready".
-                #
-                #   UltraChip family — UC8159c (5.65" ACeP) and UC8179/GD7965
-                #   (7.5" 800x480): `_busy_level = LOW` → BUSY=LOW means "busy",
-                #                            BUSY=HIGH means "ready".
-                #
-                # Pick the IDLE level per family and (a) seed the pin to IDLE
-                # at registration so the firmware's first `_waitBusy()` —
-                # which runs inside `_PowerOn()` / `_InitDisplay()` BEFORE any
-                # frame is sent — sees "ready" and proceeds, and (b) use that
-                # polarity when pulsing on frame flush below.
-                comp_id = str(s.get('component_id', f'epaper-{gpio}'))
-                width = int(s.get('width', 200))
-                height = int(s.get('height', 200))
-                refresh_ms = int(s.get('refresh_ms', 50))
-                busy_pin = int(s.get('busy_pin', -1))
-                # Read controller_family early; default to ssd168x for
-                # back-compat with old frontends that didn't send it.
-                ctl_family_early = str(s.get('controller_family', 'ssd168x'))
-                # UltraChip controllers (uc8159c, uc8179) idle BUSY HIGH; the
-                # SSD168x family idles BUSY LOW.
-                busy_idle_level = 1 if ctl_family_early in ('uc8159c', 'uc8179') else 0
-                busy_busy_level = 1 - busy_idle_level
-                if busy_pin is not None and busy_pin >= 0:
-                    try:
-                        lib.qemu_picsimlab_set_pin(busy_pin + 1, busy_idle_level)
-                    except Exception:
-                        pass
-
-                def _flush_factory(_comp_id=comp_id,
-                                   _w=width, _h=height,
-                                   _refresh=refresh_ms,
-                                   _busy=busy_pin,
-                                   _busy_busy=busy_busy_level,
-                                   _busy_idle=busy_idle_level,
-                                   _lib=lib):
-                    """Build an on_flush callback bound to this slave's
-                    component_id so the WS event can route to the right panel.
-                    Pulses BUSY to its "busy" level for refresh_ms, then back
-                    to "ready" — polarity per controller family (see above)."""
-                    def _on_flush(frame):
-                        try:
-                            frame_b64 = base64.b64encode(frame.pixels).decode('ascii')
-                        except Exception:
-                            return
-                        # NOTE: emit FLAT (fields at top level), like every other
-                        # worker event. The backend's qemu_callback re-wraps the
-                        # post-'type' payload under 'data' (simulation.py), so a
-                        # nested 'data' here would double-wrap and the frontend's
-                        # msg.data.component_id would be undefined (panel never
-                        # renders). This was the long-standing "ESP32 ePaper is
-                        # blank" bug.
-                        _emit({
-                            'type': 'epaper_update',
-                            'component_id': _comp_id,
-                            'width': _w,
-                            'height': _h,
-                            'frame_b64': frame_b64,
-                            'refresh_ms': _refresh,
-                        })
-                        if _busy is not None and _busy >= 0:
-                            try:
-                                _lib.qemu_picsimlab_set_pin(_busy + 1, _busy_busy)
-
-                                def _busy_idle_cb(_b=_busy, _lvl=_busy_idle):
-                                    try:
-                                        _lib.qemu_picsimlab_set_pin(_b + 1, _lvl)
-                                    except Exception:
-                                        pass
-
-                                threading.Timer(_refresh / 1000.0, _busy_idle_cb).start()
-                            except Exception:
-                                pass
-                    return _on_flush
-
-                # Pick the decoder family from the payload. Defaults to
-                # SSD168x for backward compatibility (initial frontends only
-                # sent SSD168x); the UC8159c value is sent for ACeP panels.
-                ctl_family = str(s.get('controller_family', 'ssd168x'))
-                if ctl_family == 'uc8159c':
-                    slave = _Uc8159cEpaperSlave(
-                        component_id=comp_id, width=width, height=height,
-                        on_flush=_flush_factory(),
-                    )
-                elif ctl_family == 'uc8179':
-                    slave = _Uc8179EpaperSlave(
-                        component_id=comp_id, width=width, height=height,
-                        on_flush=_flush_factory(),
-                    )
-                else:
-                    _is_bwr = 'bwr' in str(s.get('panel_kind', '')).lower()
-                    slave = _Ssd168xEpaperSlave(
-                        component_id=comp_id, width=width, height=height,
-                        on_flush=_flush_factory(), is_bwr=_is_bwr,
-                    )
-                state = {
-                    'slave': slave,
-                    'dc_pin': int(s.get('dc_pin', -1)),
-                    'cs_pin': int(s.get('cs_pin', -1)),
-                    'rst_pin': int(s.get('rst_pin', -1)),
-                    'busy_pin': busy_pin,
-                    'cs_low': False,
-                    'dc_high': False,
-                    'refresh_ms': refresh_ms,
-                    'controller_family': ctl_family,
-                }
-                _epaper_slaves[comp_id] = slave
-                _epaper_state[comp_id] = state
-                _spi_population_changed()
-                sensor_data['epaper_component_id'] = comp_id
-                _log(f"[epaper:{ctl_family}] registered '{comp_id}' "
-                     f"({width}x{height}) "
-                     f"DC={state['dc_pin']} CS={state['cs_pin']} "
-                     f"RST={state['rst_pin']} BUSY={state['busy_pin']}")
             elif sensor_type in ('ssd1306', 'pcf8574', 'i2c-write-sink'):
                 # 'i2c-write-sink' is the generic form: any write-only device
                 # whose rendering lives in the browser (the Grove display
@@ -3234,84 +3050,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     _i2c_add(gpio, cmd, sink, i2c_addr)
                     sensor_data['i2c_addr'] = i2c_addr
                     sensor_data['slave'] = sink
-                elif sensor_type == 'epaper-ssd168x':
-                    # Runtime registration of an SSD168x ePaper panel. Mirrors
-                    # the `_init_sensors` branch above. Component-id keyed so
-                    # multiple panels on the same board route correctly.
-                    comp_id = str(cmd.get('component_id', f'epaper-{gpio}'))
-                    width = int(cmd.get('width', 200))
-                    height = int(cmd.get('height', 200))
-                    refresh_ms = int(cmd.get('refresh_ms', 50))
-                    busy_pin = int(cmd.get('busy_pin', -1))
-
-                    def _flush_factory_rt(_comp_id=comp_id,
-                                          _w=width, _h=height,
-                                          _refresh=refresh_ms,
-                                          _busy=busy_pin,
-                                          _lib=lib):
-                        def _on_flush(frame):
-                            try:
-                                frame_b64 = base64.b64encode(frame.pixels).decode('ascii')
-                            except Exception:
-                                return
-                            # Emit FLAT (see the _init_sensors path) — the backend
-                            # re-wraps under 'data', so a nested 'data' here would
-                            # double-wrap and the frontend would never render.
-                            _emit({
-                                'type': 'epaper_update',
-                                'component_id': _comp_id,
-                                'width': _w,
-                                'height': _h,
-                                'frame_b64': frame_b64,
-                                'refresh_ms': _refresh,
-                            })
-                            if _busy is not None and _busy >= 0:
-                                try:
-                                    _lib.qemu_picsimlab_set_pin(_busy + 1, 1)
-
-                                    def _busy_low(_b=_busy):
-                                        try:
-                                            _lib.qemu_picsimlab_set_pin(_b + 1, 0)
-                                        except Exception:
-                                            pass
-
-                                    threading.Timer(_refresh / 1000.0, _busy_low).start()
-                                except Exception:
-                                    pass
-                        return _on_flush
-
-                    ctl_family = str(cmd.get('controller_family', 'ssd168x'))
-                    if ctl_family == 'uc8159c':
-                        slave = _Uc8159cEpaperSlave(
-                            component_id=comp_id, width=width, height=height,
-                            on_flush=_flush_factory_rt(),
-                        )
-                    elif ctl_family == 'uc8179':
-                        slave = _Uc8179EpaperSlave(
-                            component_id=comp_id, width=width, height=height,
-                            on_flush=_flush_factory_rt(),
-                        )
-                    else:
-                        _is_bwr = 'bwr' in str(cmd.get('panel_kind', '')).lower()
-                        slave = _Ssd168xEpaperSlave(
-                            component_id=comp_id, width=width, height=height,
-                            on_flush=_flush_factory_rt(), is_bwr=_is_bwr,
-                        )
-                    state = {
-                        'slave': slave,
-                        'dc_pin': int(cmd.get('dc_pin', -1)),
-                        'cs_pin': int(cmd.get('cs_pin', -1)),
-                        'rst_pin': int(cmd.get('rst_pin', -1)),
-                        'busy_pin': busy_pin,
-                        'cs_low': False,
-                        'dc_high': False,
-                        'refresh_ms': refresh_ms,
-                        'controller_family': ctl_family,
-                    }
-                    _epaper_slaves[comp_id] = slave
-                    _epaper_state[comp_id] = state
-                    _spi_population_changed()
-                    sensor_data['epaper_component_id'] = comp_id
                 _sensors[gpio] = sensor_data
             _log(f'Sensor {sensor_type} attached on GPIO {gpio}')
 
@@ -3394,6 +3132,14 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                                 })
                             except Exception as e:
                                 _log(f'[custom-chip] attr update failed: {e!r}')
+                        # The solve moved a wired pad (or a wire came or went):
+                        # the tab sends the whole pad table again.
+                        new_volts = cmd.get('pad_volts')
+                        if rt is not None and isinstance(new_volts, dict):
+                            try:
+                                rt.update_pad_volts(new_volts)
+                            except Exception as e:
+                                _log(f'[custom-chip] pad_volts update failed: {e!r}')
 
             for _g, _p in _ir_pending:
                 with _sensors_lock:
@@ -3412,51 +3158,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 # By identity, the record's pin: a second device at the same
                 # address (the same sensor on the other controller) stays.
                 _i2c_table.remove(('sensor', gpio))
-                if sensor and 'epaper_component_id' in sensor:
-                    cid = sensor['epaper_component_id']
-                    _epaper_slaves.pop(cid, None)
-                    _epaper_state.pop(cid, None)
             _log(f'Sensor detached from GPIO {gpio}')
-
-        # ── Cross-board I2C proxy slave ──────────────────────────────────
-        # Installed by the frontend when an ESP32 board is wired across
-        # the I2C bus to a peer board (Uno, Pico, …) that owns a virtual
-        # device.  The frontend snapshots the device's register state and
-        # pushes it here; we install a ProxySlave at the address so the
-        # ESP32 firmware's Wire master reads succeed inside QEMU.
-        elif c == 'proxy_i2c_register':
-            i2c_addr = int(cmd.get('addr', 0)) & 0x7F
-            try:
-                regs = base64.b64decode(cmd.get('regs_b64', ''))
-            except Exception as exc:
-                _log(f'proxy_i2c_register: bad base64: {exc}')
-                regs = b''
-            # Pass _emit so writes from the ESP32 firmware get forwarded
-            # back to the frontend as `proxy_i2c_complete` events.  The
-            # frontend then replays the byte sequence on the actual
-            # peer I2CDevice so its state (PCF8574 latch, SSD1306
-            # GDDRAM, memory device registers …) stays in sync.
-            _i2c_table.add(('proxy', i2c_addr), _ProxySlave(i2c_addr, regs, emit_fn=_emit),
-                           [i2c_addr])
-            _log(f'proxy_i2c registered at 0x{i2c_addr:02x} ({len(regs)} bytes)')
-
-        elif c == 'proxy_i2c_update':
-            i2c_addr = int(cmd.get('addr', 0)) & 0x7F
-            try:
-                regs = base64.b64decode(cmd.get('regs_b64', ''))
-            except Exception as exc:
-                _log(f'proxy_i2c_update: bad base64: {exc}')
-                regs = b''
-            slave = _i2c_table.get(('proxy', i2c_addr))
-            if slave is not None and hasattr(slave, 'update_registers'):
-                slave.update_registers(regs)
-                _log(f'proxy_i2c updated at 0x{i2c_addr:02x} ({len(regs)} bytes)')
-
-        elif c == 'proxy_i2c_unregister':
-            i2c_addr = int(cmd.get('addr', 0)) & 0x7F
-            popped = _i2c_table.remove(('proxy', i2c_addr))
-            if popped is not None:
-                _log(f'proxy_i2c unregistered at 0x{i2c_addr:02x}')
 
         # ── ESP32-CAM frame injection ────────────────────────────────────
         # Pushes a JPEG (or other format) into the QEMU OV2640 device's

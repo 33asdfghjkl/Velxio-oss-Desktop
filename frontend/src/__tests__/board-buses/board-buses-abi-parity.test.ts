@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { PinManager } from '../../simulation/PinManager';
 import { ChipInstance } from '../../simulation/customChips/ChipRuntime';
 import { busRegistry, boardPinsFromPinManager, registerBoardPinFunctions } from '../../simulation/buses';
+import { useElectricalStore } from '../../store/useElectricalStore';
 import type {
   EngineBinding,
   GuestClock,
@@ -69,6 +70,8 @@ interface Step {
   ns?: number;
   name?: string;
   value?: number;
+  /** A `volts` row: the solved voltage on the pad wired to `pin`, null for no wire. */
+  volts?: number | null;
   hex?: string;
   why?: string;
   /** A host that answers this row differently, and how (the shared fields overridden). */
@@ -299,6 +302,28 @@ class BrowserHost {
   dispose(): void {
     this.chip?.dispose();
     busRegistry.clear();
+    useElectricalStore.getState().reset();
+  }
+
+  /**
+   * The circuit solve's word on a pad: `volts` on the net the wire from chip
+   * pin `pin` reaches, published the way CircuitSimulationService publishes a
+   * solve (the pin-to-net map and the node voltages, as one snapshot); null
+   * takes the wire away. The runtime reads the store itself (padVolts.ts).
+   */
+  volts(pin: string, volts: number | null): void {
+    const st = useElectricalStore.getState();
+    const pinNetMap = new Map(st.pinNetMap);
+    const nodeVoltages = { ...st.nodeVoltages };
+    const net = `net_${pin}`;
+    if (volts === null) {
+      pinNetMap.delete(`${CHIP}:${pin}`);
+      delete nodeVoltages[net];
+    } else {
+      pinNetMap.set(`${CHIP}:${pin}`, net);
+      nodeVoltages[net] = volts;
+    }
+    useElectricalStore.setState({ pinNetMap, nodeVoltages } as never);
   }
 
   private get e() {
@@ -454,6 +479,9 @@ function replay(host: BrowserHost, scenario: Scenario): string[] {
         break;
       case 'attr':
         host.chip.setAttr(st.name!, st.value!);
+        break;
+      case 'volts':
+        host.volts(st.pin!, st.volts ?? null);
         break;
       case 'poke':
         host.poke(bytes(st.hex!));

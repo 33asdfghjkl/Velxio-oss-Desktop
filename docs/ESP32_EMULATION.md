@@ -546,7 +546,8 @@ manager.set_adc_raw(client_id, channel, raw)
 await manager.send_serial_bytes(client_id, data, uart_id=0)
 
 manager.set_i2c_response(client_id, addr, byte)       # Simulate I2C device
-manager.set_spi_response(client_id, byte)             # Simulate SPI device
+manager.set_bus_map(client_id, spi, i2c)              # The bus map: the SPI responders (portable WASM models) and I2C targets the worker hosts, from the tab's wiring
+manager.set_bus_attrs(client_id, owner, attrs)        # Live inputs of one hosted model (touch coordinates, a voltage)
 await manager.poll_ledc(client_id)                    # Read PWM (call periodically)
 manager.get_status(client_id)                         # → dict with runtime state
 ```
@@ -568,7 +569,8 @@ manager.get_status(client_id)                         # → dict with runtime st
 | `esp32_uart2_input` | `{bytes: [int]}` | UART2 RX |
 | `esp32_adc_set` | `{channel, millivolts?}` or `{channel, raw?}` | Set ADC |
 | `esp32_i2c_response` | `{addr, response}` | Configure I2C response |
-| `esp32_spi_response` | `{response}` | Configure SPI MISO |
+| `esp32_bus_map` | `{spi: [...], i2c: [...], uart: [...]}` | The bus map (which responders and targets the worker hosts, and on which controller); see [board-buses.md](./wiki/board-buses.md) |
+| `esp32_bus_attrs` | `{owner, attrs}` | Live inputs of a hosted model |
 | `esp32_status` | `{}` | Query runtime state |
 
 ---
@@ -1136,7 +1138,7 @@ bridge.sendSerialBytes(bytes, uart?)   // Send serial data to the ESP32
 bridge.sendPinEvent(gpioPin, state)    // Simulate external input on a GPIO (buttons)
 bridge.setAdc(channel, millivolts)     // Set ADC voltage (0-3300 mV)
 bridge.setI2cResponse(addr, response)  // I2C device response
-bridge.setSpiResponse(response)        // SPI device MISO byte
+bridge.sendBusMap(spi, i2c, uart)      // The bus map the fabric computed (esp32_bus_map); MISO is answered by the hosted models, never per byte from the tab
 ```
 
 **UI component interaction with the emulated ESP32:**

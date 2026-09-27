@@ -21,6 +21,8 @@ import type { PadDrive, PadEvent, PadPull, PadState } from './line/padEvent';
 import { PadBus } from './line/padBus';
 
 export type PinState = boolean;
+/** See PinManager.claimLevel. */
+export type LevelResolver = (proposed: boolean, source: 'mcu' | 'external') => boolean | undefined;
 export type PinChangeCallback = (pin: number, state: PinState) => void;
 export type AnalogCallback = (pin: number, voltage: number) => void;
 // timeMs (optional) is the precise simulated time of the duty-cycle change
@@ -62,6 +64,32 @@ export class PinManager {
   /** Subscribe to guest drive-state changes on one pad. */
   onPadChange(pin: number, callback: (e: PadEvent) => void): () => void {
     return this.pads.onPad(pin, callback);
+  }
+
+  // ── Claimed levels (a net resolving a pin's wire) ───────────────────────
+  //
+  // A board pin a chip holds is a net with several drivers (busNets), and the
+  // wire's level is that net's resolution, not the last thing anyone wrote.
+  // While a net claims a pin, every level that reaches the channel is a
+  // PROPOSAL the resolver answers, and the answer is what the channel
+  // carries: a level the engine reports on a pad it drives is the wire's, a
+  // part's injection or the latch of a pad the guest configured as an input
+  // is not. It used to be that the write landed first and the net re-asserted
+  // its level afterwards, so a second chip watching the pin saw a true/false
+  // glitch for every INPUT_PULLUP the sketch enabled on a pin a chip held low.
+  private readonly levelResolvers = new Map<number, LevelResolver>();
+
+  /**
+   * Let `resolve` answer every level proposed for `pin`, with the door it
+   * came through: the level the wire holds with that proposal on it, or
+   * undefined to leave the channel as it is (an injection on a pad the guest
+   * drives moves nothing). Returns the release.
+   */
+  claimLevel(pin: number, resolve: LevelResolver): () => void {
+    this.levelResolvers.set(pin, resolve);
+    return () => {
+      if (this.levelResolvers.get(pin) === resolve) this.levelResolvers.delete(pin);
+    };
   }
 
   /** The pad's current drive state (released with no pull until reported). */
@@ -166,6 +194,20 @@ export class PinManager {
         const arduinoPin = pinMap ? pinMap[bit] : (legacyOffsets[portName] ?? 0) + bit;
         if (arduinoPin < 0) continue; // unmapped bit
 
+        // The latch of a pad the guest configured as an input is its pull,
+        // not a level on the wire: on a pin a net claims, the net says what
+        // the wire holds with that pull on it (see claimLevel).
+        const isInput = ddrMask !== undefined && (ddrMask & mask) === 0;
+        const resolver = isInput ? this.levelResolvers.get(arduinoPin) : undefined;
+        if (resolver) {
+          const resolved = resolver(newState, 'external');
+          if (resolved === undefined || this.pinStates.get(arduinoPin) === resolved) continue;
+          this.pinStates.set(arduinoPin, resolved);
+          const callbacks = this.listeners.get(arduinoPin);
+          if (callbacks) callbacks.forEach((cb) => cb(arduinoPin, resolved));
+          continue;
+        }
+
         this.pinStates.set(arduinoPin, newState);
         // Only mark as MCU-output if DDR bit is set (or DDR unknown → legacy).
         if (ddrMask === undefined || (ddrMask & mask) !== 0) {
@@ -219,6 +261,12 @@ export class PinManager {
     // second, and back-to-back rebuild+solve+publish cycles starved the main
     // thread until the sim WebSocket timed out.
     const newlyClassified = source === 'mcu' && !this.outputPins.has(pin);
+    const resolver = this.levelResolvers.get(pin);
+    if (resolver) {
+      const resolved = resolver(state, source);
+      if (resolved === undefined) return;
+      state = resolved;
+    }
     const current = this.pinStates.get(pin);
     if (current === state) {
       if (source === 'mcu') this.outputPins.add(pin);

@@ -8,7 +8,7 @@ at the ctypes boundary only (fixtures/board_buses_worker/fake_libqemu.py): the
 worker's own ctypes callbacks are registered with it, and the test plays the
 guest by calling them the way the C side does (per-byte picsimlab_spi_event,
 write-only picsimlab_spi_event_batch, picsimlab_write_pin, picsimlab_i2c_event).
-Every device model is the real one: the portable microSD, Ssd168xEpaperSlave,
+Every device model is the real one: the portable microSD, the
 MPU6050/DS3231/BMP280 slaves, and custom chips compiled with the production
 chip flags (fixtures/board_buses_worker/*.c, rebuilt by build.sh) running in the
 worker's WasmChipRuntime.
@@ -84,11 +84,9 @@ def spi_chip(pin: int, cs: int, sig: int, component_id: str) -> dict:
     }
 
 
-EPAPER = {
-    'sensor_type': 'epaper-ssd168x', 'pin': 300, 'component_id': 'epd1',
-    'width': 200, 'height': 200, 'refresh_ms': 1, 'controller_family': 'ssd168x',
-    'dc_pin': EPD_DC, 'cs_pin': EPD_CS, 'rst_pin': EPD_RST, 'busy_pin': EPD_BUSY,
-}
+# The e-paper panel is a sink the tab keeps (it decodes the relayed stream
+# since F4; no model of it runs here), so the map only names its select:
+EPAPER_SINK = {'sinks': {'all': False, 'cs': [{'kind': 'pin', 'gpio': EPD_CS, 'active_low': True}]}}
 
 # The microSD as the tab sends it: the REAL portable model
 # (frontend/public/bus-chips/microsd.wasm, built from buses/models/microsd.c),
@@ -322,11 +320,10 @@ class TestChipSwallowsBus:
 
     def test_setup_bus_without_a_chip(self, worker):
         """qemu-worker-chip-spi-swallows-bus setup: with no chip, the TFT bytes
-        (per byte and bulk) reach the browser, the card answers CMD0 and the
-        e-paper latches a frame, all in this same rig."""
-        w = worker(sensors=[EPAPER], bus_map={'spi': [sd_entry()]})
+        (per byte and bulk) reach the browser and the card answers CMD0, all in
+        this same rig."""
+        w = worker(bus_map={'spi': [sd_entry()]})
         w.pin(SD_CS, 1)
-        w.pin(EPD_CS, 1)
         _clock_tft(w)
         assert w.spi_stream() == bytes(CASET_CMD + CASET_DATA + PIXELS)
 
@@ -336,12 +333,6 @@ class TestChipSwallowsBus:
         # layout cannot see it (see buses/models/microsd.c).
         assert w.spi(sd_cmd(0) + [0xFF, 0xFF])[7] == 0x01
         w.pin(SD_CS, 1)
-
-        w.pin(EPD_CS, 0)
-        w.pin(EPD_DC, 0)
-        w.spi([0x20])
-        w.pin(EPD_CS, 1)
-        assert w.wait_for(lambda: bool(w.events('epaper_update')))
 
     def test_deselected_chip_leaves_per_byte_tft_traffic_on_the_bus(self, worker):
         """qemu-worker-chip-spi-swallows-bus: with the chip's CS high, the
@@ -381,16 +372,19 @@ class TestChipSwallowsBus:
         r = w.spi(sd_cmd(0) + [0xFF, 0xFF])
         assert r[7] == 0x01, f'CMD0 answered {r}'
 
-    def test_deselected_chip_leaves_the_epaper_latching(self, worker):
+    def test_deselected_chip_leaves_a_tab_sinks_bytes_on_the_bus(self, worker):
         """qemu-worker-chip-spi-swallows-bus: with the chip's CS high and the
-        panel's CS low, MASTER_ACTIVATION (0x20) latches an e-paper frame."""
-        w = worker(sensors=[spi_chip(400, CHIP_A_CS, 0xA0, 'probe-a'), EPAPER])
+        e-paper's CS low, MASTER_ACTIVATION (0x20) reaches the tab, where the
+        panel decodes it."""
+        w = worker(sensors=[spi_chip(400, CHIP_A_CS, 0xA0, 'probe-a')],
+                   bus_map={'spi': [EPAPER_SINK]})
         w.pin(CHIP_A_CS, 1)
         w.pin(EPD_CS, 0)
         w.pin(EPD_DC, 0)
         w.spi([0x20])
         w.pin(EPD_CS, 1)
-        assert w.wait_for(lambda: bool(w.events('epaper_update')), 1.0), 'no epaper_update'
+        w.flush()
+        assert w.spi_stream() == bytes([0x20]), 'the byte clocked under the sink select reaches the tab'
 
     def test_setup_two_chips_load_and_the_second_hears_its_cs(self, worker):
         """qemu-worker-chip-spi-swallows-bus setup: with two probe chips on the

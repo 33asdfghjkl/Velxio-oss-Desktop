@@ -70,9 +70,12 @@ static void rec(uint32_t kind, uint32_t a, uint32_t b, uint32_t c) {
 
 /* ── State ──────────────────────────────────────────────────────────────── */
 
-/* Pins, by the index the probe surface uses (pick_pin). */
-enum { P_IN = 0, P_OUT = 1, P_DIR = 2, P_CS = 3, P_CS2 = 4 };
-static vx_pin pins[5];
+/* Pins, by the index the probe surface uses (pick_pin). AIN and AIN2 are the
+ * analog pads: AIN is the one a scenario wires to a solved net, AIN2 stays in
+ * the air, and neither is on the board's pin table. */
+enum { P_IN = 0, P_OUT = 1, P_DIR = 2, P_CS = 3, P_CS2 = 4, P_AIN = 5, P_AIN2 = 6 };
+#define P_COUNT 7
+static vx_pin pins[P_COUNT];
 static vx_pin p_sck, p_mosi, p_miso, p_sda, p_scl, p_rx, p_tx;
 
 static vx_spi  spi[2];
@@ -182,6 +185,8 @@ void chip_setup(void) {
   pins[P_DIR] = vx_pin_register("DIR", VX_INPUT);
   pins[P_CS]  = vx_pin_register("CS",  VX_INPUT_PULLUP);
   pins[P_CS2] = vx_pin_register("CS2", VX_INPUT_PULLUP);
+  pins[P_AIN]  = vx_pin_register("AIN",  VX_INPUT);
+  pins[P_AIN2] = vx_pin_register("AIN2", VX_INPUT);
   p_sck  = vx_pin_register("SCK",  VX_INPUT);
   p_mosi = vx_pin_register("MOSI", VX_INPUT);
   p_miso = vx_pin_register("MISO", VX_INPUT);
@@ -282,18 +287,30 @@ uint32_t probe_uart_handle(void) { return (uint32_t)uart; }
 
 /* Pins */
 __attribute__((export_name("pin_read")))
-uint32_t probe_pin_read(uint32_t which) { return (uint32_t)vx_pin_read(pins[which % 5]); }
+uint32_t probe_pin_read(uint32_t which) { return (uint32_t)vx_pin_read(pins[which % P_COUNT]); }
 
 __attribute__((export_name("pin_write")))
-void probe_pin_write(uint32_t which, uint32_t v) { vx_pin_write(pins[which % 5], (int)v); }
+void probe_pin_write(uint32_t which, uint32_t v) { vx_pin_write(pins[which % P_COUNT], (int)v); }
 
 __attribute__((export_name("pin_set_mode")))
 void probe_pin_set_mode(uint32_t which, uint32_t mode) {
-  vx_pin_set_mode(pins[which % 5], (vx_pin_mode)mode);
+  vx_pin_set_mode(pins[which % P_COUNT], (vx_pin_mode)mode);
 }
 
 __attribute__((export_name("pin_handle")))
-uint32_t probe_pin_handle(uint32_t which) { return (uint32_t)pins[which % 5]; }
+uint32_t probe_pin_handle(uint32_t which) { return (uint32_t)pins[which % P_COUNT]; }
+
+/* The analog side: the solved voltage in millivolts (rounded), and whether a
+ * wire reaches the pad. */
+__attribute__((export_name("pin_read_analog_mv")))
+uint32_t probe_pin_read_analog_mv(uint32_t which) {
+  double v = vx_pin_read_analog(pins[which % P_COUNT]);
+  if (v < 0) v = 0;
+  return (uint32_t)(v * 1000.0 + 0.5);
+}
+
+__attribute__((export_name("pin_wired")))
+uint32_t probe_pin_wired(uint32_t which) { return (uint32_t)vx_pin_wired(pins[which % P_COUNT]); }
 
 /* Attributes */
 __attribute__((export_name("attr_gain_x100")))

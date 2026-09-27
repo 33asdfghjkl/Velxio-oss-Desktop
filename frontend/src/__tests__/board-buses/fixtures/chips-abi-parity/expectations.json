@@ -24,6 +24,7 @@
     "",
     "A scenario with `only` names the hosts that can drive it at all, and says why the others",
     "cannot: the Linux boards address a chip enable per transaction (a select is never floating",
+    "volts: the tab's circuit solve publishes `volts` on the net of the pad wired to chip pin `pin` (null: no wire reaches the pad any more). The browser runtime reads it off the electrical store; a worker or Linux host is told it as pad_volts, keyed by the chip's pin names.",
     "and never a GPIO the guest writes) and forward no pins, UART or timers to a chip."
   ],
   "pins": {
@@ -1275,6 +1276,104 @@
             "spi_rx 1=06"
           ],
           "why": "CS rising ends the frame at two bytes, from the chip's own vx_spi_stop"
+        }
+      ]
+    },
+    {
+      "name": "analog: vx_pin_read_analog answers the solved voltage on a wired pad, and vx_pin_wired tells a wired pad from one in the air",
+      "steps": [
+        {
+          "op": "call",
+          "fn": "pin_wired",
+          "args": [
+            5
+          ],
+          "ret": 0,
+          "why": "no wire reaches AIN yet"
+        },
+        {
+          "op": "call",
+          "fn": "pin_read_analog_mv",
+          "args": [
+            5
+          ],
+          "ret": 0,
+          "why": "a pad in the air reads 0 V, never a PWM duty or a digital level scaled to the rail"
+        },
+        {
+          "op": "volts",
+          "pin": "AIN",
+          "volts": 2.0,
+          "why": "a rotary sensor at 120 degrees on a 5 V rail: 2.000 V on AIN's net"
+        },
+        {
+          "op": "call",
+          "fn": "pin_wired",
+          "args": [
+            5
+          ],
+          "ret": 1
+        },
+        {
+          "op": "call",
+          "fn": "pin_read_analog_mv",
+          "args": [
+            5
+          ],
+          "ret": 2000
+        },
+        {
+          "op": "volts",
+          "pin": "AIN",
+          "volts": 3.3,
+          "why": "the knob turns: the solve moves, and so does the reading"
+        },
+        {
+          "op": "call",
+          "fn": "pin_read_analog_mv",
+          "args": [
+            5
+          ],
+          "ret": 3300
+        },
+        {
+          "op": "call",
+          "fn": "pin_wired",
+          "args": [
+            6
+          ],
+          "ret": 0,
+          "why": "AIN2 has no wire whatever AIN does"
+        },
+        {
+          "op": "call",
+          "fn": "pin_read_analog_mv",
+          "args": [
+            6
+          ],
+          "ret": 0
+        },
+        {
+          "op": "volts",
+          "pin": "AIN",
+          "volts": null,
+          "why": "the wire is removed"
+        },
+        {
+          "op": "call",
+          "fn": "pin_wired",
+          "args": [
+            5
+          ],
+          "ret": 0
+        },
+        {
+          "op": "call",
+          "fn": "pin_read_analog_mv",
+          "args": [
+            5
+          ],
+          "ret": 0
         }
       ]
     }

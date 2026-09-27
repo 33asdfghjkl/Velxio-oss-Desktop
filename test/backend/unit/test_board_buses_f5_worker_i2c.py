@@ -384,14 +384,6 @@ class TestWorkerArbitrationAndIdentity:
         assert [(d['bus'], d['controller'], d['owners']) for d in diags] == [
             ('i2c', 0, ['chipA', 'chipB'])]
 
-    def test_unregistering_the_proxy_keeps_a_sensor_at_its_address(self, worker):
-        """proxy_i2c_unregister used to pop whatever sat at the address."""
-        w = worker(sensors=[mpu(268, 'mpu1')])
-        w.send({'cmd': 'proxy_i2c_register', 'addr': 0x68, 'regs_b64': ''})
-        w.send({'cmd': 'proxy_i2c_unregister', 'addr': 0x68})
-        w.sync()
-        assert w.read_reg(0, 0x68, MPU_WHO_AM_I) == (0, 0x68)
-
     def test_a_record_resent_on_its_pin_replaces_its_target(self, worker):
         """A sensor_attach on a pin that held an I2C target takes it away,
         whatever the new record is."""
