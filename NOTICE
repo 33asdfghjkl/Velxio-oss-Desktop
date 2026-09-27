@@ -94,6 +94,24 @@ made, as required by AGPLv3 section 5(a).
             that is not installed, and an already-installed core
             (arduino:avr) never triggers it.
 
+2026-09-27  backend/app/services/arduino_cli.py
+            FIXED an upstream bug in the ESP32 compile path. It passed
+            --build-property build.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1,
+            but --build-property REPLACES a property and the esp32 platform
+            defines build.extra_flags itself (-DESP32, -DARDUINO_ARCH_ESP32,
+            the per-board defines). Every one of those was dropped, so any
+            library branching on defined(ESP32) took its non-ESP path -
+            Adafruit_SSD1306.cpp included <util/delay.h>, which the Xtensa
+            toolchain does not ship, and ESP32 builds failed with
+            "fatal error: util/delay.h: No such file or directory".
+            The defines now go through compiler.cpp/c/S.extra_flags, which
+            are empty in the platform and referenced by its recipes, so they
+            append instead of replacing. Verified: ESP32-S3 and ESP32-C3
+            builds of an Adafruit_SSD1306 sketch now succeed.
+
+            The same pattern in test/backend/integration/test_esp32c3_emulation.py
+            was corrected too.
+
 2026-09-27  .gitignore
             Added ignore rules for the desktop wrapper's build output
             (desktop/node_modules, desktop/release, desktop/build/icon.png).

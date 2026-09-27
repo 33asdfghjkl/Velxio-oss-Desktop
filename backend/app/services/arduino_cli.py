@@ -695,13 +695,24 @@ class ArduinoCLIService:
                     cmd[2] = '--fqbn'
                     cmd.insert(3, fqbn_dio)
                     cmd = cmd[:4]  # trim accidental duplicates
+                    # These defines MUST go in compiler.*.extra_flags, NOT in
+                    # build.extra_flags. `--build-property` REPLACES a property,
+                    # and the esp32 platform defines build.extra_flags itself
+                    # (-DESP32, -DARDUINO_ARCH_ESP32, the per-board defines).
+                    # Overriding it dropped all of them, so any library that
+                    # branches on `defined(ESP32)` took its non-ESP path:
+                    # Adafruit_SSD1306.cpp did `#include <util/delay.h>`, the
+                    # Xtensa toolchain has no avr-libc, and the build died with
+                    # "fatal error: util/delay.h: No such file or directory".
+                    # compiler.c/cpp/S.extra_flags are empty in the platform and
+                    # referenced by its recipes, so they append cleanly.
                     cmd = [self.cli_path, "compile", "--fqbn", fqbn_dio,
                            "--build-property",
-                           "build.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1",
-                           # Adafruit_BusIO 1.17.x dropped BitOrder on ESP32 3.x;
-                           # this define restores it as uint8_t (the type it was).
+                           "compiler.cpp.extra_flags=-DBitOrder=uint8_t -DARDUINO_ESP32_LCGAMBOA=1",
                            "--build-property",
-                           "compiler.cpp.extra_flags=-DBitOrder=uint8_t",
+                           "compiler.c.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1",
+                           "--build-property",
+                           "compiler.S.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1",
                            "--output-dir", str(build_dir),
                            str(sketch_dir)]
                 else:

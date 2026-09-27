@@ -70,7 +70,11 @@ def compile_sketch(sketch_dir: Path, build_dir: Path) -> Path:
     cmd = [
         'arduino-cli', 'compile',
         '--fqbn', FQBN,
-        '--build-property', 'build.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1',
+        # compiler.*.extra_flags appends; build.extra_flags would REPLACE the
+        # platform's own -DESP32/-DARDUINO_ARCH_ESP32 and break any library
+        # that branches on defined(ESP32). See app/services/arduino_cli.py.
+        '--build-property', 'compiler.cpp.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1',
+        '--build-property', 'compiler.c.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1',
         '--output-dir', str(build_dir),
         str(sketch_dir),
     ]
