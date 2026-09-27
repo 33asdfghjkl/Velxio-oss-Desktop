@@ -66,10 +66,10 @@ deliberately independent of it:
 
 ```bash
 npm install            # install Electron
-npm run gen:icon       # regenerate build/icon.png
+npm run gen:icon       # regenerate build/icon.png and build/icon.ico
 npm start              # run the desktop app
 npm start -- --no-backend   # skip auto-starting the Python backend
-npm run dist           # package installers into desktop/release/
+npm run dist           # package installers into desktop/release/ (see below)
 ```
 
 Useful environment variables:
@@ -94,6 +94,39 @@ $env:ELECTRON_RUN_AS_NODE=''; npx electron .
 **The backend is slow on first run.** See `VELXIO_BACKEND_TIMEOUT_MS`
 above. Pre-warm once with `arduino-cli core update-index`.
 
+### Installing on Windows
+
+`npm run dist` produces a normal electron-builder output, but on a machine
+with **Smart App Control** (or any WDAC application-control policy) enabled,
+that `.exe` is refused outright:
+
+```
+An Application Control policy has blocked this file.
+```
+
+electron-builder renames and rewrites Electron's executable, which changes
+its hash and removes the reputation the policy relies on. The Electron binary
+that `npm install` downloads is untouched, so policy allows *that* one.
+
+`scripts/install-windows.ps1` installs the untouched binary and loads the app
+from a normal directory instead (Electron's "run an app directory" mode):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File desktop\scripts\install-windows.ps1
+# custom destination:
+powershell -ExecutionPolicy Bypass -File desktop\scripts\install-windows.ps1 -Destination 'D:\Apps\Velxio'
+```
+
+It lays out `electron.exe`, `desktop/`, `frontend/dist/`, `backend/` (including
+its venv) and `.tools/arduino-cli/`, then creates a desktop shortcut whose
+target is `electron.exe "<install>\desktop"`. In that mode
+`app.isPackaged === false`, which is the layout this wrapper already supports,
+so no extra build step is needed.
+
+The window appears in about a second: the HTTP server and window are created
+*before* the backend is spawned, and the backend catches up in the background
+(the proxy answers 502 until it does).
+
 ## Known limitations
 
 - **The Python backend is not bundled.** Only its source is. The wrapper starts
@@ -102,7 +135,10 @@ above. Pre-warm once with `arduino-cli core update-index`.
   emulation).
 - **QEMU-backed boards** (ESP32 family, STM32, Raspberry Pi Linux) need the QEMU
   libraries that the OSS project intentionally does not ship.
-- Code-signing is not configured; Windows/macOS may warn on first launch.
+- **Nothing is code-signed.** macOS Gatekeeper will warn, and on Windows a
+  machine with Smart App Control enabled refuses the electron-builder output
+  outright — use `scripts/install-windows.ps1` (see above). Doing this
+  properly needs a CA-issued code-signing certificate.
 
 ## License
 

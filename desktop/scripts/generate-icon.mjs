@@ -1,9 +1,13 @@
 /**
- * Generates the application icon - an ORIGINAL design.
+ * Generates the application icons - ORIGINAL designs.
  *
  * The unofficial wrapper deliberately ships no Velxio logo or trademark: this
  * is a generic chip glyph with a play mark, drawn programmatically with a tiny
- * dependency-free PNG encoder (node:zlib only).
+ * dependency-free encoder (node:zlib only).
+ *
+ * Outputs:
+ *   build/icon.png   512x512, used by the window and by electron-builder
+ *   build/icon.ico   multi-size ICO (16..256), used by the Windows shortcut
  *
  * Usage: node scripts/generate-icon.mjs [size]
  */
@@ -13,7 +17,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const OUT = path.join(HERE, '..', 'build', 'icon.png');
+const BUILD = path.join(HERE, '..', 'build');
+const OUT_PNG = path.join(BUILD, 'icon.png');
+const OUT_ICO = path.join(BUILD, 'icon.ico');
 
 const CRC_TABLE = (() => {
   const t = new Int32Array(256);
@@ -46,11 +52,7 @@ function encodePng(width, height, rgba) {
   ihdr.writeUInt32BE(width, 0);
   ihdr.writeUInt32BE(height, 4);
   ihdr[8] = 8;   // bit depth
-  ihdr[9] = 6;   // colour type RGBA
-  ihdr[10] = 0;  // deflate
-  ihdr[11] = 0;  // adaptive filtering
-  ihdr[12] = 0;  // no interlace
-
+  ihdr[9] = 6;   // RGBA
   const stride = width * 4;
   const raw = Buffer.alloc((stride + 1) * height);
   for (let y = 0; y < height; y++) {
@@ -63,6 +65,34 @@ function encodePng(width, height, rgba) {
     chunk('IDAT', zlib.deflateSync(raw, { level: 9 })),
     chunk('IEND', Buffer.alloc(0)),
   ]);
+}
+
+/**
+ * Windows ICO container holding PNG-compressed entries (Vista+ reads these).
+ * Dependency-free on purpose - see the file header.
+ */
+function encodeIco(entries) {
+  const dir = Buffer.alloc(6);
+  dir.writeUInt16LE(0, 0);              // reserved
+  dir.writeUInt16LE(1, 2);              // type: icon
+  dir.writeUInt16LE(entries.length, 4);
+
+  const table = Buffer.alloc(16 * entries.length);
+  let offset = 6 + table.length;
+  entries.forEach((e, i) => {
+    const at = i * 16;
+    table[at] = e.size >= 256 ? 0 : e.size;      // 0 means 256
+    table[at + 1] = e.size >= 256 ? 0 : e.size;
+    table[at + 2] = 0;                            // palette count
+    table[at + 3] = 0;                            // reserved
+    table.writeUInt16LE(1, at + 4);               // colour planes
+    table.writeUInt16LE(32, at + 6);              // bits per pixel
+    table.writeUInt32LE(e.png.length, at + 8);    // size of image data
+    table.writeUInt32LE(offset, at + 12);         // offset of image data
+    offset += e.png.length;
+  });
+
+  return Buffer.concat([dir, table, ...entries.map((e) => e.png)]);
 }
 
 // ── tiny raster helpers ────────────────────────────────────────────────────
@@ -82,7 +112,6 @@ function blend(c, x, y, [r, g, b], a) {
   c.px[i + 3] = Math.round(outA * 255);
 }
 
-/** Signed distance to a rounded rectangle; negative inside. */
 function sdRoundRect(px, py, x0, y0, x1, y1, r) {
   const cx = (x0 + x1) / 2;
   const cy = (y0 + y1) / 2;
@@ -95,7 +124,6 @@ function sdRoundRect(px, py, x0, y0, x1, y1, r) {
   return Math.min(Math.max(dx, dy), 0) + Math.sqrt(ox * ox + oy * oy) - r;
 }
 
-/** Fill a rounded rect with 1px antialiasing via 3x3 supersampling. */
 function fillRoundRect(c, x0, y0, x1, y1, r, colour, alpha = 1) {
   const S = 3;
   for (let y = Math.floor(y0) - 1; y <= Math.ceil(y1) + 1; y++) {
@@ -122,9 +150,7 @@ function fillTriangle(c, p0, p1, p2, colour, alpha = 1) {
     const d1 = d(x, y, p0[0], p0[1], p1[0], p1[1]);
     const d2 = d(x, y, p1[0], p1[1], p2[0], p2[1]);
     const d3 = d(x, y, p2[0], p2[1], p0[0], p0[1]);
-    const neg = d1 < 0 || d2 < 0 || d3 < 0;
-    const pos = d1 > 0 || d2 > 0 || d3 > 0;
-    return !(neg && pos);
+    return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
   };
   for (let y = minY; y <= maxY; y++) {
     for (let x = minX; x <= maxX; x++) {
@@ -149,40 +175,41 @@ function draw(size) {
 
   fillRoundRect(c, 26 * u, 26 * u, 486 * u, 486 * u, 108 * u, BG, 1);
 
-  // Chip body outline (drawn as a thick rounded frame)
   const bx0 = 148 * u, by0 = 148 * u, bx1 = 364 * u, by1 = 364 * u, br = 40 * u;
   fillRoundRect(c, bx0, by0, bx1, by1, br, BLUE, 1);
   const t = 20 * u;
   fillRoundRect(c, bx0 + t, by0 + t, bx1 - t, by1 - t, br - t * 0.6, BG, 1);
 
-  // Pins - three per side
-  const pw = 16 * u;   // pin thickness
-  const pl = 34 * u;   // pin length
+  const pw = 16 * u;
+  const pl = 34 * u;
   const positions = [200, 256, 312].map((v) => v * u);
   for (const p of positions) {
-    fillRoundRect(c, bx0 - pl, p - pw / 2, bx0 + 4 * u, p + pw / 2, pw / 2, BLUE, 1); // left
-    fillRoundRect(c, bx1 - 4 * u, p - pw / 2, bx1 + pl, p + pw / 2, pw / 2, BLUE, 1); // right
-    fillRoundRect(c, p - pw / 2, by0 - pl, p + pw / 2, by0 + 4 * u, pw / 2, BLUE, 1); // top
-    fillRoundRect(c, p - pw / 2, by1 - 4 * u, p + pw / 2, by1 + pl, pw / 2, BLUE, 1); // bottom
+    fillRoundRect(c, bx0 - pl, p - pw / 2, bx0 + 4 * u, p + pw / 2, pw / 2, BLUE, 1);
+    fillRoundRect(c, bx1 - 4 * u, p - pw / 2, bx1 + pl, p + pw / 2, pw / 2, BLUE, 1);
+    fillRoundRect(c, p - pw / 2, by0 - pl, p + pw / 2, by0 + 4 * u, pw / 2, BLUE, 1);
+    fillRoundRect(c, p - pw / 2, by1 - 4 * u, p + pw / 2, by1 + pl, pw / 2, BLUE, 1);
   }
 
-  // Play mark inside the chip
   const pad = 34 * u;
   fillRoundRect(c, bx0 + pad, by0 + pad, bx1 - pad, by1 - pad, 22 * u, PAD, 1);
-  fillTriangle(
-    c,
-    [228 * u, 210 * u],
-    [228 * u, 302 * u],
-    [308 * u, 256 * u],
-    BLUE_LIGHT,
-    1,
-  );
+  fillTriangle(c, [228 * u, 210 * u], [228 * u, 302 * u], [308 * u, 256 * u], BLUE_LIGHT, 1);
 
   return c;
 }
 
 const size = Number(process.argv[2] || 512);
-const canvas = draw(size);
-fs.mkdirSync(path.dirname(OUT), { recursive: true });
-fs.writeFileSync(OUT, encodePng(size, size, canvas.px));
-console.log('wrote ' + OUT + ' (' + size + 'x' + size + ', ' + fs.statSync(OUT).size + ' bytes)');
+fs.mkdirSync(BUILD, { recursive: true });
+
+const main = draw(size);
+fs.writeFileSync(OUT_PNG, encodePng(size, size, main.px));
+console.log('wrote ' + OUT_PNG + ' (' + size + 'x' + size + ', ' + fs.statSync(OUT_PNG).size + ' bytes)');
+
+const icoSizes = [16, 24, 32, 48, 64, 128, 256];
+const entries = icoSizes.map((s) => {
+  const c = draw(s);
+  return { size: s, png: encodePng(s, s, c.px) };
+});
+fs.writeFileSync(OUT_ICO, encodeIco(entries));
+console.log(
+  'wrote ' + OUT_ICO + ' (' + icoSizes.join('/') + ', ' + fs.statSync(OUT_ICO).size + ' bytes)',
+);

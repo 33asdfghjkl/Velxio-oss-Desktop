@@ -204,25 +204,19 @@ async function boot() {
 
   buildMenu();
 
-  // 1. Backend (best effort). A free port keeps two instances from colliding.
+  // A free port keeps two instances from colliding.
   const backendPort = process.env.VELXIO_BACKEND_PORT
     ? Number(process.env.VELXIO_BACKEND_PORT)
     : DEFAULT_BACKEND_PORT;
 
-  if (!process.argv.includes('--no-backend')) {
-    const result = await startBackend({ repoRoot, port: backendPort, log });
-    state.backendOk = result.ok;
-    state.backendChild = result.child;
-    state.backendReason = result.reason || '';
-    if (!result.ok) {
-      log('backend unavailable: ' + state.backendReason);
-    }
-  } else {
-    state.backendReason = 'disabled with --no-backend';
-    log('backend disabled with --no-backend');
-  }
-
-  // 2. Loopback server: static frontend + same-origin API proxy.
+  // 1. Loopback server and window FIRST.
+  //
+  // The backend must NOT be awaited before this point. A cold start with
+  // arduino-cli on PATH syncs several package indexes before uvicorn binds,
+  // which has been measured at ~48s and can be far longer; awaiting it here
+  // left the user staring at nothing after a double-click. The proxy already
+  // answers 502 while the backend is down, so the UI can open immediately and
+  // the backend can catch up in the background.
   const appPort = await getFreePort();
   state.appServer = await startAppServer({
     distDir,
@@ -232,8 +226,25 @@ async function boot() {
   });
   log('serving frontend at ' + state.appServer.url + ' (backend ' + HOST + ':' + backendPort + ')');
 
-  // 3. Window.
   state.window = createWindow(state.appServer.url, iconPath);
+
+  // 2. Backend, in the background (best effort).
+  if (process.argv.includes('--no-backend')) {
+    state.backendReason = 'disabled with --no-backend';
+    log('backend disabled with --no-backend');
+  } else {
+    startBackend({ repoRoot, port: backendPort, log })
+      .then((result) => {
+        state.backendOk = result.ok;
+        state.backendChild = result.child;
+        state.backendReason = result.reason || '';
+        log(result.ok ? 'backend ready' : 'backend unavailable: ' + state.backendReason);
+      })
+      .catch((err) => {
+        state.backendReason = String((err && err.message) || err);
+        log('backend failed: ' + state.backendReason);
+      });
+  }
 }
 
 if (!app.requestSingleInstanceLock()) {
