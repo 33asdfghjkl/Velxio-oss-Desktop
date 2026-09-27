@@ -62,6 +62,26 @@ made, as required by AGPLv3 section 5(a).
             NEW. Builds the frontend and runs desktop/test/wrapper-smoke.mjs.
             It needs no Python, no arduino-cli and no Electron.
 
+2026-09-27  LICENSE
+            Replaced the license body with the canonical, unmodified GNU
+            AGPLv3 text as published by the Free Software Foundation. The
+            upstream file was AGPLv3-based but ended with a GPLv3-style
+            "How to Apply These Terms" section: it contained the sentence
+            about the hypothetical commands "show w" and "show c" showing
+            the appropriate parts of the General Public License, which
+            appears in GPLv3 and NOT in AGPLv3. GitHub could therefore not
+            identify the license and reported the repository as "Other".
+            The canonical text restores correct AGPL-3.0 identification.
+
+2026-09-27  LICENSE-ADDENDUM.md
+            NEW. Holds the notice that upstream appended to the end of its
+            LICENSE file - the Velxio copyright line plus its DUAL LICENSING
+            NOTICE and the commercial-licensing contact - preserved verbatim.
+            Nothing upstream wrote was deleted, only relocated, so LICENSE can
+            be the standard text. The copyright and the commercial contact
+            belong to the upstream author; this wrapper cannot grant a
+            commercial licence for Velxio.
+
 2026-09-27  .gitignore
             Added ignore rules for the desktop wrapper's build output
             (desktop/node_modules, desktop/release, desktop/build/icon.png).
