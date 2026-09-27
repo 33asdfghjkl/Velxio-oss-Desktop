@@ -27,9 +27,22 @@ Every modification to an upstream file is listed here, with the date it was
 made, as required by AGPLv3 section 5(a).
 
 2026-09-27  README.md
-            Prepended an unofficial-project banner, disclaimer and
-            quick-start section. All original upstream content below the
-            banner is unchanged.
+            Rewritten as a wrapper-focused README (unofficial banner,
+            disclaimer, quick start, requirements, limitations, attribution).
+            The upstream project's original README - including its
+            sponsorship section, partner and affiliate links, and official
+            Docker instructions - was moved verbatim to UPSTREAM_README.md.
+            No upstream text was deleted, only relocated.
+
+2026-09-27  UPSTREAM_README.md
+            NEW. Verbatim archive of the upstream README at the base commit,
+            with a provenance header explaining that its sponsorship, partner
+            and infrastructure links belong to the upstream author.
+
+2026-09-27  .github/FUNDING.yml
+            DELETED. It pointed this repository's "Sponsor" button at the
+            upstream author's GitHub Sponsors and PayPal accounts, which
+            misrepresents an unofficial wrapper as a fundraising vehicle.
 
 2026-09-27  .gitignore
             Added ignore rules for the desktop wrapper's build output
