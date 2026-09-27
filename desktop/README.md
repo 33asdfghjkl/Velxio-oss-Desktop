@@ -76,9 +76,15 @@ Useful environment variables:
 
 - `VELXIO_BACKEND_PORT` — backend port (default `8001`).
 - `VELXIO_BACKEND_TIMEOUT_MS` — how long to wait for `/health` before
-  giving up (default `240000`). The first start with `arduino-cli` on PATH
-  can take minutes: the backend syncs several package indexes
-  (`core update-index`) before it binds.
+  giving up (default `240000`).
+- `VELXIO_SKIP_STARTUP_INDEX` — set to `1` by the wrapper. The backend
+  refreshes its board package indexes (`arduino-cli core update-index`)
+  inside its constructor, i.e. *before* uvicorn binds, so that one network
+  round-trip delays the entire backend: measured at 44s, 52s and 150s on
+  this machine. With this set, the refresh is deferred until a board
+  actually needs a core that is not installed (`ensure_core_for_board()`
+  re-runs the same pass on demand). An AVR sketch never triggers it.
+  Measured effect: backend ready in ~6s instead of 44-150s.
 
 ### Troubleshooting
 
