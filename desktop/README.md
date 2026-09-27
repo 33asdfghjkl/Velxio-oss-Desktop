@@ -75,6 +75,24 @@ npm run dist           # package installers into desktop/release/
 Useful environment variables:
 
 - `VELXIO_BACKEND_PORT` — backend port (default `8001`).
+- `VELXIO_BACKEND_TIMEOUT_MS` — how long to wait for `/health` before
+  giving up (default `240000`). The first start with `arduino-cli` on PATH
+  can take minutes: the backend syncs several package indexes
+  (`core update-index`) before it binds.
+
+### Troubleshooting
+
+**The window never appears when run from an Electron-based host.** Some
+environments export `ELECTRON_RUN_AS_NODE=1`, which makes Electron behave as
+plain Node, so `require('electron').app` is undefined and the app exits
+immediately. Clear it first:
+
+```powershell
+$env:ELECTRON_RUN_AS_NODE=''; npx electron .
+```
+
+**The backend is slow on first run.** See `VELXIO_BACKEND_TIMEOUT_MS`
+above. Pre-warm once with `arduino-cli core update-index`.
 
 ## Known limitations
 

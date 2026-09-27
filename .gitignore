@@ -181,6 +181,10 @@ desktop/release/
 desktop/node_modules/
 desktop/test/artifacts/
 
+# Portable repo-local toolchain (arduino-cli etc.) - large binaries, fetched
+# on demand, never committed.
+.tools/
+
 # Compiled binary test fixtures (large, should be built not committed)
 frontend/src/__tests__/fixtures/avr-blink/
 frontend/src/__tests__/fixtures/rp2040-blink/

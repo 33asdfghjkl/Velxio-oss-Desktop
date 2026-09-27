@@ -42,6 +42,19 @@ function firstExisting(list) {
   return null;
 }
 
+/**
+ * Repo-local tool directories to prepend to PATH for the backend.
+ *
+ * A portable arduino-cli dropped in .tools/arduino-cli lets the wrapper
+ * compile sketches with no system-wide install and no elevation prompt.
+ * (winget's MSI needs UAC; the portable zip does not.)
+ */
+function toolDirs(repoRoot) {
+  return [path.join(repoRoot, '.tools', 'arduino-cli'), path.join(repoRoot, '.tools')].filter(
+    (d) => fs.existsSync(d),
+  );
+}
+
 function probeHealth(port, timeoutMs) {
   return new Promise((resolve) => {
     const req = http.get(
@@ -74,12 +87,21 @@ async function startBackend(opts) {
 
   log('starting backend: ' + python + ' -m uvicorn app.main:app --port ' + port);
 
+  const extra = toolDirs(repoRoot);
+  const env = Object.assign({}, process.env);
+  if (extra.length) {
+    const joined = extra.join(path.delimiter);
+    env.PATH = joined + path.delimiter + (env.PATH || '');
+    env.Path = env.PATH; // Windows stores this one under a different casing
+    log('prepended to PATH: ' + joined);
+  }
+
   let child;
   try {
     child = spawn(
       python,
       ['-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', String(port)],
-      { cwd: backendDir, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+      { cwd: backendDir, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env },
     );
   } catch (err) {
     return { ok: false, child: null, reason: 'spawn failed: ' + err.message };
@@ -94,8 +116,12 @@ async function startBackend(opts) {
   });
   child.on('error', (err) => log('[backend] process error: ' + err.message));
 
-  // Wait for /health, up to ~40s (first start imports FastAPI + friends).
-  const deadline = Date.now() + 40000;
+  // Cold start can be slow: with arduino-cli on PATH the backend syncs
+  // several package indexes (core update-index) before it binds, which has
+  // been measured in minutes on a fresh machine. Allow for that, and let an
+  // operator shorten it with VELXIO_BACKEND_TIMEOUT_MS.
+  const timeoutMs = Number(process.env.VELXIO_BACKEND_TIMEOUT_MS || 240000);
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
       return {
@@ -107,7 +133,11 @@ async function startBackend(opts) {
     if (await probeHealth(port, 1500)) return { ok: true, child };
     await sleep(500);
   }
-  return { ok: false, child, reason: 'backend did not answer /health within 40s' };
+  return {
+    ok: false,
+    child,
+    reason: 'backend did not answer /health within ' + Math.round(timeoutMs / 1000) + 's',
+  };
 }
 
 function stopBackend(child) {
