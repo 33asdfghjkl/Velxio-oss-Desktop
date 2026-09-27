@@ -94,6 +94,24 @@ $env:ELECTRON_RUN_AS_NODE=''; npx electron .
 **The backend is slow on first run.** See `VELXIO_BACKEND_TIMEOUT_MS`
 above. Pre-warm once with `arduino-cli core update-index`.
 
+**The editor shows "Loading..." forever.** Monaco's runtime is not part of
+the repository: `frontend/public/monaco/` is produced by the frontend's
+`postinstall` hook (`scripts/copy-monaco.mjs`) and is gitignored. If you
+installed the frontend with `--ignore-scripts` - which is the documented way
+to skip the `canvas` native build that needs Visual Studio C++ - that hook
+never ran, so the built `dist/` has no `/monaco/vs/` and the editor cannot
+boot. Copy it manually and rebuild:
+
+```bash
+cd frontend
+node scripts/copy-monaco.mjs
+npx vite build
+```
+
+Verify with `Test-Path frontend/dist/monaco/vs/loader.js`. This wrapper's
+GitHub workflow already does this explicitly, which is why CI has always
+passed while a local `--ignore-scripts` install silently did not.
+
 ### Installing on Windows
 
 `npm run dist` produces a normal electron-builder output, but on a machine
