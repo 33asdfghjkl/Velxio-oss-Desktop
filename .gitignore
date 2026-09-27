@@ -172,6 +172,15 @@ backend/tests/debug_qemu_c3.py
 backend/tests/test_esp32c3_wifi_e2e.py
 backend/tests/test_wifi_webserver_e2e.py
 
+# ── Unofficial desktop wrapper (desktop/) ─────────────────────────────────
+# NOTE: the blanket `build/` rule above would otherwise swallow the wrapper's
+# original application icon, so re-include it explicitly.
+!desktop/build/
+!desktop/build/icon.png
+desktop/release/
+desktop/node_modules/
+desktop/test/artifacts/
+
 # Compiled binary test fixtures (large, should be built not committed)
 frontend/src/__tests__/fixtures/avr-blink/
 frontend/src/__tests__/fixtures/rp2040-blink/

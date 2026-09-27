@@ -1,0 +1,72 @@
+{
+  "name": "velxio-oss-desktop",
+  "productName": "Velxio OSS Desktop (Unofficial)",
+  "version": "0.1.0",
+  "description": "Unofficial community desktop wrapper for Velxio. Built with Electron. AGPLv3. Not affiliated with the Velxio project.",
+  "license": "AGPL-3.0-or-later",
+  "author": "Velxio OSS Desktop contributors (unofficial)",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "start:no-backend": "electron . --no-backend",
+    "gen:icon": "node scripts/generate-icon.mjs",
+    "dist": "npm run gen:icon && electron-builder"
+  },
+  "build": {
+    "appId": "io.github.unofficial.velxio.oss.desktop",
+    "productName": "Velxio OSS Desktop (Unofficial)",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "lib/**/*",
+      "build/icon.png"
+    ],
+    "extraResources": [
+      {
+        "from": "../frontend/dist",
+        "to": "frontend-dist"
+      },
+      {
+        "from": "../backend",
+        "to": "backend",
+        "filter": [
+          "**/*",
+          "!venv/**",
+          "!__pycache__/**",
+          "!.pytest_cache/**",
+          "!**/*.pyc"
+        ]
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Development"
+    }
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  }
+}

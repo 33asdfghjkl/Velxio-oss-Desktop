@@ -1,0 +1,92 @@
+# Velxio OSS Desktop (Unofficial)
+
+An **unofficial community desktop wrapper** that packages the open-source
+[Velxio](https://github.com/davidmonterocrespo24/velxio) web frontend as an
+offline desktop application, using **Electron**.
+
+> **Not affiliated with the Velxio project.** No Pro keys, no proprietary
+> validation logic, no Velxio logo or trademark. AGPLv3. See `../NOTICE` and
+> `../DISCLAIMER.md`.
+
+## What this directory contains
+
+```
+desktop/
+├── main.cjs                     Electron main process: boot, window, menu
+├── preload.cjs                  Minimal, contextIsolation-safe preload
+├── lib/
+│   ├── server.cjs               Static server + /api & WebSocket reverse proxy
+│   └── backend.cjs              Local Python backend supervisor
+├── scripts/generate-icon.mjs    Original icon generator (dependency-free PNG)
+├── build/icon.png               Generated icon (not a Velxio trademark)
+└── package.json                 Electron app manifest + electron-builder config
+```
+
+## Why Electron and not Tauri
+
+The upstream project ships a Tauri desktop shell, but that shell lives in the
+**private pro overlay** and is built around a licence gate. This wrapper is
+deliberately independent of it:
+
+- Tauri on Windows needs the Rust toolchain **and** the MSVC C++ build tools
+  (multi-GB). Electron needs only Node, so the wrapper builds and runs anywhere
+  the web app does.
+- Electron keeps this project free of the pro overlay's licence machinery, which
+  is a hard requirement for an unofficial OSS wrapper.
+
+## How it works
+
+1. **Backend (best effort).** `lib/backend.cjs` finds `backend/venv` or a
+   system `python`, runs
+   `uvicorn app.main:app --host 127.0.0.1 --port 8001`, and waits for
+   `/health`. If that fails, the app still opens.
+2. **One origin.** `lib/server.cjs` serves `frontend/dist` on a random loopback
+   port and reverse-proxies `/api`, `/health` and WebSocket upgrades to the
+   backend — the same shape as the OSS nginx image. Because everything is
+   same-origin, the upstream backend's CORS list needs **no** changes, and QEMU
+   board WebSockets work.
+3. **Bootstrap injection.** The server rewrites `index.html` to set
+   `window.__VELXIO_API_BASE__` *before* any module script runs. That is the
+   hook `frontend/src/lib/apiBase.ts` already documents for desktop hosts, so
+   **no upstream frontend file is modified**.
+4. **Window.** A sandboxed `BrowserWindow` (`contextIsolation: true`,
+   `nodeIntegration: false`, `sandbox: true`) loads the local URL. External
+   links open in the system browser.
+
+## Requirements
+
+| Piece | Needed for | Notes |
+| --- | --- | --- |
+| Node.js 20+ | building the frontend, running the wrapper | required |
+| A built `frontend/dist` | the UI itself | `cd frontend && npm install && npx vite build` |
+| Python 3.10+ and `backend/requirements.txt` | compiling code | optional; simulator still runs without it |
+| `arduino-cli` + `arduino:avr` core on PATH | compiling Arduino sketches | optional |
+
+## Commands
+
+```bash
+npm install            # install Electron
+npm run gen:icon       # regenerate build/icon.png
+npm start              # run the desktop app
+npm start -- --no-backend   # skip auto-starting the Python backend
+npm run dist           # package installers into desktop/release/
+```
+
+Useful environment variables:
+
+- `VELXIO_BACKEND_PORT` — backend port (default `8001`).
+
+## Known limitations
+
+- **The Python backend is not bundled.** Only its source is. The wrapper starts
+  it when a suitable interpreter is present; otherwise the UI runs in
+  frontend-only mode (editor, `.vlx` projects, in-browser AVR / RP2040
+  emulation).
+- **QEMU-backed boards** (ESP32 family, STM32, Raspberry Pi Linux) need the QEMU
+  libraries that the OSS project intentionally does not ship.
+- Code-signing is not configured; Windows/macOS may warn on first launch.
+
+## License
+
+AGPLv3 — see `../LICENSE`. Velxio core © David Montero Crespo and
+contributors. This wrapper is a derivative work and is licensed the same way.

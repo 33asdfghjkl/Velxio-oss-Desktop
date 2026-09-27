@@ -1,3 +1,80 @@
+# Velxio OSS Desktop (Unofficial)
+
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Status: unofficial](https://img.shields.io/badge/status-unofficial-red.svg)](#disclaimer--免责声明)
+
+非官方 Velxio 桌面封装,使用 **Electron** 将 Velxio 开源 Web 前端打包为离线桌面应用。
+本项目与 Velxio 官方**无关联**,不包含任何 Pro 许可证密钥或专有验证逻辑。
+本项目以 **AGPLv3** 许可证发布,完整源码见本仓库。
+
+> **Unofficial community desktop wrapper for Velxio. Built with Electron. AGPLv3.
+> Not affiliated with the Velxio project. Ships no Pro keys and no proprietary
+> validation logic.**
+
+---
+
+## Disclaimer / 免责声明
+
+- 这**不是** Velxio 官方产品,与 Velxio 项目及其作者**没有任何关联**。
+- 不包含任何 Pro 许可证密钥、订阅校验或专有验证逻辑。
+- 本仓库**不含** Velxio 的官方 Logo 或商标;应用图标为本项目原创设计(见 `desktop/scripts/generate-icon.mjs`)。
+- Velxio 核心代码版权归原作者 **David Montero Crespo** 及贡献者所有,遵循 AGPLv3。
+- 本项目同样以 AGPLv3 发布;对上游源码的修改已在 `NOTICE` 中逐项标注。
+- 基于上游仓库 commit `f1514587` 构建。
+
+## 快速开始 / Quick start
+
+### 1. 构建前端
+
+```bash
+cd frontend
+npm install
+npx vite build          # 产物输出到 frontend/dist
+```
+
+### 2. 安装并启动桌面壳
+
+```bash
+cd desktop
+npm install             # 安装 Electron
+npm start               # 启动桌面应用
+```
+
+### 3. (可选)启用本地编译后端
+
+桌面壳会自动探测并拉起本地 Velxio 后端。没有后端时,编辑器、`.vlx` 项目、
+以及**浏览器内的 AVR / RP2040 仿真**依然可用;只是无法编译新代码。
+
+```bash
+cd backend
+python -m venv venv
+venv/Scripts/pip install -r requirements.txt   # Windows
+# source venv/bin/activate && pip install -r requirements.txt   # macOS / Linux
+```
+
+要让 Arduino 代码**真正编译**成 `.hex`,还需要在系统 PATH 中安装 `arduino-cli`:
+
+```bash
+arduino-cli core update-index
+arduino-cli core install arduino:avr
+```
+
+## 这个壳子做了什么
+
+| 能力 | 说明 |
+| --- | --- |
+| 离线桌面应用 | 前端全部本地加载,不依赖网络 CDN |
+| 同源反向代理 | 本地 HTTP 服务托管 `dist/` 并把 `/api`、`/health`、WebSocket 转发到本地后端,**无需修改上游前后端代码,也不需要放宽 CORS** |
+| 本地后端托管 | 自动探测 `backend/venv` 或系统 Python 并拉起 uvicorn,退出时回收进程 |
+| 安全默认值 | `contextIsolation: true`、`nodeIntegration: false`、`sandbox: true` |
+| 无商业逻辑 | 不包含许可证门禁、Pro Key、试用期或任何专有校验 |
+
+---
+
+_以下为上游 Velxio 项目原始 README,内容未作修改,版权归原作者所有。_
+
+---
+
 # Velxio: Arduino & Embedded Board Emulator
 
 **Live at [velxio.dev](https://velxio.dev)**

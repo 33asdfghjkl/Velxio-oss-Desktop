@@ -1,0 +1,69 @@
+Velxio OSS Desktop (Unofficial)
+Copyright (C) 2026 Velxio OSS Desktop contributors
+
+This is an UNOFFICIAL community desktop wrapper for Velxio.
+It is not affiliated with, endorsed by, or sponsored by the Velxio project
+or its author, David Montero Crespo.
+
+================================================================================
+UPSTREAM
+================================================================================
+
+Velxio - https://github.com/davidmonterocrespo24/velxio
+Copyright (C) David Montero Crespo and Velxio contributors.
+Licensed under the GNU Affero General Public License v3.0 (see LICENSE).
+
+This repository is a derivative work. The full upstream source is included so
+that the AGPLv3 corresponding-source obligation is satisfied.
+
+Base commit: f1514587
+("Merge pull request #361 from davidmonterocrespo24/board-buses")
+
+================================================================================
+MODIFICATIONS BY THIS PROJECT
+================================================================================
+
+Every modification to an upstream file is listed here, with the date it was
+made, as required by AGPLv3 section 5(a).
+
+2026-09-27  README.md
+            Prepended an unofficial-project banner, disclaimer and
+            quick-start section. All original upstream content below the
+            banner is unchanged.
+
+2026-09-27  .gitignore
+            Added ignore rules for the desktop wrapper's build output
+            (desktop/node_modules, desktop/release, desktop/build/icon.png).
+
+2026-09-27  the following files are NEW (not derived from upstream):
+            desktop/main.cjs
+            desktop/preload.cjs
+            desktop/lib/server.cjs
+            desktop/lib/backend.cjs
+            desktop/package.json
+            desktop/scripts/generate-icon.mjs
+            desktop/README.md
+            NOTICE (this file)
+            DISCLAIMER.md
+
+No upstream frontend or backend source file was modified. The wrapper points
+the app at its local backend through an HTTP reverse proxy and a bootstrap
+script injected by desktop/lib/server.cjs, so the upstream code keeps its
+defaults.
+
+================================================================================
+WHAT THIS PROJECT DELIBERATELY DOES NOT CONTAIN
+================================================================================
+
+- No Velxio logo, wordmark or other trademark asset. The application icon is an
+  original programmatic design (desktop/scripts/generate-icon.mjs).
+- No Pro license keys.
+- No license gate, entitlement check, trial timer, grace period or lockout
+  overlay.
+- No proprietary validation logic of any kind.
+
+================================================================================
+LICENSE
+================================================================================
+
+GNU Affero General Public License v3.0. The full text is in LICENSE.
