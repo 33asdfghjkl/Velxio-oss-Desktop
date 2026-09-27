@@ -44,6 +44,24 @@ made, as required by AGPLv3 section 5(a).
             upstream author's GitHub Sponsors and PayPal accounts, which
             misrepresents an unofficial wrapper as a fundraising vehicle.
 
+2026-09-27  .github/workflows/
+            DELETED the 11 upstream workflows: actions-cache-cleanup,
+            backend-e2e-tests, backend-unit-tests, build-espidf-toolchain,
+            discord-issues, discord-release-notify, docker-publish,
+            frontend-tests, library-compile, pr-guard and test-circuit.
+            They belong to the upstream project's own infrastructure: they
+            reference upstream secrets, publish Docker images to a registry,
+            notify the upstream Discord server, and run on a schedule. Most
+            importantly, docker-publish.yml passed an upstream Pro licence key
+            to the build (VELXIO_LICENSE_KEY), which contradicts this
+            repository's promise to ship no Pro keys. Replaced by a single
+            workflow that builds this repository and runs the wrapper's own
+            smoke test.
+
+2026-09-27  .github/workflows/wrapper-smoke.yml
+            NEW. Builds the frontend and runs desktop/test/wrapper-smoke.mjs.
+            It needs no Python, no arduino-cli and no Electron.
+
 2026-09-27  .gitignore
             Added ignore rules for the desktop wrapper's build output
             (desktop/node_modules, desktop/release, desktop/build/icon.png).

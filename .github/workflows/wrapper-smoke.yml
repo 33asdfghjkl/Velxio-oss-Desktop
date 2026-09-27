@@ -1,0 +1,55 @@
+name: Wrapper Smoke Test
+
+# This repository is an UNOFFICIAL desktop wrapper around Velxio. The upstream
+# project's own CI was removed: it belongs to upstream's infrastructure
+# (docker publishing, Discord notifications, ESP-IDF toolchain builds,
+# scheduled library compiles) and it references secrets - including an
+# upstream Pro licence key build argument in docker-publish.yml - that this
+# wrapper neither has nor wants.
+#
+# What is worth testing here is narrow and cheap: does the wrapper still build
+# the web app, and does it serve it correctly through its own reverse proxy?
+# The smoke test needs no Python, no arduino-cli and no Electron.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Build frontend + wrapper smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # --ignore-scripts skips the only lifecycle scripts that exist: the
+      # Monaco asset copy (run explicitly below) and canvas, a native module
+      # used only by the upstream visual test suite. Vite and esbuild resolve
+      # their binaries from the installed platform packages either way.
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Copy Monaco assets
+        working-directory: frontend
+        run: node scripts/copy-monaco.mjs
+
+      - name: Build the web app
+        working-directory: frontend
+        run: npx vite build
+
+      # Exercises the wrapper's own server: bootstrap injection, static
+      # assets, SPA fallback, the /api reverse proxy, the WebSocket upgrade
+      # and the traversal guard. Fails the job on any regression.
+      - name: Wrapper smoke test
+        working-directory: desktop
+        run: node test/wrapper-smoke.mjs
