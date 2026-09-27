@@ -8,16 +8,7 @@
  * Arduino pin numbers based on the diagram's wire connections.
  */
 import { PartSimulationRegistry } from './PartSimulationRegistry';
-import {
-  ChipInstance,
-  decodeWasmBase64,
-  ensureUartBridge,
-  ensureSpiBridge,
-  getSimulatorBridges,
-  avrUartTx,
-  getI2CBus,
-  detectSimulatorKind,
-} from '../customChips';
+import { ChipInstance, decodeWasmBase64, detectSimulatorKind } from '../customChips';
 import { hostsChipsInWorker } from '../customChips/simulatorBridges';
 import { b64ToBytes, inflateZlib, spliceFramebufferRows } from '../customChips/inflateZlib';
 import type { ChipFramebufferFrame } from '../Esp32Bridge';
@@ -27,12 +18,15 @@ import { useElectricalStore } from '../../store/useElectricalStore';
 import { normalizeChipPinNames } from '../customChips/chipJson';
 import { clearChipDrives } from '../customChips/chipPinDrives';
 import { isSyntheticChipPin } from '../customChips/syntheticPins';
-import { resolveChipNetMembers, resolveChipOwnerBoardId } from '../customChips/chipNets';
-import { classifyPin } from '../../utils/boardProtocols';
+import { resolveChipNetMembers } from '../customChips/chipNets';
 import { requestElectricalResolve } from '../spice/electricalResolveHook';
 import { runChipAttachExtensions } from '../customChips/chipAttachExtensions';
-import { createUartBitBanger, type UartBitBanger } from '../customChips/uartBitBang';
+import { chipUartOwner } from '../customChips/ChipRuntime';
+import { padVoltsFor, samePadVolts } from '../customChips/padVolts';
+import { readChipUartPads } from '../customChips/chipUartPads';
 import { setAdcVoltage, analogRailVolts } from './partUtils';
+import { attachUartEndpoint } from '../buses';
+import { isBusCapable, type GuestClock, type UartHandle } from '../buses/types';
 
 // Physical-key (KeyboardEvent.code) -> Galaksija keyboard matrix offset, from
 // the libretro Galaksija core's keyMap. The chip's set_key takes this offset;
@@ -92,6 +86,15 @@ const GALAKSIJA_KEY_OFFSET: Record<string, number> = {
   ShiftLeft: 53,
   ShiftRight: 53,
 };
+
+/**
+ * The guest clock of the board a part's simulator stands for, or null when
+ * it has none: the board-less stub, or a bridge that offers no binding.
+ */
+function readGuestClock(sim: unknown): GuestClock | null {
+  if (!isBusCapable(sim)) return null;
+  return sim.getBusBinding()?.clock ?? null;
+}
 
 PartSimulationRegistry.register('custom-chip', {
   attachEvents: (_element, simulator, getArduinoPin, componentId) => {
@@ -202,49 +205,89 @@ PartSimulationRegistry.register('custom-chip', {
       // different board (a second QEMU worker) for the interconnect to bridge.
       const nets = resolveChipNetMembers(useSimulatorStore.getState(), componentId);
 
-      // Which board UART each wired GPIO belongs to. The chip's vx_uart_attach
-      // names its own RX/TX pins, and the backend runtime turns those into
-      // GPIOs through pinMap; this table is the last hop, GPIO to UART number,
-      // and it is board-specific so it has to come from here. Without it every
-      // chip landed on one fixed UART whatever the diagram said, which put a
-      // module wired to Serial2 on the wrong end of the board.
-      const uartMap: Record<number, number> = {};
-      {
-        const st = useSimulatorStore.getState();
-        const ownerId = resolveChipOwnerBoardId(st, componentId);
-        const ownerKind = st.boards.find((b) => b.id === ownerId)?.boardKind;
-        if (ownerKind) {
-          for (const gpio of Object.values(pinMap)) {
-            const role = classifyPin(ownerKind, String(gpio));
-            if (role.kind === 'uart-tx' || role.kind === 'uart-rx') {
-              uartMap[gpio] = role.uart;
-            }
-          }
-        }
-      }
-
       // The worker keys sensor records by pin and a chip has none: each chip
       // gets its own synthetic slot (see chipVirtualPin), so live attribute
       // updates and a detach reach this chip and not the last one registered.
       const virtualPin = chipVirtualPin(componentId);
+      // The solved voltage on each of the chip's pads, for its
+      // vx_pin_read_analog in the worker: the same numbers the browser runtime
+      // reads off the electrical store (padVolts.ts), sent with the chip and
+      // again whenever the solve moves one of them. A plain chip's pin names
+      // are its pad names.
+      const padPins: Array<[string, string]> = pins.map((name) => [name, name]);
+      let lastPadVolts: Record<string, number | null> | null = padVoltsFor(componentId, padPins);
+      const unsubscribePadVolts = useElectricalStore.subscribe((st, prev) => {
+        if (st.nodeVoltages === prev.nodeVoltages && st.pinNetMap === prev.pinNetMap) return;
+        const volts = padVoltsFor(componentId, padPins);
+        if (samePadVolts(lastPadVolts, volts)) return;
+        lastPadVolts = volts;
+        try {
+          sim.updateSensor?.(virtualPin, { pad_volts: volts });
+        } catch {
+          /* worker gone */
+        }
+      });
       try {
         sim.registerSensor('custom-chip', virtualPin, {
           wasm_b64: wasmBase64,
           attrs: attrsObj,
           pin_map: pinMap,
+          pad_volts: lastPadVolts,
           nets,
-          uart_map: uartMap,
           // The worker allocates the framebuffer vx_framebuffer_init hands the
-          // chip, and needs the id to send the rows back to THIS element.
+          // chip, and needs the id to send the rows back to THIS element. It
+          // is also the chip's identity in the bus map the shim sends
+          // (uart_bus_table.owner_of), see the UART registration below.
           component_id: componentId,
           display: display ?? undefined,
         });
         console.info(
-          `[custom-chip:${componentId}] sent to backend ESP32 worker (chip runs synchronously inside QEMU process). pinMap=${JSON.stringify(pinMap)} nets=${JSON.stringify(nets)} uartMap=${JSON.stringify(uartMap)}`,
+          `[custom-chip:${componentId}] sent to backend ESP32 worker (chip runs synchronously inside QEMU process). pinMap=${JSON.stringify(pinMap)} nets=${JSON.stringify(nets)}`,
         );
       } catch (e) {
         console.error(`[custom-chip:${componentId}] failed to register on ESP32 backend:`, e);
       }
+
+      // Which of the guest's UARTs the chip is on is the circuit's business,
+      // and the circuit is in this tab (board-buses F6). The chip's RX and TX
+      // pads go on the bus fabric under the chip's own id, the identity its
+      // record carries to the worker, and the UART half of the bus map the
+      // shim sends names the controller on each pad's wire (RemoteUartLane,
+      // busRegistry.uartMap); the worker's table reads that per byte, after
+      // the live GPIO matrix (uart_bus_table.py). The pads are the ones the
+      // chip's own vx_uart_attach names, and the chip runs in the worker, so
+      // they are read off an inert copy of the WASM here (readChipUartPads).
+      // The endpoint itself answers nothing: the worker's copy of the chip
+      // does, beside the guest, and this tab only says where it is wired.
+      //
+      // What stood here classified the wired GPIOs against a static pin table
+      // and sent the worker a {gpio: uart} map it took as the chip's own
+      // word: the classic ESP32's table for every variant, so a module on an
+      // S3's UART1 pins was placed on UART2 (esp32-variant-uart-table-wrong),
+      // and a chip wired to nothing landed on Serial1 instead of on no wire.
+      let uartHandles: UartHandle[] = [];
+      let uartGone = false;
+      void readChipUartPads(decodeWasmBase64(wasmBase64), {
+        attrs: attrsObj,
+        strAttrs: strAttrsObj,
+        romBytes,
+      }).then((uarts) => {
+        if (uartGone) return;
+        uartHandles = uarts.map((u, handle) =>
+          attachUartEndpoint(
+            {
+              owner: chipUartOwner(componentId, handle),
+              componentId,
+              pins: {
+                ...(u.rxPad ? { rx: u.rxPad } : {}),
+                ...(u.txPad ? { tx: u.txPad } : {}),
+              },
+              baud: u.baud,
+            },
+            { receive: () => {} },
+          ),
+        );
+      });
       // A display chip's pixels come back from the worker as `chip_framebuffer`
       // rows (see Esp32Bridge.onChipFramebuffer). Kept in a full RGBA image here
       // so a partial frame (the rows a driver's window touched) lands on top of
@@ -315,8 +358,13 @@ PartSimulationRegistry.register('custom-chip', {
       // list it would replay at the next Run, and the part re-registers when
       // it attaches again. The same cleanup as the ePaper part.
       return () => {
+        unsubscribePadVolts();
         offFramebuffer();
         cleanupExtensions();
+        // Off the wires, so the map the shim sends next no longer names it.
+        uartGone = true;
+        for (const h of uartHandles) h.dispose();
+        uartHandles = [];
         try {
           sim.unregisterSensor?.(virtualPin);
         } catch {
@@ -340,21 +388,30 @@ PartSimulationRegistry.register('custom-chip', {
     const attrs = new Map<string, number>(Object.entries(attrsObj));
     const strAttrs = new Map<string, string>(Object.entries(strAttrsObj));
 
-    // Lazily install the per-simulator bridges. Idempotent — safe to call
-    // even if other custom chips have already wired them up.
-    ensureUartBridge(sim);
-    ensureSpiBridge(sim);
-    const bridges = getSimulatorBridges(sim);
+    // Nothing to install on the simulator for any bus: the chip joins the
+    // board's SPI, I2C and UART wires from its own vx_spi_attach,
+    // vx_i2c_attach and vx_uart_attach, with the pins of its config, on
+    // every engine kind alike (the in-browser ESP32 engines included). A chip
+    // that never calls them stays off those buses.
 
     // Async create — wrap so we can dispose even if create is still in-flight
     // when the user stops the simulation.
     let instance: ChipInstance | null = null;
-    let uartListener: ((byte: number) => void) | null = null;
-    let uartBitBanger: UartBitBanger | null = null;
     let rafHandle = 0;
     let disposed = false;
     let keyboardCleanup: (() => void) | undefined;
     let extensionCleanup: (() => void) | undefined;
+
+    // The chip keeps the board's time: the guest clock of the engine binding,
+    // the one the fabric's software UART already runs on. A simulator with
+    // no binding (the board-less stub) has no guest clock, and then the tick
+    // below is the chip's only clock.
+    let guestClock: GuestClock | null = null;
+    try {
+      guestClock = readGuestClock(sim);
+    } catch {
+      /* a bridge that cannot bind yet: no clock */
+    }
 
     (async () => {
       try {
@@ -363,11 +420,10 @@ PartSimulationRegistry.register('custom-chip', {
           wasm,
           componentId,
           pinManager: sim.pinManager,
-          // Polymorphic I2C: AVR returns the I2CBusManager directly, RP2040
-          // and a browser-hosted ESP32 (in-browser engine) a thin adapter,
-          // anything else null (chip won't get I2C).
-          i2cBus: getI2CBus(sim, 0) as any,
-          spiBus: bridges.spiBus,
+          clock: guestClock,
+          // No I2C bus is handed over: the chip enters the bus its own SDA/SCL
+          // are wired to when it calls vx_i2c_attach, on whichever controller
+          // that is (Wire1, the XIAO RP2040's I2C1) or on none.
           wires,
           attrs,
           strAttrs,
@@ -414,42 +470,6 @@ PartSimulationRegistry.register('custom-chip', {
           instance: inst,
           wires,
         });
-
-        // Bridge UART: AVR Serial.write(byte) → chip.feedUart(byte).
-        // Chip's vx_uart_write(byte) → the board:
-        //   - TX wired to the hardware RX (pin 0) or unwired → USART inject
-        //     (Serial.read / the monitor), the historical path.
-        //   - TX wired to any other GPIO on an AVR board → bit-banged 8N1 on
-        //     that pin, so SoftwareSerial(rx=that pin) actually receives.
-        //     Before this, GPIO-wired chip streams (the NMEA GPS scenario)
-        //     delivered nothing at all.
-        //
-        // An ESP32-kind simulator hosting the chip in the browser (an
-        // overlay's in-browser engine) is left to the attach extensions: the
-        // engine publishes its UART bytes on the overlay's own bus, and the
-        // shim's onSerialData is never invoked, so there is nothing here to
-        // listen on. Pure OSS never reaches this branch with kind esp32.
-        if (inst.hasUart && detectSimulatorKind(sim) !== 'esp32') {
-          uartListener = (byte: number) => inst.feedUart(byte);
-          bridges.uartListeners.add(uartListener);
-          const route = inst.getUartTxRoute();
-          const gpioTarget =
-            detectSimulatorKind(sim) === 'avr' &&
-            route?.txArduinoPin != null &&
-            !isSyntheticChipPin(route.txArduinoPin) &&
-            route.txArduinoPin !== 0;
-          if (gpioTarget && route) {
-            uartBitBanger = createUartBitBanger(
-              sim as never,
-              route.txArduinoPin as number,
-              route.baud,
-              `chip:${componentId}`,
-            );
-            inst.onUartTx((byte) => uartBitBanger?.write(byte));
-          } else {
-            inst.onUartTx((byte) => avrUartTx(sim, byte));
-          }
-        }
 
         // Bridge framebuffer → chip's web component canvas (when chip has display).
         // The runtime reports every vx_buffer_write; a driver painting a 480x320
@@ -519,8 +539,18 @@ PartSimulationRegistry.register('custom-chip', {
         // stepping its core, or a sensor publishing samples) need a
         // host-side tick to fire those callbacks — without this loop the
         // WASM is loaded but never executes anything past chip_setup().
-        // We feed wall-clock nanoseconds; the chip's WasiShim already
-        // exposes the same epoch via vx_sim_now_nanos.
+        //
+        // On a board the chip's timers are on the guest clock and fire at
+        // their guest instant from the engine's own event queue; the tick is
+        // the net under them (a rebuilt CPU drops its events). With no guest
+        // clock the tick IS the clock: the time this canvas has been running,
+        // advanced by the frame's length while it runs and standing still
+        // while it is stopped. It used to feed performance.now(), the page's
+        // age, and compare timers started at 0 against it: the first tick
+        // replayed every period of that age at once (finding
+        // browser-chip-clock-always-zero).
+        let hostNanos = 0n;
+        let lastFrameMs: number | null = null;
         const tick = () => {
           if (disposed || !instance) return;
           // Whatever the chip drew since the last frame reaches the canvas now,
@@ -539,16 +569,25 @@ PartSimulationRegistry.register('custom-chip', {
             ? !useElectricalStore.getState().paused
             : simState.boards.some((b) => b.running);
           if (runnable) {
+            const nowMs = performance.now();
+            // A frame after a pause (the tab in the background) is not that
+            // long of running time: the same 50 ms cap the AVR frame loop uses.
+            if (lastFrameMs !== null) {
+              hostNanos += BigInt(Math.floor(Math.min(nowMs - lastFrameMs, 50) * 1_000_000));
+            }
+            lastFrameMs = nowMs;
             try {
               // Cap per-frame compute at 6 ms so a slow multi-chip bus (a Z80
               // running real-time over the settle kernel) degrades to a slower
               // boot instead of freezing the tab. Fast single-chip examples
               // finish their due fires well under the budget, so they are
               // unaffected and still run at real time.
-              instance.tickTimers(BigInt(Math.floor(performance.now() * 1_000_000)), 6);
+              instance.tickTimers(guestClock ? undefined : hostNanos, 6);
             } catch (e) {
               console.error(`[custom-chip:${componentId}] tickTimers threw:`, e);
             }
+          } else {
+            lastFrameMs = null;
           }
           rafHandle = requestAnimationFrame(tick);
         };
@@ -563,11 +602,6 @@ PartSimulationRegistry.register('custom-chip', {
       if (extensionCleanup) extensionCleanup();
       if (rafHandle) cancelAnimationFrame(rafHandle);
       rafHandle = 0;
-      if (uartListener) bridges.uartListeners.delete(uartListener);
-      if (uartBitBanger) {
-        uartBitBanger.dispose();
-        uartBitBanger = null;
-      }
       if (keyboardCleanup) keyboardCleanup();
       if (instance) instance.dispose();
       instance = null;

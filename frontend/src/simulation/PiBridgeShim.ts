@@ -4,14 +4,14 @@
  * hands to the parts wired to it.
  *
  * Why it exists: every part on the canvas attaches to
- * `getBoardSimulator(boardId)` and asks it for a bus (`addI2CDevice`, `.spi`,
- * `setSPIHandler`), a pin (`setPinState`, `pinManager`) or an ADC
- * (`setAdcVoltage`). A Pi had no entry in that map: a hand-rolled stub in
- * DynamicComponent answered `setPinState` and nothing else, so an I2C sensor
- * wired to GPIO2/3 attached nowhere and the guest read 0x00 from an address
- * that had a model sitting right there on the canvas. This class gives the
- * Pi the same surface the STM32 and ESP32 shims give their boards, over the
- * same `I2CBusManager` and `PinManager` every other board uses.
+ * `getBoardSimulator(boardId)` and asks it for a pin (`setPinState`,
+ * `pinManager`) or an ADC (`setAdcVoltage`), and its bus lines reach the
+ * board through the bus fabric's ports below. A Pi had no entry in that
+ * map: a hand-rolled stub in DynamicComponent answered `setPinState` and
+ * nothing else, so an I2C sensor wired to GPIO2/3 attached nowhere and the
+ * guest read 0x00 from an address that had a model sitting right there on
+ * the canvas. This class gives the Pi the same surface the STM32 and ESP32
+ * shims give their boards, over the same `PinManager` every other board uses.
  *
  * Two engines run a Pi script, and both come here for their peripherals:
  *
@@ -35,7 +35,8 @@
  *   I2C <bus> <addr> T  <hex|-> <n>      write bytes, repeated start, read n
  *   SPI <bus> <cs> X  <hex>              full-duplex transfer, CS released after
  *   SPI <bus> <cs> XC <hex>              same, CS held low for the next transfer
- *   SPI <bus> <cs> CONFIG ...            accepted, nothing to answer
+ *   SPI <bus> <cs> W | WC <hex>          X / XC with nothing waiting for MISO
+ *   SPI <bus> <cs> CONFIG <hz> <mode> <bits>   the handle's settings, nothing to answer
  *   W1 <pin> LIST | SP <rom> | RES <rom> <bits>
  *   W1 <pin> RESET | RB | WB <hex> | RBLK <n> | WBLK <hex> | TRIPLET <d>
  *   PWM <ch> <period_ns> <duty_ns> <en>  hardware PWM channel (0 = GPIO18, 1 = GPIO19)
@@ -46,15 +47,37 @@
  *
  *   I2C_DATA <bus> <addr> [<hex>]        ack; the bytes read, if any
  *   I2C_ERR  <bus> <addr> nack           nobody acknowledged the address
+ *   I2C_ERR  <bus> <addr> nack data      the address was, a data byte was not
  *   SPI_DATA <bus> <cs> <hex>            the bytes clocked in on MISO
  *   W1_LIST  <pin> [<rom>,...]           ROM ids on that pin
  *   W1_SLAVE <pin> <rom> <18hex> <crc_ok>  a slave's 9-byte scratchpad
  *   W1_DATA  <pin> <hex|0|1|ok>          the byte-level ops
  *   W1_ERR   <pin> no-master             nothing registered on that pin
  *   (null)                               lines that need no answer (PWM, GPIO_SETUP, CONFIG)
+ *
+ * SPI (project board-buses-2026-09): the board's two header controllers are
+ * bus-fabric ports ({@link getBusBinding}), one per controller and created
+ * with the shim, so a guest reboot, Stop/Run or a switch between the two
+ * engines changes who clocks the bytes and never the port. The CE lines are
+ * the controller's own chip selects, reported to the fabric as such. The
+ * fabric is the only SPI path: a part is on this bus because its pins are on
+ * the controller's nets, never because it hooked a callback here.
+ *
+ * I2C (F5) has the same shape: I2C0 and I2C1 are ports, a request line's
+ * `<bus>` picks the port, and the fabric answers from the targets whose SDA is
+ * on that controller's net. The backend relay is told which addresses exist on
+ * which bus from the same placement ({@link busTopology}).
+ *
+ * UART (F6) too: the header UART (UART0, the PL011 behind /dev/serial0) is one
+ * port on GPIO14/15. What the board transmits reaches it from either engine
+ * (the guest through `RaspberryPi3Bridge.onUartTxBytes`, the in-browser one
+ * through {@link headerUartTx}) and the fabric hands it to every part whose RX
+ * is wired to GPIO14; what such a part answers enters the port and goes to
+ * whichever engine is running ({@link sendSerialBytes}). Until F6 the board's
+ * outgoing bytes bypassed the parts entirely (velxio #358): a module that only
+ * speaks when spoken to never heard the question.
  */
 
-import { I2CBusManager, nullI2CMaster, type I2CDevice } from './I2CBusManager';
 import type { PinManager } from './PinManager';
 import type { RaspberryPi3Bridge, PiBusTopology } from './RaspberryPi3Bridge';
 import type { LineSupport } from './line/LineHost';
@@ -62,6 +85,24 @@ import { recordPartGap } from './line/requestLine';
 import { requestElectricalResolve } from './spice/electricalResolveHook';
 import { getBoardLineSupport, getPiBusOp } from '../lib/proBoardRegistry';
 import type { OneWireByteMaster } from './oneWireHost';
+import { busRegistry } from './buses/registry';
+import { functionsOfPin, getBoardPinFunctions, type SpiSignal } from './buses/pinFunctions';
+// Every OSS board's pin function table, which says where this board's pads are.
+import './buses/boardPinTables';
+import type {
+  EngineBinding,
+  I2cControllerPort,
+  I2cRouting,
+  I2cTransactionHandler,
+  SpiControllerConfig,
+  SpiControllerPort,
+  SpiMode,
+  SpiRouting,
+  UartConfig,
+  UartControllerPort,
+  UartRouting,
+} from './buses/types';
+import { boardPinsFromPinManager } from './buses/boardPins';
 
 /** What the store tells the shim about its board, read fresh on every call. */
 export interface PiShimBoardState {
@@ -109,17 +150,303 @@ export interface PiBridgeShimOptions {
   boardState: () => PiShimBoardState | undefined;
 }
 
-/** The SPI adapter in the AVR shape parts already hook (`spi.onByte`). */
-export interface PiSpiAdapter {
-  onByte: ((mosi: number) => void) | null;
-  completeTransfer: (miso: number) => void;
+/** One SPI controller's header pins: BCM GPIO numbers, which are the board pins. */
+interface PiSpiPins {
+  sck: number;
+  mosi: number;
+  miso: number;
+  /** Chip selects by the guest's `cs` index: CE0, CE1, CE2. */
+  ce: readonly number[];
 }
 
-/** BCM pins of the chip-selects per SPI bus, indexed by the guest's `cs`. */
-const SPI_CE_PINS: Record<number, number[]> = {
-  0: [8, 7],
-  1: [18, 17, 16],
+/**
+ * Where the guest image puts each controller: SPI0 (`dtparam=spi=on`:
+ * /dev/spidev0.0 and 0.1) and SPI1, the auxiliary controller
+ * (`dtoverlay=spi1-3cs`), on the Raspberry Pi's 40-pin header.
+ */
+const GUEST_SPI_PINS: Record<number, PiSpiPins> = {
+  0: { sck: 11, mosi: 10, miso: 9, ce: [8, 7] },
+  1: { sck: 21, mosi: 20, miso: 19, ce: [18, 17, 16] },
 };
+
+/**
+ * The guest's pads for controller `unit`, when the board's pin function table
+ * says those pads carry that controller (every Raspberry Pi from the Zero to
+ * the 5). Another board of the family boots the same image on another pinout
+ * (the UNIHIKER), so its table, not its name, decides: null there, and while
+ * the board's table is not registered yet (undefined).
+ */
+function guestSpiPins(boardKind: string, unit: number): PiSpiPins | null | undefined {
+  if (!getBoardPinFunctions(boardKind)) return undefined;
+  const pins = GUEST_SPI_PINS[unit];
+  if (!pins) return null;
+  const carries = (pin: number, signal: SpiSignal, csIndex?: number) =>
+    functionsOfPin(boardKind, pin).some(
+      (f) =>
+        f.bus === 'spi' &&
+        f.unit === unit &&
+        f.signal === signal &&
+        (csIndex === undefined || f.csIndex === csIndex),
+    );
+  const onBoard =
+    carries(pins.sck, 'sck') &&
+    carries(pins.mosi, 'mosi') &&
+    carries(pins.miso, 'miso') &&
+    pins.ce.every((pin, i) => carries(pin, 'cs', i));
+  return onBoard ? pins : null;
+}
+
+/** The SPI controllers a line's `<bus>` can name, by unit. */
+const SPI_UNITS = [0, 1] as const;
+
+/** What a guest's spidev handle programmed (`SPI <bus> <cs> CONFIG`). */
+interface PiSpiSettings {
+  hz: number;
+  mode: SpiMode;
+}
+
+const UNROUTED: SpiRouting = Object.freeze({});
+
+/**
+ * One SPI controller of the board as the bus fabric sees it. Created once with
+ * the shim and never replaced: whichever engine runs the script (the Linux
+ * guest through the relay, or the in-browser one) clocks its transactions
+ * through the same port, and a guest reboot or Stop/Run only powers it off.
+ *
+ * SPI0 is on from boot, as the guest's device tree has it. SPI1 comes up the
+ * first time the guest configures or clocks it, the moment a Pi would have
+ * loaded its overlay, and goes down again with the guest: until then its pads
+ * are plain GPIOs and the fabric must not route the controller to them.
+ */
+class PiSpiPort implements SpiControllerPort {
+  readonly bus = 'spi' as const;
+  readonly unit: number;
+  readonly name: string;
+  frameHandler: ((mosi: number, bits: number) => number) | null = null;
+  blockHandler: ((mosi: Uint8Array, miso: Uint8Array | null) => void) | null = null;
+  csHandler: ((index: number, active: boolean) => void) | null = null;
+  /** Chip select of the transaction in progress, or of the last one. */
+  activeCs = 0;
+  private routingHandler: (() => void) | null = null;
+  private readonly settings = new Map<number, PiSpiSettings>();
+  private readonly onFromBoot: boolean;
+  private on: boolean;
+  private readonly boardKind: string;
+  /** The board's pads for this controller, once its pin function table is known. */
+  private pads: { pins: PiSpiPins | null; routed: SpiRouting } | null = null;
+
+  constructor(unit: number, boardKind: string, onFromBoot: boolean) {
+    this.unit = unit;
+    this.name = `SPI${unit}`;
+    this.boardKind = boardKind;
+    this.onFromBoot = onFromBoot;
+    this.on = onFromBoot;
+  }
+
+  /** Header pins, or null on a board whose pads for this controller are not known. */
+  get pins(): PiSpiPins | null {
+    return this.resolvePads()?.pins ?? null;
+  }
+
+  private resolvePads(): { pins: PiSpiPins | null; routed: SpiRouting } | null {
+    if (this.pads) return this.pads;
+    const pins = guestSpiPins(this.boardKind, this.unit);
+    if (pins === undefined) return null;
+    this.pads = {
+      pins,
+      routed: pins
+        ? Object.freeze({ sck: pins.sck, mosi: pins.mosi, miso: pins.miso, cs: [...pins.ce] })
+        : UNROUTED,
+    };
+    return this.pads;
+  }
+
+  setFrameHandler(handler: ((mosi: number, bits: number) => number) | null): void {
+    this.frameHandler = handler;
+  }
+
+  setBlockHandler(handler: ((mosi: Uint8Array, miso: Uint8Array | null) => void) | null): void {
+    this.blockHandler = handler;
+  }
+
+  setHardwareCsHandler(handler: ((index: number, active: boolean) => void) | null): void {
+    this.csHandler = handler;
+  }
+
+  setRoutingChangeHandler(handler: (() => void) | null): void {
+    this.routingHandler = handler;
+  }
+
+  config(): SpiControllerConfig {
+    const s = this.settings.get(this.activeCs);
+    // Frames are the line's bytes, 8 bits each. Neither the BCM2835 nor the
+    // RP1 controller shifts LSB first (spidev answers SPI_LSB_FIRST with
+    // EINVAL); the mode and clock are only known once the guest's handle says
+    // them (the in-browser engine never does).
+    return s
+      ? { enabled: this.on, mode: s.mode, bitOrder: 'msb', bits: 8, hz: s.hz }
+      : { enabled: this.on, bitOrder: 'msb', bits: 8 };
+  }
+
+  routing(): SpiRouting {
+    return this.on ? (this.resolvePads()?.routed ?? UNROUTED) : UNROUTED;
+  }
+
+  /** The pad a chip-select index drives, if this board has it. */
+  cePin(cs: number): number | undefined {
+    return this.pins?.ce[cs];
+  }
+
+  configure(cs: number, settings: PiSpiSettings): void {
+    this.settings.set(cs, settings);
+    this.enable();
+  }
+
+  /** The guest uses this controller: its pads leave GPIO duty. */
+  enable(): void {
+    if (this.on) return;
+    this.on = true;
+    this.routingHandler?.();
+  }
+
+  /** The guest is gone: its settings go with it, and an overlay controller with them. */
+  powerOff(): void {
+    this.settings.clear();
+    this.activeCs = 0;
+    if (this.on && !this.onFromBoot) {
+      this.on = false;
+      this.routingHandler?.();
+    }
+  }
+}
+
+/**
+ * Where the guest image puts its I2C controllers: /dev/i2c-1 (BSC1) on
+ * GPIO2/3, the header bus, and /dev/i2c-0 (BSC0) on GPIO0/1, which velxio-busd
+ * serves too. The bus number in a request line is the controller's unit.
+ */
+const GUEST_I2C_PINS: Record<number, { sda: number; scl: number }> = {
+  0: { sda: 0, scl: 1 },
+  1: { sda: 2, scl: 3 },
+};
+
+/** The I2C controllers a line's `<bus>` can name, by unit. */
+const I2C_UNITS = [0, 1] as const;
+
+/**
+ * One I2C controller of the board as the bus fabric sees it (project
+ * board-buses-2026-09, F5). Like PiSpiPort: created once with the shim, and
+ * whichever engine runs the script (the Linux guest through the relay, or the
+ * in-browser one) runs its transactions through it, so a target is on this
+ * controller's bus because its SDA is on the controller's net, never because
+ * it hooked the shim.
+ *
+ * Its pads come from the board's pin function table, as for SPI: a board of
+ * the family whose table does not put this controller on the guest's pads
+ * routes it nowhere, and every address on it NACKs.
+ */
+class PiI2cPort implements I2cControllerPort {
+  readonly bus = 'i2c' as const;
+  readonly unit: number;
+  readonly name: string;
+  handler: I2cTransactionHandler | null = null;
+  private readonly boardKind: string;
+  private routed: I2cRouting | null = null;
+
+  constructor(unit: number, boardKind: string) {
+    this.unit = unit;
+    this.name = `I2C${unit}`;
+    this.boardKind = boardKind;
+  }
+
+  setTransactionHandler(handler: I2cTransactionHandler | null): void {
+    this.handler = handler;
+  }
+
+  routing(): I2cRouting {
+    if (this.routed) return this.routed;
+    const pins = GUEST_I2C_PINS[this.unit];
+    if (!getBoardPinFunctions(this.boardKind)) return {};
+    const carries = (pin: number, signal: 'sda' | 'scl') =>
+      functionsOfPin(this.boardKind, pin).some(
+        (f) => f.bus === 'i2c' && f.unit === this.unit && f.signal === signal,
+      );
+    this.routed =
+      pins && carries(pins.sda, 'sda') && carries(pins.scl, 'scl')
+        ? Object.freeze({ sda: pins.sda, scl: pins.scl })
+        : Object.freeze({});
+    return this.routed;
+  }
+}
+
+/**
+ * The header UART as the bus fabric sees it (project board-buses-2026-09,
+ * F6): UART0, the PL011 the guest image puts behind /dev/serial0 on
+ * GPIO14 (TXD) and GPIO15 (RXD), fixed by the board's pin table. Created
+ * once with the shim, like the SPI and I2C ports, and fed by whichever
+ * engine runs the script: the Linux guest's bytes arrive raw from the
+ * bridge, the in-browser engine's from PiBridgeShim.headerUartTx. A byte a
+ * part answers is queued and leaves for the engine per task, so a modem's
+ * "OK\r\n" is one relay frame and not four.
+ *
+ * The rate is not reported: a tty's termios never reaches the tab, and the
+ * in-browser engine's serial shim ignores the baudrate it is given, so the
+ * port says nothing rather than a guess. A part that declares its own rate
+ * is delivered to as-is.
+ */
+class PiUartPort implements UartControllerPort {
+  readonly bus = 'uart' as const;
+  readonly unit = 0;
+  readonly name = 'UART0 (PL011)';
+  private handler: ((byte: number) => void) | null = null;
+  private readonly send: (bytes: number[]) => void;
+  private pending: number[] = [];
+  private flushQueued = false;
+
+  constructor(send: (bytes: number[]) => void) {
+    this.send = send;
+  }
+
+  setTxHandler(handler: ((byte: number) => void) | null): void {
+    this.handler = handler;
+  }
+
+  /** Whether the fabric holds this port right now (tests, inspector). */
+  get bound(): boolean {
+    return this.handler !== null;
+  }
+
+  receive(byte: number): void {
+    this.pending.push(byte & 0xff);
+    if (this.flushQueued) return;
+    this.flushQueued = true;
+    queueMicrotask(() => this.flush());
+  }
+
+  /** Hand the engine what receive() queued, now. */
+  flush(): void {
+    this.flushQueued = false;
+    if (this.pending.length === 0) return;
+    const out = this.pending;
+    this.pending = [];
+    this.send(out);
+  }
+
+  config(): UartConfig {
+    return {};
+  }
+
+  routing(): UartRouting | 'static' {
+    return 'static';
+  }
+
+  /** Bytes the board wrote to the header UART, in order. */
+  transmitted(bytes: ArrayLike<number>): void {
+    const handler = this.handler;
+    if (!handler) return;
+    for (let i = 0; i < bytes.length; i++) handler(bytes[i] & 0xff);
+  }
+}
 
 /** Hardware PWM channels of `pwmchip0` on the 40-pin header. */
 const PWM_CHANNEL_PINS: Record<number, number> = { 0: 18, 1: 19 };
@@ -171,19 +498,6 @@ export class PiBridgeShim {
   readonly boardId: string;
   readonly boardKind: string;
   pinManager: PinManager;
-  /**
-   * One character the board just put on its HEADER UART, for the parts wired
-   * to it. Fed by {@link noteHeaderUartTxTemporary} and by nothing else.
-   *
-   * The slot carries the rp2040 name because `detectSimulatorKind` files this
-   * shim as rp2040 (it has `addI2CDevice` and `setSPIHandler`), so
-   * `ensureUartBridge` wraps exactly this one to fan bytes out to the UART
-   * parts. It is not the serial monitor: the Pi's console is fed from
-   * `RaspberryPi3Bridge.onSerialData`, which the store wires separately, so
-   * unlike the ESP32 and STM32 shims nothing ever assigns this property and
-   * the parts are its only consumer.
-   */
-  onSerialData: ((ch: string) => void) | null = null;
   onPinChangeWithTime: ((pin: number, state: boolean, timeMs: number) => void) | null = null;
   private _instantAdapter: PiInstantAdapter | null = null;
   /**
@@ -225,9 +539,15 @@ export class PiBridgeShim {
 
   private readonly bridge: RaspberryPi3Bridge;
   private readonly boardState: () => PiShimBoardState | undefined;
-  private readonly i2cBusInstance: I2CBusManager;
-  private readonly spiHandlers = new Map<number, (mosi: number) => number>();
-  private _spiAdapter: PiSpiAdapter | null = null;
+  /** SPI0 and SPI1, by unit. The fabric's view of this board's SPI. */
+  private readonly spiPorts: PiSpiPort[];
+  /** I2C0 and I2C1, by unit: the fabric's view of this board's I2C. */
+  private readonly i2cPorts: PiI2cPort[];
+  /** UART0, the header UART: the fabric's view of this board's UART. */
+  private readonly uartPort: PiUartPort;
+  private readonly busBinding: EngineBinding;
+  /** Set while a fabric holds this board's binding (the store binds every board). */
+  private resetHandler: (() => void) | null = null;
   /** `bus:cs` of a chip-select held low by an `XC` transfer, if any. */
   private heldCs: { bus: number; cs: number } | null = null;
   private readonly oneWireMasters = new Map<number, OneWireByteMaster>();
@@ -241,7 +561,8 @@ export class PiBridgeShim {
   /** Bus-map sync with a relaying backend (see startBusSync). */
   private busTimer: ReturnType<typeof setInterval> | null = null;
   private busMapKey = '';
-  private readonly lastRegs = new Map<number, string>();
+  /** Last registers pushed, by `bus:addr`. */
+  private readonly lastRegs = new Map<string, string>();
 
   constructor(opts: PiBridgeShimOptions) {
     this.boardId = opts.boardId;
@@ -249,17 +570,60 @@ export class PiBridgeShim {
     this.bridge = opts.bridge;
     this.pinManager = opts.pinManager;
     this.boardState = opts.boardState;
-    this.i2cBusInstance = new I2CBusManager(nullI2CMaster());
-    this.tapHeaderUartTx();
+    // Every board of the family gets the controllers the guest image serves;
+    // each port finds its pads in the board's pin function table.
+    this.spiPorts = SPI_UNITS.map((unit) => new PiSpiPort(unit, opts.boardKind, unit === 0));
+    this.i2cPorts = I2C_UNITS.map((unit) => new PiI2cPort(unit, opts.boardKind));
+    // What a part answers goes to whichever engine runs the script, through
+    // the same seam a peer board's bytes take.
+    this.uartPort = new PiUartPort((bytes) => this.sendSerialBytes(bytes));
+    this.busBinding = {
+      // A device answering on a GPIO (a bit-banged MISO) is a part driving
+      // an input, exactly what setPinState carries to either engine.
+      pins: boardPinsFromPinManager(this.pinManager, (pin, level) => this.setPinState(pin, level)),
+      spi: this.spiPorts,
+      i2c: this.i2cPorts,
+      uart: [this.uartPort],
+      setResetHandler: (handler) => {
+        this.resetHandler = handler;
+      },
+    };
+    // The Linux guest's header-UART bytes, raw, into the port. Its own slot
+    // on the bridge: Interconnect chains the text one for the peer boards.
+    this.bridge.onUartTxBytes = (bytes) => this.uartPort.transmitted(bytes);
+  }
+
+  /** The board as the bus fabric sees it: the same object, and the same ports, for the board's life. */
+  getBusBinding(): EngineBinding {
+    return this.busBinding;
   }
 
   // ── Lifecycle (the store drives the guest through the bridge / engine) ──
   start(): void {}
-  /** Nothing to halt here; a chip-select held by an unfinished transfer is
-   *  released and the bus-map sync with the backend stops. */
+  /** Nothing to halt here: the guest is gone (the store cuts it before this),
+   *  so its pads float and its SPI state goes with it, and the bus-map sync
+   *  with the backend stops. */
   stop(): void {
-    this.releaseHeldCs();
+    this.spiPowerCycle(true);
     this.stopBusSync();
+  }
+
+  /**
+   * The guest that programmed the SPI controllers is gone, or a fresh one is
+   * about to start: a chip select it held is released, its settings and any
+   * overlay controller go away, and the fabric hears an MCU reset. That comes
+   * last, so a chip select the fabric re-reads then is never a level the old
+   * guest left: on Stop every pad is released first (`releasePads`), as the
+   * MCU engines do on reset, and a GPIO the guest held low as a chip select
+   * reads "not driven" instead of keeping its chip selected into the next run.
+   * A fresh guest announced by the relay leaves the pins alone: the Stop
+   * before it already released them, and the levels the parts drive are theirs.
+   */
+  private spiPowerCycle(releasePads: boolean): void {
+    this.releaseHeldCs();
+    if (releasePads) this.pinManager.hardResetPinStates();
+    for (const port of this.spiPorts) port.powerOff();
+    this.resetHandler?.();
   }
 
   // ── The bus map, for a backend that answers the guest from the canvas ──
@@ -271,12 +635,63 @@ export class PiBridgeShim {
    * copy, both without asking this tab; only the rest travels here.
    */
   busTopology(): PiBusTopology {
-    const i2c = this.i2cBusInstance.listDevices().map((dev) => ({
-      bus: HEADER_I2C_BUS,
-      addr: dev.address & 0x7f,
-      regs: typeof dev.dumpRegisters === 'function' ? toHex(Array.from(dev.dumpRegisters())) : null,
-    }));
+    const i2c: PiBusTopology['i2c'] = [];
+    const seen = new Set<string>();
+    // The targets the fabric placed on a bus a controller of this board
+    // drives, per controller (project board-buses-2026-09, F5): a sensor wired
+    // to GPIO2/3 is on bus 1, one wired to GPIO0/1 on bus 0, and one wired to
+    // neither is on no bus at all, so the relay NAKs it without asking.
+    for (const t of this.fabricI2cTargets()) {
+      const key = `${t.bus}:${t.addr}`;
+      if (seen.has(key)) {
+        // Two chips at one address: if either can NAK, the tab has to answer.
+        const first = i2c.find((d) => d.bus === t.bus && d.addr === t.addr);
+        if (first && t.ask_writes) first.ask_writes = true;
+        continue;
+      }
+      seen.add(key);
+      i2c.push(t);
+    }
     return { version: 1, i2c, spi: { attached: this.spiAttached() } };
+  }
+
+  /**
+   * Every address a fabric target answers on this board, by the controller
+   * whose bus it is on. A target that can hand over its registers
+   * (`dumpRegisters`, as every register-file part the relay mirrors does) is
+   * published with them, so the relay answers its reads without a round trip,
+   * exactly as for a part on the header manager.
+   */
+  private fabricI2cTargets(): PiBusTopology['i2c'] {
+    if (!this.boundToFabric()) return [];
+    const fabric = busRegistry.fabric(this.boardId);
+    const out: PiBusTopology['i2c'] = [];
+    for (const port of this.i2cPorts) {
+      const sda = port.routing().sda;
+      const bus = sda === undefined ? undefined : fabric.i2cBuses.get(sda);
+      if (!bus) continue;
+      for (const m of bus.members.values()) {
+        if (!m.clocked) continue;
+        const dump = (m.target as { dumpRegisters?: () => Uint8Array }).dumpRegisters;
+        const regs =
+          typeof dump === 'function' ? toHex(Array.from(dump.call(m.target))) : null;
+        // Only a chip that can NAK costs its writes a round trip; the rest
+        // are ACKed by the relay, which is what keeps a display's frame fast.
+        const ask = m.target.mayNak === true ? { ask_writes: true as const } : {};
+        for (const addr of m.addresses) out.push({ bus: port.unit, addr, regs, ...ask });
+      }
+    }
+    out.sort((a, b) => a.bus - b.bus || a.addr - b.addr);
+    return out;
+  }
+
+  /** Every address answered on I2C bus `bus`, for a NAK message that says
+   *  what IS wired there. */
+  i2cAddresses(bus: number): number[] {
+    return this.busTopology()
+      .i2c.filter((d) => d.bus === bus)
+      .map((d) => d.addr)
+      .sort((a, b) => a - b);
   }
 
   /**
@@ -288,6 +703,10 @@ export class PiBridgeShim {
    */
   startBusSync(): void {
     this.stopBusSync();
+    // The backend announces a guest it just spawned: whatever the previous one
+    // left on the SPI controllers (a guest that died mid-transfer never got a
+    // Stop) is not this one's.
+    this.spiPowerCycle(false);
     this.publishBusTopology();
     // The guest is fresh: the backend announces `bus_relay` right after it
     // spawns QEMU, and a part that mounted before then sent its attach into a
@@ -320,8 +739,39 @@ export class PiBridgeShim {
     const topology = this.busTopology();
     this.busMapKey = this.mapKeyOf(topology);
     this.lastRegs.clear();
-    for (const dev of topology.i2c) if (dev.regs !== null) this.lastRegs.set(dev.addr, dev.regs);
+    for (const dev of topology.i2c) {
+      if (dev.regs !== null) this.lastRegs.set(`${dev.bus}:${dev.addr}`, dev.regs);
+    }
+    // The responders with a portable model, which the backend runs beside the
+    // guest by chip enable instead of asking this tab once per transfer
+    // (project board-buses-2026-09, F4). Built here and not in busTopology():
+    // that one runs on every 250 ms tick, and a map carries each model's
+    // artifact and an SD card's whole image. Membership changes reach this
+    // through pushBusMap, which the store calls when the registry says so.
+    topology.spi.responders = this.boundToFabric() ? busRegistry.remoteSpiMap(this.boardId) : [];
     (this.bridge as Partial<RaspberryPi3Bridge>).sendBusTopology?.(topology);
+  }
+
+  /**
+   * The registry says who is on this board's SPI changed (the store routes
+   * every board's map change here, as it does for the QEMU MCU shims). Only
+   * while a relaying backend is listening: before `bus_relay` there is nobody
+   * to tell, and startBusSync publishes the whole map when it arrives.
+   */
+  pushBusMap(): void {
+    if (this.busTimer === null) return;
+    this.publishBusTopology();
+  }
+
+  /**
+   * A hosted responder's live inputs changed (the finger, the slider, the
+   * circuit solve). The backend applies them to the model it runs for that
+   * owner; a map published later carries them too, so nothing is lost while
+   * no relay is listening.
+   */
+  pushBusAttrs(owner: string, attrs: Record<string, number>): void {
+    if (this.busTimer === null) return;
+    (this.bridge as Partial<RaspberryPi3Bridge>).sendBusAttrs?.(owner, attrs);
   }
 
   private busTick(): void {
@@ -332,21 +782,45 @@ export class PiBridgeShim {
     }
     const bridge = this.bridge as Partial<RaspberryPi3Bridge>;
     for (const dev of topology.i2c) {
-      if (dev.regs === null || this.lastRegs.get(dev.addr) === dev.regs) continue;
-      this.lastRegs.set(dev.addr, dev.regs);
+      // By bus and address: the same sensor on bus 0 and bus 1 is two devices.
+      const key = `${dev.bus}:${dev.addr}`;
+      if (dev.regs === null || this.lastRegs.get(key) === dev.regs) continue;
+      this.lastRegs.set(key, dev.regs);
       bridge.sendBusRegs?.(dev.bus, dev.addr, dev.regs);
     }
   }
 
   /** Which devices are where (not their register contents). */
   private mapKeyOf(topology: PiBusTopology): string {
-    const i2c = topology.i2c.map((d) => `${d.bus}:${d.addr}:${d.regs === null ? 'ask' : 'regs'}`).sort();
+    const i2c = topology.i2c
+      .map((d) => `${d.bus}:${d.addr}:${d.regs === null ? 'ask' : 'regs'}${d.ask_writes ? ':nak' : ''}`)
+      .sort();
     return `${i2c.join(',')}|spi:${topology.spi.attached ? 1 : 0}`;
   }
 
-  /** A part listens on the SPI bus in either shape parts use. */
+  /**
+   * Something on the canvas listens on this board's SPI: a device the bus
+   * fabric placed on a controller's SCK net. The backend answers the guest's
+   * transfers with idle bytes while this is false.
+   */
   private spiAttached(): boolean {
-    return !!this._spiAdapter?.onByte || this.spiHandlers.size > 0;
+    return this.fabricHasSpiDevices();
+  }
+
+  /** Whether the page's fabric for this board holds THIS shim's binding. */
+  private boundToFabric(): boolean {
+    // Only a bound board has a fabric to ask (asking creates one otherwise).
+    if (!this.resetHandler) return false;
+    return busRegistry.fabric(this.boardId).pins === this.busBinding.pins;
+  }
+
+  private fabricHasSpiDevices(): boolean {
+    // Only the page's fabric holding THIS binding speaks for it.
+    if (!this.boundToFabric()) return false;
+    const fabric = busRegistry.fabric(this.boardId);
+    return this.spiPorts.some(
+      (p) => p.pins !== null && (fabric.spiBuses.get(p.pins.sck)?.size ?? 0) > 0,
+    );
   }
   reset(): void {}
   setSpeed(_s: number): void {}
@@ -454,15 +928,14 @@ export class PiBridgeShim {
   /**
    * The hosted line-sensor channel (simulation/line/requestLine).
    *
-   * This class used to have no `registerSensor` at all, on purpose, so the
-   * I2C parts would take their `addI2CDevice` branch and no device was fed
-   * twice. That invariant still holds and is worth restating: every one of
-   * those parts calls `addI2CDevice?.()` inside the registerSensor branch
-   * too, and the extras it reaches for (`addI2CTransactionListener` and its
-   * remover) are optional and absent here, so the branch they now take is the
-   * one they took before plus a `registerSensor` that declines. The
-   * `line_request` guard below is what makes declining exact: only a record
-   * the line contract built is ours.
+   * This class used to have no `registerSensor` at all, on purpose, so no
+   * I2C part would file a worker record here on top of its bus model. That
+   * invariant still holds and is worth restating: an I2C part is on the
+   * fabric by its wiring (parts/i2cPart.ts) and only files a worker record
+   * with a simulator that says yes, so a `registerSensor` that declines
+   * everything but the line contract keeps every device on the fabric alone.
+   * The `line_request` guard below is what makes declining exact: only a
+   * record the line contract built is ours.
    *
    * WHERE THE MODEL RUNS is not this class's business. Under QEMU it runs in
    * the backend, because a guest read is answered from the backend's own pin
@@ -506,6 +979,34 @@ export class PiBridgeShim {
   }
 
   /**
+   * A responder the relay hosts wrote into its storage (`bus_blob`): the guest
+   * saved something on a card. The span lands on the tab's copy, which is
+   * what the SD panel lists and what the next Run builds the card from; the
+   * relay keeps its own model across republishes, so without this the guest's
+   * file lives only until the guest stops.
+   */
+  applyBusBlob(data: Record<string, unknown>): boolean {
+    const b64 = typeof data['data'] === 'string' ? data['data'] : '';
+    let bytes: Uint8Array;
+    try {
+      const bin = atob(b64);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch {
+      return false;
+    }
+    const owner = String(data['owner'] ?? '');
+    const name = String(data['name'] ?? '');
+    const offset = Number(data['offset'] ?? 0);
+    const blobId = typeof data['blob_id'] === 'string' ? data['blob_id'] : undefined;
+    if (!busRegistry.applyRemoteBlob(this.boardId, owner, name, offset, bytes, blobId)) {
+      console.warn(`[PiBridgeShim:${this.boardId}] nobody here takes the span ${owner}/${name}@${offset}`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * A refusal the host sent back after taking the sensor (`sensor_refused`).
    * Filed against the component that asked, so the circuit check prints it
    * exactly like a refusal made in the browser.
@@ -525,66 +1026,14 @@ export class PiBridgeShim {
 
   // ── Header UART: what the board TRANSMITS ──────────────────────────────
   /**
-   * One chunk the board just wrote to its header UART, handed on to the
-   * parts wired to it.
-   *
-   * Until this existed the shim's whole UART surface was the RX direction
-   * below, and the board's outgoing bytes never passed through it in either
-   * engine: they went straight to the cross-board fan-out (Interconnect's
-   * `serialFanout`), which only ever reaches other BOARDS. So a part could
-   * talk to the Pi and the Pi could talk to a peer board, but a module that
-   * only answers when spoken to never heard the question. The two GPS bricks
-   * were the exception, and only because a GPS never listens: it just pushes
-   * NMEA.
-   *
-   * Both engines end here and nowhere else: the Linux guest through the
-   * bridge's `onUartTx` ({@link tapHeaderUartTx}), the in-browser engine
-   * through `feedBoardSerialOut`, which Interconnect hands on. Neither
-   * fan-out is rerouted, so board-to-board forwarding is untouched.
-   *
-   * TEMPORARY, and the name says so on purpose. board-buses-2026-09 phase F6
-   * replaces every per-engine UART hook with membership derived from the TX
-   * and RX nets, and deletes `ensureUartBridge` and its kind switch outright.
-   * When that lands, this method and both of its callers go with it. It is
-   * named this way so that project can find every caller without grepping for
-   * who else might depend on it: the answer is nobody outside this file and
-   * Interconnect.
+   * Bytes the board wrote to its header UART from an engine running the
+   * script in this tab. They enter the board's UART port and the fabric
+   * hands them to every part whose RX is on GPIO14. The Linux guest's bytes
+   * take the bridge's `onUartTxBytes` into the same port; the cross-board
+   * fan-out (Interconnect) is a separate path and is not served here.
    */
-  noteHeaderUartTxTemporary(text: string): void {
-    const sink = this.onSerialData;
-    if (!sink || !text) return;
-    for (const ch of text) sink(ch);
-  }
-
-  /**
-   * Chain onto the bridge's TX callback instead of owning it. Interconnect
-   * takes the same slot for the board-to-board wires and chains whatever it
-   * finds there (its `__icUartHook` branch), so whichever installs first the
-   * other still runs and each byte is delivered once on each path.
-   */
-  private tapHeaderUartTx(): void {
-    const bridge = this.bridge as unknown as { onUartTx?: ((text: string) => void) | null };
-    // Only tap a bridge that DECLARES the slot. Interconnect decides between
-    // the header UART and the console with the same `'onUartTx' in bridge`
-    // test, so creating the property on a bridge that has no header UART
-    // would move it off the console fallback and mute a wired peer board.
-    // RaspberryPi3Bridge declares it; the reduced doubles the suites use for
-    // other boards do not, and they are the ones that fallback is for.
-    if (!('onUartTx' in bridge)) return;
-    // Wrap once. Today a second wrap cannot happen (the store makes one shim
-    // per board and hands it a freshly constructed bridge), but the failure
-    // mode if that ever changes is silent doubling of every byte, which is
-    // far harder to notice than silence: an AT modem would see "ATAT". The
-    // marker is the same one Interconnect uses on the same object for the
-    // same reason.
-    const marked = bridge as unknown as { __piHeaderUartTap?: boolean };
-    if (marked.__piHeaderUartTap) return;
-    marked.__piHeaderUartTap = true;
-    const previous = bridge.onUartTx ?? null;
-    bridge.onUartTx = (text: string) => {
-      previous?.(text);
-      this.noteHeaderUartTxTemporary(text);
-    };
+  headerUartTx(bytes: ArrayLike<number>): void {
+    this.uartPort.transmitted(bytes);
   }
 
   // ── Header UART: what the board RECEIVES ───────────────────────────────
@@ -597,74 +1046,93 @@ export class PiBridgeShim {
     }
     (this.bridge as Partial<RaspberryPi3Bridge>).sendUartBytes?.(bytes);
   }
-  /** One byte, the RP2040 name: the OSS custom-chip bridge (avrUartTx)
-   *  routes a browser-hosted chip's vx_uart_write through `serialWriteByte`
-   *  on an rp2040-kind simulator, which this shim is. Without it the board
-   *  heard the chip (onSerialData) but the chip's replies went nowhere. */
-  serialWriteByte(byte: number): void {
-    this.sendSerialBytes([byte & 0xff]);
-  }
-  /** Text counterpart, the uniform `sim.feedUart(uart, data)` seam. */
+  /** Text counterpart, the uniform `sim.feedUart(uart, data)` seam. A part on
+   *  the fabric answers through the UART port, not through this. */
   feedUart(uart: number, data: string): boolean {
     this.sendSerialBytes(Array.from(new TextEncoder().encode(data)), uart);
     return true;
   }
 
-  // ── I2C: the header bus, shared by the parts and both engines ──────────
-  // No `addI2CTransactionListener` on purpose: the parts then take their
-  // `addI2CDevice` branch (the AVR / RP2040 path), so every device lives on
-  // this one I2CBusManager and nobody feeds it twice. `registerSensor` above
-  // exists for the line contract only and declines everything else, which
-  // keeps that true — see its comment.
-  getI2CBus(_bus: 0 | 1 = 0): I2CBusManager {
-    return this.i2cBusInstance;
-  }
-  addI2CDevice(device: I2CDevice, _bus: 0 | 1 = 0): void {
-    this.i2cBusInstance.addDevice(device);
-  }
-  removeI2CDevice(addr: number, _bus: 0 | 1 = 0): void {
-    this.i2cBusInstance.removeDevice(addr);
-  }
+  // ── I2C ────────────────────────────────────────────────────────────────
+  // A part is on the bus fabric (attachI2cTarget): on the controller its SDA
+  // is wired to, reached through the I2C ports above. No
+  // `addI2CTransactionListener` on purpose, and `registerSensor` declines
+  // everything but the line contract, so nothing files a second copy of a
+  // part here: see its comment.
 
   /**
    * One I2C transaction as a master would run it: address for write, send
    * `write`, and when `readLen` > 0 re-address for read WITHOUT a stop in
    * between (a repeated start: the device keeps its register pointer), read,
    * then stop. Null when nobody acknowledges the address (a NAK), which is
-   * what the guest turns into errno 121. Only the header bus has devices;
-   * any other bus number is empty.
+   * what the guest turns into errno 121.
+   *
+   * `bus` is the guest's controller (/dev/i2c-<bus>). Its port hands the
+   * transaction to the fabric, which answers from the targets whose SDA is on
+   * that controller's net (project board-buses-2026-09, F5).
    */
   i2cTransfer(addr: number, write: readonly number[], readLen: number, bus = HEADER_I2C_BUS): number[] | null {
-    if (bus !== HEADER_I2C_BUS) return null;
-    const i2c = this.i2cBusInstance;
+    const r = this.i2cExchange(addr, write, readLen, bus);
+    return Array.isArray(r) ? r : null;
+  }
+
+  /**
+   * {@link i2cTransfer}, telling an address NAK from a NAK on a data byte.
+   * Linux reports both as EREMOTEIO, so the guest cannot tell either; the
+   * reply line still says which, for whoever reads it.
+   */
+  private i2cExchange(
+    addr: number,
+    write: readonly number[],
+    readLen: number,
+    bus: number,
+  ): number[] | 'nack' | 'nack-data' {
+    const port = this.i2cPorts[bus] as PiI2cPort | undefined;
+    return port?.handler ? this.fabricI2cTransfer(port.handler, addr, write, readLen) : 'nack';
+  }
+
+  /**
+   * The same transaction through a controller port's fabric handler: one
+   * event per START, byte and STOP, as the controller would put them on the
+   * wire. A NAK at either address phase still ends in a STOP, so every
+   * target addressed so far sees it.
+   */
+  private fabricI2cTransfer(
+    h: I2cTransactionHandler,
+    addr: number,
+    write: readonly number[],
+    readLen: number,
+  ): number[] | 'nack' | 'nack-data' {
     if (write.length > 0 || readLen === 0) {
-      if (!i2c.handleExternalConnect(addr, true)) return null;
-      for (const b of write) i2c.handleExternalWrite(b);
+      if (!h.start(addr, false)) {
+        h.stop();
+        return 'nack';
+      }
+      for (const b of write) {
+        // A NAKed byte ends the write there, as the BSC controller does:
+        // nothing after it goes out, and the transfer fails.
+        if (!h.write(b & 0xff)) {
+          h.stop();
+          return 'nack-data';
+        }
+      }
     }
     const out: number[] = [];
     if (readLen > 0) {
-      if (!i2c.handleExternalConnect(addr, false)) {
-        i2c.handleExternalStop();
-        return null;
+      if (!h.start(addr, true)) {
+        h.stop();
+        return 'nack';
       }
-      for (let i = 0; i < readLen; i++) out.push(i2c.handleExternalRead() & 0xff);
+      for (let i = 0; i < readLen; i++) out.push(h.read() & 0xff);
     }
-    i2c.handleExternalStop();
+    h.stop();
     return out;
   }
 
-  // ── SPI: the AVR adapter shape AND the RP2040 handler shape ────────────
-  // Parts hook whichever they know; a transfer feeds both and ANDs the MISO
-  // bytes (an idle line reads high, so a silent side contributes 0xff).
-  get spi(): PiSpiAdapter {
-    if (!this._spiAdapter) {
-      this._spiAdapter = { onByte: null, completeTransfer: (_miso: number) => {} };
-    }
-    return this._spiAdapter;
-  }
-  setSPIHandler(bus: 0 | 1, handler: (value: number) => number): void {
-    this.spiHandlers.set(bus, handler);
-  }
+  // ── SPI ────────────────────────────────────────────────────────────────
+  // Each transaction goes to its controller's port, whole when the fabric
+  // takes blocks and frame by frame otherwise. The fabric is the only path:
+  // a device is on this bus because its pins are on the controller's nets.
 
   /**
    * Clock `mosi` out on `bus` with chip-select `cs` low, return MISO.
@@ -673,39 +1141,80 @@ export class PiBridgeShim {
    * releases it.
    */
   spiTransfer(bus: number, cs: number, mosi: readonly number[], holdCs = false): number[] {
-    const cePin = SPI_CE_PINS[bus]?.[cs];
-    const held = this.heldCs && this.heldCs.bus === bus && this.heldCs.cs === cs;
+    return Array.from(this.clockSpi(bus, cs, mosi, holdCs, true) ?? []);
+  }
+
+  /** One transfer; `wantMiso` false is a write nothing reads back (`W`). */
+  private clockSpi(
+    bus: number,
+    cs: number,
+    mosi: readonly number[],
+    holdCs: boolean,
+    wantMiso: boolean,
+  ): Uint8Array | null {
+    const port = this.spiPorts[bus] as PiSpiPort | undefined;
+    const held = this.heldCs !== null && this.heldCs.bus === bus && this.heldCs.cs === cs;
     if (!held) {
       this.releaseHeldCs();
-      if (cePin !== undefined) this.pinManager.triggerPinChange(cePin, false, 'mcu');
+      if (port) {
+        port.enable();
+        port.activeCs = cs;
+      }
+      this.driveCe(bus, cs, true);
     }
-    const adapter = this.spi;
-    const handler = this.spiHandlers.get(bus);
-    const out: number[] = [];
-    for (const byte of mosi) {
-      let fromAdapter = 0xff;
-      adapter.completeTransfer = (miso: number) => {
-        fromAdapter = miso & 0xff;
-      };
-      adapter.onByte?.(byte & 0xff);
-      const fromHandler = handler ? handler(byte & 0xff) & 0xff : 0xff;
-      out.push(fromAdapter & fromHandler);
-    }
-    adapter.completeTransfer = (_miso: number) => {};
+    const tx = new Uint8Array(mosi.length);
+    for (let i = 0; i < tx.length; i++) tx[i] = mosi[i] & 0xff;
+    const rx = wantMiso ? new Uint8Array(tx.length) : null;
+    // A bus number with no controller behind it clocks into nothing.
+    if (port) this.exchange(port, tx, rx);
+    else rx?.fill(0xff);
     if (holdCs) {
       this.heldCs = { bus, cs };
     } else {
       this.heldCs = null;
-      if (cePin !== undefined) this.pinManager.triggerPinChange(cePin, true, 'mcu');
+      this.driveCe(bus, cs, false);
     }
-    return out;
+    return rx;
+  }
+
+  /**
+   * The controller drives its CE line: the fabric hears a hardware chip
+   * select, and the pad follows it, low while selected, for whatever else is
+   * wired to it and the legacy parts that watch it. Hardware first, so both
+   * agree at every moment a listener can look.
+   */
+  private driveCe(bus: number, cs: number, active: boolean): void {
+    const port = this.spiPorts[bus] as PiSpiPort | undefined;
+    const pin = port?.cePin(cs);
+    if (!port || pin === undefined) return;
+    port.csHandler?.(cs, active);
+    this.pinManager.triggerPinChange(pin, !active, 'mcu');
+  }
+
+  /**
+   * One transaction on `port`: exactly one fabric answer per frame. `rx` null
+   * means nobody reads MISO back.
+   */
+  private exchange(port: PiSpiPort, tx: Uint8Array, rx: Uint8Array | null): void {
+    // The whole transaction at once: CS cannot move while the guest waits for
+    // the line's answer, so the fabric can hand it to a sink in one call.
+    const block = port.blockHandler;
+    if (block) {
+      block(tx, rx);
+      return;
+    }
+    const frame = port.frameHandler;
+    for (let i = 0; i < tx.length; i++) {
+      const miso = frame ? frame(tx[i], 8) & 0xff : 0xff;
+      if (rx) rx[i] = miso;
+    }
   }
 
   private releaseHeldCs(): void {
     if (!this.heldCs) return;
-    const cePin = SPI_CE_PINS[this.heldCs.bus]?.[this.heldCs.cs];
+    const { bus, cs } = this.heldCs;
     this.heldCs = null;
-    if (cePin !== undefined) this.pinManager.triggerPinChange(cePin, true, 'mcu');
+    this.driveCe(bus, cs, false);
   }
 
   // ── 1-Wire: one byte master per pin, registered by the part that models it ─
@@ -891,8 +1400,12 @@ export class PiBridgeShim {
     }
     if (write === null || readLen === null) return null;
     const addrHex = addr.toString(16).padStart(2, '0');
-    const data = this.i2cTransfer(addr, write, readLen, bus);
-    if (data === null) return `I2C_ERR ${bus} ${addrHex} nack`;
+    const data = this.i2cExchange(addr, write, readLen, bus);
+    if (data === 'nack') return `I2C_ERR ${bus} ${addrHex} nack`;
+    // `nack` stays the fourth word, which is all velxio-busd and the tab's
+    // fcntl shim read (both raise EREMOTEIO on it); the fifth says the address
+    // was answered and a data byte was not.
+    if (data === 'nack-data') return `I2C_ERR ${bus} ${addrHex} nack data`;
     return data.length ? `I2C_DATA ${bus} ${addrHex} ${toHex(data)}` : `I2C_DATA ${bus} ${addrHex}`;
   }
 
@@ -901,7 +1414,18 @@ export class PiBridgeShim {
     const cs = parseCount(parts[2]);
     if (bus === null || cs === null) return null;
     const op = parts[3];
-    if (op === 'CONFIG') return null;
+    if (op === 'CONFIG') {
+      // CONFIG <hz> <mode> <bits>: what the handle programmed, sent before its
+      // first transfer. The fabric reads the mode off the port to check it
+      // against each chip's.
+      const hz = Number(parts[4]);
+      const mode = Number(parts[5]);
+      const port = this.spiPorts[bus] as PiSpiPort | undefined;
+      if (port && Number.isInteger(hz) && hz >= 0 && Number.isInteger(mode)) {
+        port.configure(cs, { hz, mode: (mode & 3) as SpiMode });
+      }
+      return null;
+    }
     // W and WC are X and XC with no MISO buffer on the other side. A Linux
     // guest writing a display frame passes rx == NULL to SPI_IOC_MESSAGE, and
     // until this existed the daemon still waited for the bytes it was about to
@@ -911,9 +1435,9 @@ export class PiBridgeShim {
     if (op !== 'X' && op !== 'XC' && !writeOnly) return null;
     const mosi = fromHex(parts[4]);
     if (mosi === null) return null;
-    const miso = this.spiTransfer(bus, cs, mosi, op === 'XC' || op === 'WC');
-    if (writeOnly) return null;
-    return `SPI_DATA ${bus} ${cs} ${toHex(miso)}`;
+    const miso = this.clockSpi(bus, cs, mosi, op === 'XC' || op === 'WC', !writeOnly);
+    if (!miso) return null;
+    return `SPI_DATA ${bus} ${cs} ${toHex(Array.from(miso))}`;
   }
 }
 

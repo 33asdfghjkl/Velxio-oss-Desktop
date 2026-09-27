@@ -16,10 +16,9 @@
  * its echo pin. This module is the single list; the code that MODELS each
  * sensor stays where it is (that is real per-device behaviour, not a list).
  *
- * NOT in here on purpose: sensors that register through the same channel but
- * only LISTEN — an ePaper panel's DC / CS / RST, any I2C device on a virtual
- * 200+addr pin. The host drives those, so they must
- * stay drivable.
+ * NOT in here on purpose: records that come through the same channel but
+ * only LISTEN: any I2C device on a virtual 200+addr pin, a worker-hosted
+ * chip. The host drives those pads, so they must stay drivable.
  *
  * Adding a single-wire sensor: one entry here, plus the model itself (a part
  * under simulation/parts and, for the in-browser engines, a case in the
@@ -84,18 +83,15 @@ export const SINGLE_WIRE_SENSOR_MODELS: Readonly<Record<string, SensorModelSpec>
  * other layer — the SPICE-threshold connector above all.
  *
  * The single-wire sensors contribute their data pin plus whatever extra pins
- * they declare. The other two entries are models that own a pad WITHOUT being
+ * they declare. The other entry is a model that owns pads WITHOUT being
  * single-wire, which is why a plain "is it a single-wire sensor?" test was not
- * enough:
+ * enough: a matrix keypad drives EVERY wire it is wired to, rows and columns
+ * alike; the model is the membrane, and whichever side the firmware scans, the
+ * other side is what the model answers on. Pads a record names but its model
+ * does not drive (an I2C device's virtual pin) are the opposite case: the host
+ * drives those, so they are deliberately absent.
  *
- *  - a matrix keypad drives EVERY wire it is wired to, rows and columns alike:
- *    the model is the membrane, and whichever side the firmware scans, the
- *    other side is what the model answers on;
- *  - an ePaper panel drives BUSY to tell the firmware it is refreshing. Its
- *    DC / CS / RST are the opposite case — the host drives those, so they are
- *    deliberately absent.
- *
- * Neither is broken with plain wiring today, because the connector's older
+ * It is not broken with plain wiring today, because the connector's older
  * `sourcedNets` gate happens to skip a net nothing else sits on. Put a pull-up
  * on a keypad column and that gate stops holding — which is exactly how a
  * level-shifted HC-SR04 lost its echo.
@@ -108,7 +104,6 @@ const MODEL_OWNED_PIN_FIELDS: Readonly<Record<string, readonly string[]>> = {
     ]),
   ),
   'matrix-keypad': ['rows', 'cols'],
-  'epaper-ssd168x': ['busy_pin'],
 };
 
 /** `sensor_type` values whose model drives its own line. Derived, never typed twice. */

@@ -22,6 +22,7 @@ Both are kept in sync; either works as the include path.
 - [UART](#uart)
 - [Timers and time](#timers-and-time)
 - [Display / framebuffer](#display--framebuffer)
+- [Named blobs](#named-blobs)
 - [Logging](#logging)
 - [Type & constant cheat sheet](#type--constant-cheat-sheet)
 - [ABI guarantees](#abi-guarantees)
@@ -91,8 +92,12 @@ s->out = vx_pin_register("OUT", VX_OUTPUT_LOW);   // starts LOW, no glitch
 int vx_pin_read(vx_pin p);
 ```
 
-Returns the digital state of a pin: `0` (LOW) or `1` (HIGH). If the pin
-isn't wired to anything in the diagram, returns `0`.
+Returns the digital state of a pin: `0` (LOW) or `1` (HIGH). On a board pin
+it is the level the wire carries: what the MCU drives, or what another part
+on the same pin puts there (a button, a tilt switch, a second chip), not the
+mode the pin was registered with. A pin nothing has driven yet, or one the
+diagram wires to nothing, returns `0`; no host models a chip's own pull on a
+board pin.
 
 ### `vx_pin_write`
 
@@ -104,14 +109,45 @@ Drive an OUTPUT pin to `value` (0 or 1). The host propagates the change
 through the wiring graph immediately — any other chip with a `pin_watch` on
 the wired pin will see the edge.
 
+On a board pin the chip is one driver of the wire, resolved against the
+MCU's pad and any other chip on it: while the MCU drives the pad the chip
+cannot move it (the host reports the contention and feeds nothing back), and
+two chips holding one line resolve as a wired-AND. A pin a bus attach named
+as one the bus drives (the `miso` of `vx_spi_attach`, the `tx` of
+`vx_uart_attach`, `sda` and `scl` of `vx_i2c_attach`) is the bus's: its
+registration mode puts no level on the wire, and an explicit `vx_pin_write`
+or `vx_pin_set_mode` by the chip takes it back (a UART chip that turns its
+TX into a plain level in an IO mode relies on that).
+
 ### `vx_pin_read_analog`
 
 ```c
 double vx_pin_read_analog(vx_pin p);
 ```
 
-Read the analog voltage of a pin (0.0 V – 5.0 V on AVR, 0.0 V – 3.3 V on
-ESP32). Used by ADC chips to sample voltages from potentiometers or sensors.
+Read the analog voltage of a pin: the voltage the circuit solve publishes
+for the net the pin's pad is on (a potentiometer's wiper, a sensor's output,
+a board pin the MCU drives), the same number in every host. A pad on no
+net, or on a net the solve has no number for, reads `0.0`. In the browser
+the runtime reads the electrical store's solve for the pad's net; a chip
+hosted in a QEMU worker or beside the Raspberry Pi guest is handed the same
+numbers as `pad_volts`, published by the tab with the chip's record and
+again on every solve that moves one of its pads (`null` for a wire that was
+removed). Before 2026-09 (board-buses F8) the browser answered the pin's PWM
+duty times five and the worker its digital level times five, so an ADC
+model written against either read the wrong voltage on a real wiper.
+
+### `vx_pin_wired`
+
+```c
+int vx_pin_wired(vx_pin p);
+```
+
+`1` when a wire reaches the pin's pad (the diagram puts it on a net), `0`
+when the pad is in the air. A model with a UI control that stands in for a
+missing wire (an ADC with a slider per channel) reads the control only when
+this answers `0`: a wired channel is the circuit's, whatever the slider
+says.
 
 ### `vx_pin_dac_write`
 
@@ -127,8 +163,19 @@ Drive an analog voltage on a pin. Used by DAC chips.
 void vx_pin_set_mode(vx_pin p, vx_pin_mode mode);
 ```
 
-Change a pin's direction after registration — useful for bidirectional
-buses (e.g. open-drain protocols where you switch between input and output).
+Change a pin's direction after registration, which is how a bidirectional
+line (an open-drain protocol, a bus the chip only sometimes drives) is done:
+
+- `VX_OUTPUT_LOW` and `VX_OUTPUT_HIGH` drive that level at once, exactly as
+  `vx_pin_write` would.
+- `VX_OUTPUT` changes the direction and drives nothing until the first
+  `vx_pin_write`.
+- `VX_INPUT`, `VX_INPUT_PULLUP` and `VX_INPUT_PULLDOWN` release the line:
+  the chip leaves the wire and whatever else holds it decides the level, the
+  pad's pull (a `pinMode(INPUT_PULLUP)` in the sketch restores HIGH) or
+  another chip; a floating pad keeps the level it had. The chip's own pull
+  is not put on a board pin. On the QEMU boards the worker has no pad model,
+  so a released pin keeps the last level the chip drove.
 
 ### `vx_pin_watch`
 
@@ -296,6 +343,21 @@ void on_stop(void* ud);
 The master issued STOP. Reset any "transaction in progress" state your
 chip has — the next `on_connect` is a fresh transaction.
 
+Every START names your address to `on_connect`, a repeated START included:
+`Wire.endTransmission(false)` followed by `requestFrom()` reaches you as
+`on_connect(write)`, the register byte, `on_connect(read)`, the reads, and
+one `on_stop`. That is what the browser runtime and the QEMU workers deliver.
+On a QEMU board the bridge reports a repeated START as a STOP followed by a
+START, and on a Linux board the guest shim speaks whole transactions, so on
+those hosts the chip sees an `on_stop` between the two phases as well. Keep
+the register pointer across `on_stop` (the register-map idiom above does)
+and a write-then-read serves the right bytes everywhere; only state that
+must not survive a STOP belongs in `on_stop`.
+
+A chip may attach several addresses on the same pins (`vx_i2c_attach` once
+per address): each has its own callbacks, and a STOP reaches every address
+the transaction touched.
+
 ### Example: 24C01 EEPROM
 
 ```c
@@ -363,11 +425,13 @@ typedef struct {
   vx_pin   sck;
   vx_pin   mosi;
   vx_pin   miso;
-  vx_pin   cs;          /* watched by the chip — runtime ignores this field */
+  vx_pin   cs;          /* the bus honours it: no bytes while deasserted.
+                           ((vx_pin)-1) = the chip has no select line */
   uint32_t mode;        /* 0..3 */
   void   (*on_done)(void* user_data, uint8_t* buffer, uint32_t count);
   void*    user_data;
-  uint32_t reserved[8];
+  uint8_t (*on_exchange)(void* user_data, uint8_t mosi);  /* optional, 0 = none */
+  uint32_t reserved[7];
 } vx_spi_config;
 _Static_assert(sizeof(vx_spi_config) == 60, "vx_spi_config must be 60 bytes");
 ```
@@ -382,14 +446,51 @@ void   vx_spi_stop  (vx_spi s);
 
 ### How it works
 
-1. `vx_spi_attach` registers the chip on the bus.
+1. `vx_spi_attach` registers the chip on the bus its `sck` wire reaches. The
+   bus clocks the chip only while `cs` is low (a select tied to GND, or
+   `((vx_pin)-1)`, means always), compares `mode` and the MSB-first order
+   every chip shifts in with the controller's settings, and reports a
+   mismatch (`spi-mode`, `spi-bit-order`) instead of emulating the shifted
+   bytes. The select edge reaches the chip's own `vx_pin_watch` on `cs`
+   whichever block of the board drives it, a GPIO or the SPI peripheral's own
+   chip-select output.
 2. The chip calls `vx_spi_start(handle, buf, N)` to say "I want to exchange
    N bytes; here's my MISO data."
 3. As the master clocks bytes, byte by byte:
    - the master's MOSI byte overwrites `buf[i]`
    - the chip's `buf[i]` (its MISO data) is shifted out to the master
 4. After N bytes, `on_done(buf, N)` fires. `buf` now contains the N MOSI
-   bytes the master sent.
+   bytes the master sent, and it is the pointer this handle's own
+   `vx_spi_start` armed: a chip with two handles (two selects on one bus,
+   or two buses) is handed each one's buffer.
+
+### Answering inside the same byte (`on_exchange`)
+
+The buffer is written before the chip has seen the byte it answers, so the
+best a buffer can do is answer one byte behind the question. Most chips never
+notice: they answer a command in the bytes after it. A chip whose answer
+depends on bits of the SAME byte cannot be right that way. The MCP3008 is the
+example: spidev's framing `[1, 0x80 | ch << 4, 0]` puts the top two result
+bits in the byte that carries the channel number, and through the buffer
+alone they come out of the previous state.
+
+Set `on_exchange` and the host hands the chip every byte a hardware controller
+exchanges whole, and takes its return value as the MISO for THAT byte. Shift
+the bits through in order and each output bit depends only on the input bits
+before it, as on silicon:
+
+```c
+static uint8_t on_exchange(void* ud, uint8_t mosi) {
+  chip_state_t* s = ud;
+  uint8_t miso = clock_byte(s, mosi);  /* 8 clocks, DIN in, DOUT out */
+  arm_lookahead(s);                    /* vx_spi_start with the next byte */
+  return miso;
+}
+```
+
+Keep a transfer armed as well: a bit-banged master reads MISO before its byte
+is in, and it reads the buffer. The field used to be reserved, so a chip that
+leaves it 0 keeps the buffer contract exactly as described above.
 
 ### Re-arming
 
@@ -424,6 +525,12 @@ static void on_cs_change(void* ud, vx_pin pin, int value) {
 
 vx_pin_watch(s->cs, VX_EDGE_BOTH, on_cs_change, s);
 ```
+
+`on_done` fires once per transfer. When the master clocked every byte of
+the buffer it has already fired, and the `vx_spi_stop` on the rising edge
+finds nothing armed and reports nothing; when the master released the
+select part-way, `vx_spi_stop` is what fires it, with the bytes exchanged so
+far. The same in the browser, the QEMU workers and the Linux-board host.
 
 ---
 
@@ -493,9 +600,26 @@ void     vx_timer_start (vx_timer t, uint64_t period_nanos, bool repeat);
 void     vx_timer_stop  (vx_timer t);
 ```
 
-Timer ticks are anchored to **simulated time** — they fire deterministically
-relative to CPU cycles, not wall-clock seconds. A 1-ms timer will fire after
-exactly 1 ms of simulated AVR time regardless of how fast the host actually runs.
+`vx_sim_now_nanos` is the board's **simulated time**: the guest's cycle count
+at its clock rate on the browser engines, the QEMU virtual clock on the QEMU
+boards. It starts at 0 when the chip is created, never runs backwards (Stop
+and Run, a reload of the firmware or a reset rebuild the guest, and the
+chip's clock carries on from where it was) and stands still while the
+simulation is stopped. Inside a timer callback it answers the timer's
+deadline, so a periodic timer reads exact multiples of its period whatever
+the granularity the deadline was reached with.
+
+Timers are anchored to that clock, not to wall-clock seconds: a timer fires
+at the guest instant its deadline falls on (between two instructions, never
+early), a repeating one adds its period to the deadline, and a 1-ms timer
+fires after exactly 1 ms of simulated time whether the host runs the board
+faster or slower than real time. `vx_timer_stop` cancels it. A timer armed
+before the guest has a clock (an engine before its SoC boots) starts once it
+runs. On the QEMU boards the worker's timer thread wakes against the guest
+clock in naps of up to 20 ms, so a deadline there carries that much host
+jitter (the callback still reads the exact deadline). The Linux-board host
+forwards I2C transactions and SPI chip enables to a chip and nothing else:
+on a Raspberry Pi a chip's timers do not run.
 
 ```c
 static void on_tick(void* ud) {
@@ -560,6 +684,79 @@ For real LCDs you typically convert RGB565 → RGBA8888 inline before writing.
 
 ---
 
+## Named blobs
+
+Byte storage the host hands your chip by name, and that your chip can write
+back to. An attribute carries a number or a line of text; a blob carries a
+file: the image of a microSD card, a flash dump, a font ROM. The chip reads
+sectors out of it, and the sectors the firmware writes land back in the same
+bytes, which is how the card panel in the editor sees what the sketch stored.
+
+```c
+uint32_t vx_blob_size(const char* name);
+uint32_t vx_blob_read(const char* name, uint32_t offset, uint8_t* dst, uint32_t len);
+uint32_t vx_blob_write(const char* name, uint32_t offset, const uint8_t* src, uint32_t len);
+```
+
+`vx_blob_size` answers the blob's length. `vx_blob_read` and `vx_blob_write`
+each copy `min(len, size - offset)` bytes and **return how many they copied**.
+Check the return value: it is the only thing that tells you the transfer was
+short.
+
+```c
+/* A card model serving one 512-byte sector. */
+static bool read_sector(uint32_t sector, uint8_t* buf) {
+  return vx_blob_read("card", sector * 512u, buf, 512u) == 512u;
+}
+
+static bool write_sector(uint32_t sector, const uint8_t* buf) {
+  return vx_blob_write("card", sector * 512u, buf, 512u) == 512u;
+}
+```
+
+### The rules
+
+Your chip runs in three places: the browser tab, the QEMU worker (ESP32 and
+STM32 boards) and the host that drives the Linux boards. All three answer
+these calls identically, and here is what they answer.
+
+| Case | `vx_blob_size` | `vx_blob_read` | `vx_blob_write` |
+|---|---|---|---|
+| The blob the host declared | its length | copies, returns the count | stores, returns the count |
+| `offset` past (or at) the end | n/a | 0, `dst` untouched | 0, nothing stored |
+| `offset + len` past the end | n/a | copies what fits, returns that | stores what fits, returns that |
+| A name the host never declared | 0 | 0, `dst` untouched | 0, nothing stored |
+| `NULL` or `""` as the name | 0 | 0 | 0 |
+| `len` of 0 | n/a | 0 | 0 |
+
+Four things follow, and they are worth stating because a model that assumes
+otherwise breaks on one host and not the others:
+
+- **Storage is per chip instance.** Two microSD parts on the canvas each have
+  their own `"card"`. Blobs are never shared between instances, and never
+  between chips.
+- **A chip cannot create a blob.** A name the host did not declare stays empty
+  however much you write to it. Storage comes from the part, which is where
+  the user picked the file.
+- **A blob never grows.** Its size is the device's capacity, so a write off the
+  end stops at the end, exactly as addressing a sector past the last one does
+  on a real card.
+- **Bytes past the returned count are left alone.** A short read does not zero
+  or pad the rest of your buffer, so you can tell a truncated sector from a
+  sector of zeros.
+
+A write is visible to the next read from the same instance, immediately.
+
+### Blobs and `vx_rom_*`
+
+`vx_rom_size` / `vx_rom_read` stay what they were: ONE read-only image,
+injected before `chip_setup`, for a chip that boots a program (a CPU emulator
+loading its ROM). A blob is named, there can be several, and the chip writes to
+it. Reach for `vx_rom_*` for firmware you only execute, and for a blob for
+storage the device owns.
+
+---
+
 ## Logging
 
 ```c
@@ -615,7 +812,8 @@ These are checked at compile time inside the header:
 If any of these change, your chip won't compile until the runtime side is
 updated to match. This is intentional — it catches ABI drift early.
 
-Each config struct also has a `uint32_t reserved[8]` field at the end. Zero
-it out (the Velxio header initializer literally `= {.field = ...}` syntax
-zeros unmentioned fields). Future versions may use those slots; today they
-must be 0.
+Each config struct also has `uint32_t reserved[]` slots at the end (8 in
+`vx_i2c_config` and `vx_uart_config`, 7 in `vx_spi_config`, whose first slot
+became `on_exchange`). Zero them out (the Velxio header initializer literally
+`= {.field = ...}` syntax zeros unmentioned fields). Future versions may use
+those slots; today they must be 0.

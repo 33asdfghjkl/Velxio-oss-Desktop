@@ -507,6 +507,14 @@ export const DynamicComponent: React.FC<DynamicComponentProps> = ({
       // input with a reason. A hand-rolled stub used to stand here instead
       // and, taking precedence over `getBoardSimulator`, kept every I2C part
       // off the board's bus.
+      //
+      // The board is the one the part's SIGNAL pins reach. Its supply pins
+      // say nothing about which MCU it talks to: a chip powered from board
+      // A's 5V rail with its SPI on board B is board B's chip, and it used
+      // to attach to whichever board the first wire traced reached, rails
+      // included (finding multiboard-chip-owner-first-wire; a supply wire
+      // is usually drawn first). A rail is a numbered pin below zero in the
+      // trace; only when no signal pin reaches any board does a rail decide.
       const { piBoardId, wiredBoardId } = (() => {
         const st = useSimulatorStore.getState();
         const ownPins = new Set<string>();
@@ -514,15 +522,27 @@ export const DynamicComponent: React.FC<DynamicComponentProps> = ({
           if (w.start.componentId === id) ownPins.add(w.start.pinName);
           if (w.end.componentId === id) ownPins.add(w.end.pinName);
         }
-        let anyBoardId: string | null = null;
+        let signalBoardId: string | null = null;
+        let railBoardId: string | null = null;
+        let piSignalBoardId: string | null = null;
+        let piRailBoardId: string | null = null;
         for (const pinName of ownPins) {
-          const { boardId } = traceDetailed(st, id, pinName, 0);
+          const { boardId, arduinoPin } = traceDetailed(st, id, pinName, 0);
           const board = boardId ? st.boards.find((b) => b.id === boardId) : undefined;
           if (!board) continue;
-          if (anyBoardId === null) anyBoardId = board.id;
-          if (isPiBoardKind(board.boardKind)) return { piBoardId: board.id, wiredBoardId: board.id };
+          const pi = isPiBoardKind(board.boardKind);
+          if (arduinoPin !== null && arduinoPin >= 0) {
+            if (signalBoardId === null) signalBoardId = board.id;
+            if (pi && piSignalBoardId === null) piSignalBoardId = board.id;
+          } else {
+            if (railBoardId === null) railBoardId = board.id;
+            if (pi && piRailBoardId === null) piRailBoardId = board.id;
+          }
         }
-        return { piBoardId: null, wiredBoardId: anyBoardId };
+        if (piSignalBoardId) return { piBoardId: piSignalBoardId, wiredBoardId: piSignalBoardId };
+        if (signalBoardId) return { piBoardId: null, wiredBoardId: signalBoardId };
+        if (piRailBoardId) return { piBoardId: piRailBoardId, wiredBoardId: piRailBoardId };
+        return { piBoardId: null, wiredBoardId: railBoardId };
       })();
       const piSimulator = piBoardId ? (getBoardSimulator(piBoardId) ?? null) : null;
 

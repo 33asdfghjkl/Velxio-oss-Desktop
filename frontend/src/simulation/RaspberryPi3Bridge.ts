@@ -44,6 +44,7 @@
  */
 
 import { getTabSessionId } from './Esp32Bridge';
+import type { RemoteSpiMapEntry } from './buses/registry';
 
 /**
  * What the board publishes to the backend about its bus (`pi_bus_topology`).
@@ -53,8 +54,19 @@ import { getTabSessionId } from './Esp32Bridge';
  */
 export interface PiBusTopology {
   version: 1;
-  i2c: Array<{ bus: number; addr: number; regs: string | null }>;
-  spi: { attached: boolean };
+  /**
+   * `ask_writes`: a device that can NAK while present (I2cTarget.mayNak).
+   * The backend asks this tab for the ACK of its writes instead of giving it
+   * itself, so a NAK reaches the guest. Absent = the backend ACKs.
+   */
+  i2c: Array<{ bus: number; addr: number; regs: string | null; ask_writes?: true }>;
+  /**
+   * `responders` are the SPI devices with a portable model (the bus map an
+   * ESP32 or STM32 worker gets, entry for entry): the backend runs them beside
+   * the guest, by chip enable, and answers their transfers without asking this
+   * tab (project board-buses-2026-09, F4). Absent = none.
+   */
+  spi: { attached: boolean; responders?: RemoteSpiMapEntry[] };
 }
 
 const API_BASE = (): string => {
@@ -106,6 +118,13 @@ export class RaspberryPi3Bridge {
   /** Bytes the guest wrote to its HEADER UART (not the console): another
    * board wired to those pads is the destination. Decoded text. */
   onUartTx: ((text: string) => void) | null = null;
+  /**
+   * The same bytes, raw, for the board's UART controller port (the
+   * PiBridgeShim owns this slot; project board-buses-2026-09, F6). Its own
+   * slot rather than a chain on onUartTx: a byte above 0x7f does not survive
+   * the text decode, and a fingerprint reader's frames are made of them.
+   */
+  onUartTxBytes: ((bytes: Uint8Array) => void) | null = null;
   /** Guest PWM activity (PWM_START / PWM_CHANGE / PWM_STOP). Overlay boards
    * use it for built-in buzzers/speakers. */
   onGpioPwm:
@@ -256,11 +275,9 @@ export class RaspberryPi3Bridge {
           const b64 = (msg.data.data as string) ?? '';
           if (b64) {
             try {
-              this.onUartTx?.(
-                new TextDecoder().decode(
-                  Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0)),
-                ),
-              );
+              const raw = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+              this.onUartTxBytes?.(raw);
+              this.onUartTx?.(new TextDecoder().decode(raw));
             } catch {
               /* malformed payload — never kill the session over it */
             }
@@ -478,6 +495,12 @@ export class RaspberryPi3Bridge {
    * answer the guest from (`pi_bus_topology`). */
   sendBusTopology(topology: PiBusTopology): void {
     this._send({ type: 'pi_bus_topology', data: topology });
+  }
+
+  /** A hosted SPI responder's live inputs changed (`pi_bus_attrs`): the
+   *  backend applies them to the model it runs for `owner`. */
+  sendBusAttrs(owner: string, attrs: Record<string, number>): void {
+    this._send({ type: 'pi_bus_attrs', data: { owner, attrs } });
   }
 
   /** A register-file device's registers changed (`pi_bus_regs`). */

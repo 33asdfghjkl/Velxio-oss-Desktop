@@ -5,6 +5,14 @@
 > per-event SPI **C→Python ctypes crossings**, plus a full record of what was
 > tried, what failed, and why — so nobody re-runs the dead ends.
 >
+> **Read with a date in mind.** The batching and the CS handling below are
+> still what the worker does; what changed in 2026-09 (board-buses F4) is who
+> answers MISO and who receives the bytes: the worker arbitrates by chip
+> select from the tab's bus map (`_spi_models`, the portable WASM
+> responders) and relays a byte to the tab only while a sink listed in that
+> map could be selected. The `esp32_spi_response` path this page mentions
+> in passing is gone. See [board-buses.md](./board-buses.md).
+>
 > Bottom line: ESP32 display slowness in Velxio is **not** the QEMU TCG compute,
 > **not** the libqemu `-O` level, **not** the backend→frontend WebSocket
 > transport, and **not** the arduino-esp32 core version. It is the **number of

@@ -76,7 +76,6 @@ vi.mock('../simulation/Esp32Bridge', () => ({
     this.onBleStatus = null;
     this.onI2cEvent = null;
     this.onI2cTransaction = null;
-    this.onSpiEvent = null;
     this.connect = vi.fn();
     this.disconnect = vi.fn();
     this.connected = true;
@@ -186,5 +185,24 @@ describe('Raspberry Pi 3B ↔ Pico W — UART', () => {
       (c: any[]) => Array.isArray(c[0]) && c[0][0] === 'R'.charCodeAt(0),
     );
     expect(matched).toBe(true);
+  });
+
+  it('a wire drawn from the RX end routes the same way (the TX side is read off the pins, not off the wire)', () => {
+    const store = useSimulatorStore.getState();
+    const piId = store.addBoard('raspberry-pi-3', 100, 100);
+    const picoId = store.addBoard('pi-pico-w', 400, 100);
+    setWires(useSimulatorStore, [
+      // Drawn from the Pico's RX to the Pi's TX: still Pi3B UART0 TX -> Pico UART0 RX.
+      { fromBoard: picoId, fromPin: 'GP1', toBoard: piId, toPin: '8' },
+    ]);
+    const piBridge = getBoardBridge(piId) as any;
+    const simPico = getBoardSimulator(picoId) as any;
+    piBridge.onSerialData('Q');
+    expect(
+      (simPico.feedUart as any).mock.calls.some((c: any[]) => c[0] === 0 && c[1] === 'Q'),
+    ).toBe(true);
+    // And the Pico's own console output is not pushed back into the Pi.
+    simPico.onSerialData('R');
+    expect(piBridge.sendSerialBytes).not.toHaveBeenCalled();
   });
 });

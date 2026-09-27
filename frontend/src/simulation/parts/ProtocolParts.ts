@@ -21,10 +21,18 @@
  */
 
 import { PartSimulationRegistry } from './PartSimulationRegistry';
-import { spiChainAttach, spiChainDetach, spiChainTag, spiChainUnder } from './spiChannel';
+import { attachSpiDevice, type SpiDevice } from '../buses';
+import {
+  loadSdBusChip,
+  SdSpiCard,
+  sdCardRemoteBlobWrite,
+  sdCardRemoteModel,
+  sdSpiFabricDevice,
+} from './sdSpiCard';
 import { requestLine, releaseLineGap } from '../line/requestLine';
 import { VirtualDS1307, VirtualBMP280, VirtualDS3231, VirtualPCF8574 } from '../I2CBusManager';
 import type { I2CDevice } from '../I2CBusManager';
+import { attachI2cPart } from './i2cPart';
 import { HD44780Decoder } from '../HD44780Decoder';
 import { registerSensorUpdate, unregisterSensorUpdate } from '../SensorUpdateRegistry';
 import {
@@ -36,18 +44,7 @@ import {
   type IrAirFrame,
   type IrPulse,
 } from '../ir';
-import { useSimulatorStore } from '../../store/useSimulatorStore';
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/**
- * Remove a virtual I2C device from both AVR (i2cBus) and RP2040 simulators.
- */
-function removeI2CDevice(simulator: any, address: number): void {
-  simulator.i2cBus?.removeDevice(address);
-  simulator.removeI2CDevice?.(address, 0);
-  simulator.removeI2CDevice?.(address, 1);
-}
+import { useSimulatorStore, registerSdImageReader } from '../../store/useSimulatorStore';
 
 // ─── SSD1306 OLED ────────────────────────────────────────────────────────────
 
@@ -111,6 +108,18 @@ class SSD1306Core {
   writeData(value: number): void {
     this.buffer[this.page * 128 + this.col] = value;
     this.advanceCursor();
+  }
+
+  /**
+   * Drop a half-received command. The MCU restarting leaves the panel
+   * powered, so its GDDRAM and its configuration survive (the glass keeps
+   * showing the last frame); only the bytes of a command that will never be
+   * completed have to go, or the first byte of the new init would be eaten
+   * as their parameter.
+   */
+  resetCommand(): void {
+    this.cmdBuf = [];
+    this.cmdWant = 0;
   }
 
   /** Feed a command or parameter byte. Multi-byte commands are accumulated. */
@@ -240,12 +249,11 @@ class VirtualSSD1306 implements I2CDevice {
 
   private ctrlByte = true;
   private isData = false;
+  private readonly element: HTMLElement;
 
-  constructor(
-    address: number,
-    private element: HTMLElement,
-  ) {
+  constructor(address: number, element: HTMLElement) {
     this.address = address;
+    this.element = element;
   }
 
   /** Expose core buffer for tests. */
@@ -278,27 +286,34 @@ class VirtualSSD1306 implements I2CDevice {
 }
 
 /**
- * Attach SSD1306 in SPI mode — intercepts the AVR SPI bus.
+ * Attach SSD1306 in SPI mode.
  *
- * Follows the same pattern as ILI9341 (ComplexParts.ts): hook spi.onByte,
- * track DC pin state via PinManager, and render GDDRAM to the element.
+ * The panel is a write-only sink on its bus: it has no MISO pin at all, so it
+ * answers null and lets the fabric resolve the line, and it takes a whole
+ * block in one call when the controller clocks one (DESIGN 11). Chip select
+ * is not its business either: the fabric hands it the frames clocked while
+ * this panel is selected and nothing else, so a CS strapped to a rail is a
+ * selection like any other instead of an edge that never comes.
+ *
+ * D/C stays a plain pin (F3 rule 6), read from its CURRENT level when the
+ * part attaches: a panel that (re)attaches in the middle of a frame, while
+ * the sketch holds D/C high, must keep decoding pixels, not commands.
  */
 function attachSSD1306SPI(
   element: HTMLElement,
   simulator: any,
   getPin: (name: string) => number | null,
+  componentId?: string,
 ): () => void {
-  const pinManager = simulator.pinManager;
-  const spi = simulator.spi;
-  if (!pinManager || !spi) return () => {};
-
+  const pinManager = simulator?.pinManager;
   const core = new SSD1306Core();
   let dcState = false;
   const unsubs: (() => void)[] = [];
 
-  // Track DC pin (LOW = command, HIGH = data)
+  // D/C: LOW = command, HIGH = data.
   const pinDC = getPin('DC');
-  if (pinDC !== null) {
+  if (pinDC !== null && pinDC >= 0 && pinManager) {
+    dcState = pinManager.peekPinState?.(pinDC) ?? false;
     unsubs.push(
       pinManager.onPinChange(pinDC, (_: number, s: boolean) => {
         dcState = s;
@@ -320,37 +335,49 @@ function attachSSD1306SPI(
     });
   };
 
-  // Chip select. This mode is only picked when CS is wired, and on a shared
-  // bus the panel must ignore every byte clocked for somebody else, as the
-  // real controller does (it latches nothing while CS is high).
-  let csLow = false;
-  const pinCS = getPin('CS');
-  if (pinCS !== null) {
-    unsubs.push(
-      pinManager.onPinChange(pinCS, (_: number, s: boolean) => {
-        csLow = !s;
-      }),
-    );
-  }
-
-  // Join the board's SPI chain (onByte + completeTransfer). Write-only: the
-  // panel answers idle and passes every byte along.
-  const leaveSpi = spiChainAttach(spi, `ssd1306:${(element as { id?: string }).id || 'panel'}`, (value, next) => {
-    if (csLow || pinCS === null) {
-      if (!dcState) {
-        core.writeCommand(value);
-      } else {
-        core.writeData(value);
-        dirty = true;
-        scheduleSync();
-      }
+  const take = (value: number): void => {
+    if (!dcState) {
+      core.writeCommand(value);
+      return;
     }
-    spi.completeTransfer(0xff);
-    next?.(value);
-  });
+    core.writeData(value);
+    dirty = true;
+    scheduleSync();
+  };
+
+  // No deselect(): a real SSD1306 keeps its command parser across chip
+  // select. Adafruit_SSD1306 sends a two-byte command as two transactions
+  // (ssd1306_command1 per byte, CS toggled in between), and the panel on the
+  // bench still reads the second byte as the parameter of the first.
+  const device: SpiDevice = {
+    transfer: (value: number): number | null => {
+      take(value);
+      return null;
+    },
+    transferBlock: (bytes: Uint8Array): void => {
+      for (let i = 0; i < bytes.length; i++) take(bytes[i]);
+    },
+    boardReset: () => core.resetCommand(),
+  };
+
+  const handle = attachSpiDevice(
+    {
+      owner: componentId ?? (element as { id?: string }).id ?? 'ssd1306',
+      componentId,
+      pins: { sck: 'CLK', mosi: 'DATA', cs: 'CS' },
+      // 4-wire SPI: the byte is latched on the rising edge of the clock,
+      // which idles either way (datasheet 8.1.3).
+      modes: [0, 3],
+      // A module wired for SPI whose CS pad is left open is the only chip on
+      // the bus: that is how the bench wires it, and how every project
+      // migrated from the old ssd1306-spi entry is wired.
+      csWhenFloating: 'selected',
+    },
+    device,
+  );
 
   return () => {
-    leaveSpi();
+    handle.dispose();
     if (rafId !== null) cancelAnimationFrame(rafId);
     unsubs.forEach((u) => u());
   };
@@ -367,42 +394,33 @@ function attachSSD1306(
   getPin: (n: string) => number | null,
   protocol: 'i2c' | 'spi',
   i2cAddr = 0x3c,
+  componentId?: string,
+  /** The 8-pin module's I2C mode uses D1 (DATA) as SDA and D0 (CLK) as SCL;
+   *  the 4-pin module names them. */
+  i2cPins: { scl: string; sda: string } = { scl: 'CLK', sda: 'DATA' },
 ): () => void {
   if (protocol === 'spi') {
-    return attachSSD1306SPI(element, simulator, getPin);
+    return attachSSD1306SPI(element, simulator, getPin, componentId);
   }
-  const sim = simulator as any;
   const device = new VirtualSSD1306(i2cAddr, element);
-
-  // The ESP32/STM32 bridge shims expose registerSensor (backend QEMU slave) +
-  // addI2CTransactionListener (framebuffer bytes streamed back) AND addI2CDevice
-  // (frontend bus for the cross-board Interconnect). AVR / RP2040 also carry a
-  // registerSensor() stub that returns false, so they enter this branch too —
-  // harmlessly: registerSensor no-ops, the absent addI2CTransactionListener is
-  // skipped, and the real attach happens via the addI2CDevice mirror below.
-  if (typeof sim.registerSensor === 'function') {
-    // ── ESP32 / STM32 (and AVR/RP2040 via the addI2CDevice mirror) ──────────
-    const virtualPin = 200 + i2cAddr;
-    sim.registerSensor('ssd1306', virtualPin, { addr: i2cAddr });
-    sim.addI2CTransactionListener?.(i2cAddr, (data: number[]) => {
-      data.forEach((b: number) => device.writeByte(b));
-      device.stop();
-    });
-    // Mirror on the frontend bus so peer boards reading across an
-    // I2C bridge can also reach the device.
-    sim.addI2CDevice?.(device);
-    return () => {
-      sim.unregisterSensor(virtualPin);
-      sim.removeI2CTransactionListener?.(i2cAddr);
-      sim.removeI2CDevice?.(i2cAddr, 0);
-    };
-  } else if (typeof sim.addI2CDevice === 'function') {
-    // ── AVR / RP2040 path ──────────────────────────────────────────────────
-    sim.addI2CDevice(device);
-    return () => removeI2CDevice(sim, device.address);
-  }
-  return () => {};
+  // A QEMU board's worker only ACKs and echoes the writes, and this copy
+  // draws from them.
+  const part = attachI2cPart({
+    simulator,
+    componentId,
+    device,
+    pins: i2cPins,
+    worker: {
+      type: 'ssd1306',
+      echo: (data) => {
+        data.forEach((b: number) => device.writeByte(b));
+        device.stop();
+      },
+    },
+  });
+  return () => part.dispose();
 }
+
 
 /**
  * Which wire protocol did the user build?  A real SSD1306 breakout is ONE board
@@ -413,9 +431,8 @@ function attachSSD1306(
  * I2C.  This mirrors the physical part — one component, no protocol switch to
  * set, just wire it up.
  *
- * Pure wiring check: it deliberately does NOT read `simulator.spi`, whose getter
- * on some boards (RP2040, and the ESP32/STM32 bridge shims) lazily re-routes the
- * board SPI bus as a side effect and must not fire in I2C mode.
+ * Pure wiring check: the wires decide, never the simulator. Which board is
+ * under the part says nothing about which of its two buses the user built.
  */
 function detectSSD1306Protocol(getPin: (n: string) => number | null): 'i2c' | 'spi' {
   return getPin('CS') !== null ? 'spi' : 'i2c';
@@ -438,7 +455,7 @@ PartSimulationRegistry.register('ssd1306', {
     const explicit = comp?.properties?.protocol;
     const protocol: 'i2c' | 'spi' =
       explicit === 'i2c' || explicit === 'spi' ? explicit : detectSSD1306Protocol(getPin);
-    return attachSSD1306(element, simulator, getPin, protocol, i2cAddr);
+    return attachSSD1306(element, simulator, getPin, protocol, i2cAddr, componentId);
   },
 });
 
@@ -452,7 +469,10 @@ PartSimulationRegistry.register('ssd1306-i2c-4pin', {
     const { components } = useSimulatorStore.getState();
     const comp = components.find((c) => c.id === componentId);
     const i2cAddr = parseI2cAddress(comp?.properties?.i2cAddress, 0x3c);
-    return attachSSD1306(element, simulator, getPin, 'i2c', i2cAddr);
+    return attachSSD1306(element, simulator, getPin, 'i2c', i2cAddr, componentId, {
+      scl: 'SCL',
+      sda: 'SDA',
+    });
   },
 });
 
@@ -463,26 +483,14 @@ PartSimulationRegistry.register('ssd1306-i2c-4pin', {
  * Returns the browser's current system time in BCD format for registers 0–6.
  */
 PartSimulationRegistry.register('ds1307', {
-  attachEvents: (_element, simulator, _getPin) => {
-    const sim = simulator as any;
-    const rtc = new VirtualDS1307();
-
-    if (typeof sim.registerSensor === 'function') {
-      // ── ESP32 path: backend QEMU RTC slave + frontend bus mirror ────────
-      const virtualPin = 200 + 0x68;
-      sim.registerSensor('ds1307', virtualPin, { addr: 0x68 });
-      sim.addI2CDevice?.(rtc);
-      return () => {
-        sim.unregisterSensor(virtualPin);
-        sim.removeI2CDevice?.(rtc.address, 0);
-      };
-    } else if (typeof sim.addI2CDevice === 'function') {
-      // ── AVR / RP2040 path ──────────────────────────────────────────────────
-      sim.addI2CDevice(rtc);
-      return () => removeI2CDevice(sim, rtc.address);
-    }
-
-    return () => {};
+  attachEvents: (_element, simulator, _getPin, componentId) => {
+    const part = attachI2cPart({
+      simulator,
+      componentId,
+      device: new VirtualDS1307(),
+      worker: { type: 'ds1307' },
+    });
+    return () => part.dispose();
   },
 });
 
@@ -567,70 +575,35 @@ class VirtualMPU6050 implements I2CDevice {
 
 PartSimulationRegistry.register('mpu6050', {
   attachEvents: (element, simulator, _getPin, componentId) => {
-    const sim = simulator as any;
     const el = element as any;
     // Respect AD0 pin: `el.ad0 = true` → address 0x69, else 0x68
     const addr = el.ad0 === true || el.ad0 === 'true' ? 0x69 : 0x68;
+    const device = new VirtualMPU6050(addr);
+    const part = attachI2cPart({ simulator, componentId, device, worker: { type: 'mpu6050' } });
 
-    if (typeof sim.registerSensor === 'function') {
-      // ── ESP32 path: backend QEMU I2C slave + frontend bus mirror ────────
-      const virtualPin = 200 + addr;
-      const device = new VirtualMPU6050(addr);
-      sim.registerSensor('mpu6050', virtualPin, { addr });
-      sim.addI2CDevice?.(device);
+    const writeI16 = (regH: number, raw: number) => {
+      const v = Math.max(-32768, Math.min(32767, Math.round(raw))) & 0xffff;
+      device.registers[regH] = (v >> 8) & 0xff;
+      device.registers[regH + 1] = v & 0xff;
+    };
 
-      const writeI16 = (regH: number, raw: number) => {
-        const v = Math.max(-32768, Math.min(32767, Math.round(raw))) & 0xffff;
-        device.registers[regH] = (v >> 8) & 0xff;
-        device.registers[regH + 1] = v & 0xff;
-      };
+    registerSensorUpdate(componentId, (values) => {
+      // The worker's copy answers a QEMU board; this one answers every board
+      // whose firmware runs in the tab, and the Pi relay reads its registers.
+      part.updateWorker(values);
+      if ('accelX' in values) writeI16(0x3b, (values.accelX as number) * 16384);
+      if ('accelY' in values) writeI16(0x3d, (values.accelY as number) * 16384);
+      if ('accelZ' in values) writeI16(0x3f, (values.accelZ as number) * 16384);
+      if ('gyroX' in values) writeI16(0x43, (values.gyroX as number) * 131);
+      if ('gyroY' in values) writeI16(0x45, (values.gyroY as number) * 131);
+      if ('gyroZ' in values) writeI16(0x47, (values.gyroZ as number) * 131);
+      if ('temp' in values) writeI16(0x41, ((values.temp as number) - 36.53) * 340);
+    });
 
-      registerSensorUpdate(componentId, (values) => {
-        sim.updateSensor(virtualPin, values);
-        // Keep the frontend-side mirror in sync so peer-master bridge reads
-        // see fresh values too.
-        if ('accelX' in values) writeI16(0x3b, (values.accelX as number) * 16384);
-        if ('accelY' in values) writeI16(0x3d, (values.accelY as number) * 16384);
-        if ('accelZ' in values) writeI16(0x3f, (values.accelZ as number) * 16384);
-        if ('gyroX' in values) writeI16(0x43, (values.gyroX as number) * 131);
-        if ('gyroY' in values) writeI16(0x45, (values.gyroY as number) * 131);
-        if ('gyroZ' in values) writeI16(0x47, (values.gyroZ as number) * 131);
-        if ('temp' in values) writeI16(0x41, ((values.temp as number) - 36.53) * 340);
-      });
-
-      return () => {
-        sim.unregisterSensor(virtualPin);
-        sim.removeI2CDevice?.(addr, 0);
-        unregisterSensorUpdate(componentId);
-      };
-    } else if (typeof sim.addI2CDevice === 'function') {
-      // ── AVR / RP2040 path: virtual I2C device in JavaScript ──────────────
-      const device = new VirtualMPU6050(addr);
-      sim.addI2CDevice(device);
-
-      const writeI16 = (regH: number, raw: number) => {
-        const v = Math.max(-32768, Math.min(32767, Math.round(raw))) & 0xffff;
-        device.registers[regH] = (v >> 8) & 0xff;
-        device.registers[regH + 1] = v & 0xff;
-      };
-
-      registerSensorUpdate(componentId, (values) => {
-        if ('accelX' in values) writeI16(0x3b, (values.accelX as number) * 16384);
-        if ('accelY' in values) writeI16(0x3d, (values.accelY as number) * 16384);
-        if ('accelZ' in values) writeI16(0x3f, (values.accelZ as number) * 16384);
-        if ('gyroX' in values) writeI16(0x43, (values.gyroX as number) * 131);
-        if ('gyroY' in values) writeI16(0x45, (values.gyroY as number) * 131);
-        if ('gyroZ' in values) writeI16(0x47, (values.gyroZ as number) * 131);
-        if ('temp' in values) writeI16(0x41, ((values.temp as number) - 36.53) * 340);
-      });
-
-      return () => {
-        removeI2CDevice(sim, device.address);
-        unregisterSensorUpdate(componentId);
-      };
-    }
-
-    return () => {};
+    return () => {
+      part.dispose();
+      unregisterSensorUpdate(componentId);
+    };
   },
 });
 
@@ -955,69 +928,44 @@ PartSimulationRegistry.register('ir-remote', {
 // ─── MicroSD Card ─────────────────────────────────────────────────────────────
 
 /**
- * MicroSD card — generic SD-over-SPI device with a real backing store.
+ * MicroSD card: the canvas part of the generic SD-over-SPI card.
  *
- * Hooks the hardware SPI peripheral (simulator.spi) — works for AVR and RP2040
- * (both expose the `.spi` adapter). ESP32 runs in QEMU and is a separate path.
+ * A responder on the bus fabric: it is on the bus its SCK/DI/DO/CS wires put
+ * it on, whatever board and whatever engine, and it only ever sees the frames
+ * clocked while its own chip select is active.
  *
- * Implements the SD v2 / SDHC command set the SD.h / SdFat libraries use, so it
- * works generically with any card configuration (not a one-card hack):
- *   - Init/info: CMD0, CMD8 (R7), CMD55+ACMD41, CMD58 (OCR, CCS=1 SDHC),
- *     CMD9 (CSD v2 reflecting SD_CARD_BYTES), CMD10 (CID), CMD13, CMD16.
- *   - Read:  CMD17 (single), CMD18 (multiple, until CMD12) — served from store.
- *   - Write: CMD24 (single), CMD25 (multiple, until stop token 0xFD) — the data
- *     block that follows the command is captured and stored.
- *
- * Addressing: the card advertises SDHC (CCS=1), so CMD17/24 args are BLOCK
- * indices (not byte offsets). Backing store is a sparse Map of 512-byte sectors.
- *
- * An optional pre-built FAT image can be injected via element.sdImageData (the
- * file-upload / auto-copy feature lands files there). The response queue drains
- * one byte per SPI transfer; idle line reads 0xFF.
+ * The protocol is NOT here. One model serves this part, a board's built-in
+ * slot and the portable artifact a remote worker runs
+ * (`parts/sdSpiCard.ts` and `buses/models/microsd.c`), because three
+ * hand-kept copies of it had already drifted apart and each drift was a card
+ * that mounted on one engine and not another. What this part owns is the
+ * interface: the image the project's files are baked into
+ * (`element.sdImageData`), the reader the card panel lists them through, and
+ * the pad names the fabric walks the wires from.
  */
-const SD_BLOCK_SIZE = 512;
 // Fixed card capacity (mirrors Wokwi's "no size attribute" model). The backing
 // store is SPARSE — only written/loaded blocks allocate — so the advertised
 // capacity is free in RAM. Adjustable here; not exposed to the user.
 const SD_CARD_BYTES = 64 * 1024 * 1024; // 64 MB
-const SD_C_SIZE = Math.floor(SD_CARD_BYTES / (512 * 1024)) - 1; // CSD v2 C_SIZE
 
 PartSimulationRegistry.register('microsd-card', {
-  attachEvents: (element, simulator, getPin) => {
-    const spi = (simulator as any).spi;
-    if (!spi) return () => {};
+  attachEvents: (element, _simulator, _getPin, componentId) => {
     const el = element as any;
 
-    // The card answers only while its CS is low, and hands every other byte
-    // back to whoever had the bus. `spi.onByte` is a single-listener channel,
-    // so taking it unconditionally made a display on the same SCK/MOSI go
-    // silent the moment a card was dropped on the canvas — no wiring could
-    // avoid it, which is what issue #343 was about. An unwired CS keeps the
-    // old always-listening behaviour: nothing to share with.
-    // A rail is not a GPIO. The pin walk answers -1 for a pad that reaches
-    // GND or a supply, and subscribing to that waits for an edge that never
-    // comes — which would leave a card wired CS-to-GND (permanently selected
-    // on the bench, and a normal way to wire a card that is alone) silent for
-    // the whole run.
-    const csPin = getPin('CS');
-    const csGpio = typeof csPin === 'number' && csPin >= 0 ? csPin : null;
-    const pm = (simulator as any).pinManager;
-    let selected = csGpio === null;
+    // The card model is shared with a board's built-in slot and with the
+    // portable model a remote worker runs, so a fix lands in one place
+    // (project board-buses-2026-09, F4). This part is the INTERFACE: the image
+    // the user's files are baked into, the panel that lists them, and the pins
+    // the silkscreen prints.
+    const card = new SdSpiCard(null, SD_CARD_BYTES);
 
-    // ── Backing store: sparse map of blockIndex -> 512-byte sector ──────────
-    const store = new Map<number, Uint8Array>();
-    const readBlock = (idx: number): Uint8Array => store.get(idx) ?? new Uint8Array(SD_BLOCK_SIZE); // unwritten = zeros
-    const writeBlock = (idx: number, data: ArrayLike<number>): void => {
-      const blk = new Uint8Array(SD_BLOCK_SIZE);
-      blk.set(Array.from(data).slice(0, SD_BLOCK_SIZE));
-      store.set(idx, blk);
-    };
-
-    // Optional pre-built FAT image (Phase 2 sets element.sdImageData). Loaded
-    // into the store block-by-block so the firmware can mount + read it.
-    (() => {
+    // Optional pre-built FAT image (DynamicComponent sets element.sdImageData
+    // from the project's files plus the panel's uploads). How big it was is
+    // what the dump pads back to, so a FAT parser reading the card sees the
+    // whole volume and not just the blocks somebody touched.
+    let imageBytes = 0;
+    {
       const raw = el.sdImageData;
-      if (!raw) return;
       const bytes: Uint8Array | null =
         raw instanceof Uint8Array
           ? raw
@@ -1026,246 +974,56 @@ PartSimulationRegistry.register('microsd-card', {
             : Array.isArray(raw)
               ? Uint8Array.from(raw)
               : null;
-      if (!bytes) return;
-      for (let i = 0; i * SD_BLOCK_SIZE < bytes.length; i++) {
-        const slice = bytes.subarray(i * SD_BLOCK_SIZE, (i + 1) * SD_BLOCK_SIZE);
-        // Skip all-zero blocks so the store stays sparse (they read back as
-        // zeros anyway) — a multi-MB FAT image only allocates its used blocks.
-        if (slice.some((b) => b !== 0)) writeBlock(i, slice);
+      if (bytes) {
+        imageBytes = bytes.length;
+        card.loadImage(bytes);
       }
-    })();
+    }
 
-    // ── 16-byte CSD (v2.0, high-capacity) reflecting SD_CARD_BYTES ──────────
-    const buildCSD = (): number[] => [
-      0x40,
-      0x0e,
-      0x00,
-      0x32,
-      0x5b,
-      0x59,
-      0x00,
-      (SD_C_SIZE >> 16) & 0x3f,
-      (SD_C_SIZE >> 8) & 0xff,
-      SD_C_SIZE & 0xff,
-      0x7f,
-      0x80,
-      0x0a,
-      0x40,
-      0x00,
-      0x01,
-    ];
-    // ── 16-byte CID (manufacturer info; values are cosmetic) ────────────────
-    const buildCID = (): number[] => [
-      0x01,
-      0x56,
-      0x58,
-      0x56,
-      0x45,
-      0x4c,
-      0x58,
-      0x53, // mfr, "VX", "VELXS"
-      0x10,
-      0x00,
-      0x00,
-      0x00,
-      0x01,
-      0x01,
-      0x60,
-      0x01,
-    ];
+    const owner = componentId ?? (el?.id as string) ?? 'microsd-card';
+    // The panel asks by owner. `fromPart` says this card is a component on the
+    // canvas, so a panel opened on the card itself finds it without being told
+    // which component it is.
+    const unpublish = registerSdImageReader(
+      owner,
+      () => {
+        const image = card.dumpImage(imageBytes);
+        // Nothing mounted yet reads as no card, which is what the panel shows
+        // for a slot it has never seen a byte from.
+        return image.length > 0 ? image : null;
+      },
+      { fromPart: true },
+    );
 
-    // ── SD SPI protocol state machine ───────────────────────────────────────
-    const respQueue: number[] = [];
-    let cmdBuf: number[] = [];
-    let expectingAcmd = false;
-    // Phases: 'cmd' (idle/command), and the write data path after CMD24/25.
-    let phase: 'cmd' | 'wait-token' | 'recv-data' | 'recv-crc' = 'cmd';
-    let dataBuf: number[] = [];
-    let crcLeft = 0;
-    let writeAddr = 0;
-    let multiWrite = false;
-    // CMD18 continuous read: keep streaming blocks until CMD12.
-    let multiRead = false;
-    let readAddr = 0;
+    // The card is also a RESPONDER on a board whose CPU is in a QEMU worker,
+    // and there it has to run beside the guest: the worker reads MISO for a
+    // byte before this tab has seen the byte (D-004). Start the fetch of the
+    // portable model now; the map is published again when the bytes land.
+    loadSdBusChip();
 
-    /** Queue a data block as the firmware reads it: token + 512 bytes + CRC. */
-    const pushDataBlock = (bytes: ArrayLike<number>): void => {
-      respQueue.push(0xfe); // start-block token
-      for (let i = 0; i < SD_BLOCK_SIZE; i++) respQueue.push((bytes as any)[i] ?? 0);
-      respQueue.push(0xff, 0xff); // CRC (ignored by SPI mode)
-    };
-    /** Queue R1 + a short (<=16 byte) data block (CSD/CID). */
-    const pushShortData = (bytes: number[]): void => {
-      respQueue.push(0x00, 0xfe, ...bytes, 0xff, 0xff);
-    };
-
-    const processCmd = (raw: number[]): void => {
-      const cmd = raw[0] & 0x3f;
-      const arg = ((raw[1] << 24) | (raw[2] << 16) | (raw[3] << 8) | raw[4]) >>> 0;
-      const isAcmd = expectingAcmd;
-      expectingAcmd = false;
-
-      if (isAcmd) {
-        if (cmd === 41) {
-          respQueue.push(0x00);
-          return;
-        } // ACMD41 — ready
-        if (cmd === 13) {
-          respQueue.push(0x00, 0x00);
-          return;
-        } // ACMD13 SD status (R2)
-        // fall through for other ACMDs
-      }
-
-      switch (cmd) {
-        case 0:
-          respQueue.push(0x01);
-          break; // GO_IDLE -> idle
-        case 8:
-          respQueue.push(0x01, 0x00, 0x00, 0x01, 0xaa);
-          break; // SEND_IF_COND (R7)
-        case 9:
-          pushShortData(buildCSD());
-          break; // SEND_CSD
-        case 10:
-          pushShortData(buildCID());
-          break; // SEND_CID
-        case 12:
-          multiRead = false;
-          respQueue.push(0x00, 0x00, 0xff);
-          break; // STOP_TRANSMISSION
-        case 13:
-          respQueue.push(0x00, 0x00);
-          break; // SEND_STATUS (R2)
-        case 16:
-          respQueue.push(0x00);
-          break; // SET_BLOCKLEN (fixed 512)
-        // Standard-capacity (SDSC) byte addressing: CMD17/18/24/25 args are BYTE
-        // offsets (block*512), not block indices. The Arduino SD library uses
-        // this even when the card advertises SDHC, so we present SDSC (CMD58
-        // CCS=0) and translate `arg >> 9` -> block. SDSC covers up to 2 GB,
-        // plenty for our small card; every SD library supports it.
-        case 17:
-          respQueue.push(0x00);
-          pushDataBlock(readBlock(arg >> 9));
-          break; // READ_SINGLE
-        case 18: // READ_MULTIPLE — stream until CMD12
-          respQueue.push(0x00);
-          readAddr = arg >> 9;
-          multiRead = true;
-          pushDataBlock(readBlock(readAddr));
-          readAddr++;
-          break;
-        case 24: // WRITE_SINGLE — data block follows
-          respQueue.push(0x00);
-          writeAddr = arg >> 9;
-          multiWrite = false;
-          phase = 'wait-token';
-          break;
-        case 25: // WRITE_MULTIPLE — data blocks follow until stop token
-          respQueue.push(0x00);
-          writeAddr = arg >> 9;
-          multiWrite = true;
-          phase = 'wait-token';
-          break;
-        case 55:
-          respQueue.push(0x01);
-          expectingAcmd = true;
-          break; // APP_CMD prefix
-        case 58:
-          respQueue.push(0x00, 0x80, 0xff, 0x80, 0x00);
-          break; // READ_OCR (powered, CCS=0 SDSC)
-        default:
-          respQueue.push(0x00); // accept unhandled commands
-      }
-    };
-
-    const chain = spiChainUnder(spi.onByte, `sd:${(el?.id as string) ?? 'microsd'}`);
-
-    const onByte = (byte: number) => {
-      // Not ours: the bus belongs to whatever else is wired to it.
-      if (!selected) {
-        chain.next?.(byte);
-        return;
-      }
-      // Full-duplex: the MISO shifted out for THIS transfer was prepared by
-      // earlier bytes, so reply FIRST (from the queue as it stood before this
-      // byte), THEN consume this MOSI byte to prepare future MISO. This gives
-      // the 1-byte (Ncr) command->response latency real SD cards have — the
-      // host reads R1 on the 0xFF clocks it sends AFTER the 6 command bytes,
-      // not on the last command byte. Replying after processing broke SD.begin.
-      spi.completeTransfer?.(respQueue.length > 0 ? respQueue.shift()! : 0xff);
-
-      switch (phase) {
-        case 'cmd':
-          if (cmdBuf.length === 0 && (byte & 0xc0) === 0x40) {
-            cmdBuf = [byte]; // command start (bit7=0, bit6=1)
-          } else if (cmdBuf.length > 0) {
-            cmdBuf.push(byte);
-            if (cmdBuf.length === 6) {
-              processCmd(cmdBuf);
-              cmdBuf = [];
-            }
-          } else if (multiRead && respQueue.length === 0) {
-            // Continuous read: refill the next block while the host clocks 0xFF.
-            pushDataBlock(readBlock(readAddr));
-            readAddr++;
-          }
-          break;
-        case 'wait-token':
-          if (byte === 0xfe || byte === 0xfc) {
-            phase = 'recv-data';
-            dataBuf = [];
-          } else if (byte === 0xfd) {
-            multiWrite = false;
-            phase = 'cmd';
-            respQueue.push(0x00);
-          }
-          // else 0xFF gap — keep waiting
-          break;
-        case 'recv-data':
-          dataBuf.push(byte);
-          if (dataBuf.length === SD_BLOCK_SIZE) {
-            phase = 'recv-crc';
-            crcLeft = 2;
-          }
-          break;
-        case 'recv-crc':
-          if (--crcLeft === 0) {
-            writeBlock(writeAddr, dataBuf);
-            writeAddr++;
-            respQueue.push(0x05); // data-response: accepted
-            phase = multiWrite ? 'wait-token' : 'cmd';
-          }
-          break;
-      }
-    };
-    spi.onByte = spiChainTag(onByte, `sd:${(el?.id as string) ?? 'microsd'}`, chain);
-
-    const csCleanup =
-      csGpio !== null && pm
-        ? pm.onPinChange(csGpio, (_p: number, level: boolean) => {
-            const now = !level; // active low
-            if (selected && !now) {
-              // Letting go of CS ends the transaction: a command frame still
-              // being clocked in cannot be finished by bytes meant for the
-              // display, and a reply nobody stayed to read is gone.
-              cmdBuf = [];
-              respQueue.length = 0;
-            }
-            selected = now;
-          })
-        : null;
+    const handle = attachSpiDevice(
+      {
+        owner,
+        componentId,
+        pins: { sck: 'SCK', mosi: 'DI', miso: 'DO', cs: 'CS' },
+        // SD cards clock on modes 0 and 3.
+        modes: [0, 3],
+        // CS (pin 1, DAT3) carries the card's own pull-up, so a card whose CS
+        // nothing drives reads as deselected and stays quiet.
+        csWhenFloating: 'deselected',
+        remoteModel: () => sdCardRemoteModel(card, imageBytes),
+        // What the guest writes on a remote board comes back as spans: the
+        // worker no longer relays the bytes of a card transaction no sink can
+        // see, and this copy is what the panel lists.
+        remoteBlobWrite: sdCardRemoteBlobWrite(card),
+      },
+      sdSpiFabricDevice(card),
+    );
 
     return () => {
-      csCleanup?.();
-      // Out of the chain wherever we sit. Restoring the channel outright
-      // would mute a part that attached after us, and staying in it would
-      // leave a torn-down card answering from an emptied store.
-      spiChainDetach(spi, onByte);
-      respQueue.length = 0;
-      cmdBuf = [];
-      store.clear();
+      handle.dispose();
+      unpublish();
+      card.setCs(false);
     };
   },
 });
@@ -1289,55 +1047,31 @@ PartSimulationRegistry.register('microsd-card', {
  */
 PartSimulationRegistry.register('bmp280', {
   attachEvents: (element, simulator, _getPin, componentId) => {
-    const sim = simulator as any;
     const el = element as any;
     const addr = el.address === '0x77' || el.address === 0x77 ? 0x77 : 0x76;
     const initTemp = el.temperature !== undefined ? parseFloat(el.temperature) : 25.0;
     const initPressure = el.pressure !== undefined ? parseFloat(el.pressure) : 1013.25;
 
-    if (typeof sim.registerSensor === 'function') {
-      // ── ESP32 path: backend BMP280 slave + frontend bus mirror ──────────
-      const virtualPin = 200 + addr;
-      const dev = new VirtualBMP280(addr);
-      dev.temperatureC = initTemp;
-      dev.pressureHPa = initPressure;
-      sim.registerSensor('bmp280', virtualPin, {
-        addr,
-        temperature: initTemp,
-        pressure: initPressure,
-      });
-      sim.addI2CDevice?.(dev);
+    const dev = new VirtualBMP280(addr);
+    dev.temperatureC = initTemp;
+    dev.pressureHPa = initPressure;
+    const part = attachI2cPart({
+      simulator,
+      componentId,
+      device: dev,
+      worker: { type: 'bmp280', props: { temperature: initTemp, pressure: initPressure } },
+    });
 
-      registerSensorUpdate(componentId, (values) => {
-        sim.updateSensor(virtualPin, values);
-        if ('temperature' in values) dev.temperatureC = values.temperature as number;
-        if ('pressure' in values) dev.pressureHPa = values.pressure as number;
-      });
+    registerSensorUpdate(componentId, (values) => {
+      part.updateWorker(values);
+      if ('temperature' in values) dev.temperatureC = values.temperature as number;
+      if ('pressure' in values) dev.pressureHPa = values.pressure as number;
+    });
 
-      return () => {
-        sim.unregisterSensor(virtualPin);
-        sim.removeI2CDevice?.(addr, 0);
-        unregisterSensorUpdate(componentId);
-      };
-    } else if (typeof sim.addI2CDevice === 'function') {
-      // ── AVR / RP2040 path ──────────────────────────────────────────────────
-      const dev = new VirtualBMP280(addr);
-      dev.temperatureC = initTemp;
-      dev.pressureHPa = initPressure;
-      sim.addI2CDevice(dev);
-
-      registerSensorUpdate(componentId, (values) => {
-        if ('temperature' in values) dev.temperatureC = values.temperature as number;
-        if ('pressure' in values) dev.pressureHPa = values.pressure as number;
-      });
-
-      return () => {
-        removeI2CDevice(sim, dev.address);
-        unregisterSensorUpdate(componentId);
-      };
-    }
-
-    return () => {};
+    return () => {
+      part.dispose();
+      unregisterSensorUpdate(componentId);
+    };
   },
 });
 
@@ -1357,41 +1091,25 @@ PartSimulationRegistry.register('bmp280', {
  */
 PartSimulationRegistry.register('ds3231', {
   attachEvents: (element, simulator, _getPin, componentId) => {
-    const sim = simulator as any;
     const el = element as any;
     const initTemp = el.temperature !== undefined ? parseFloat(el.temperature) : 25.0;
 
-    if (typeof sim.registerSensor === 'function') {
-      // ── ESP32 path: backend DS3231 slave + frontend bus mirror ──────────
-      const virtualPin = 200 + 0x68;
-      const dev = new VirtualDS3231();
-      dev.temperatureC = initTemp;
-      sim.registerSensor('ds3231', virtualPin, { addr: 0x68, temperature: initTemp });
-      sim.addI2CDevice?.(dev);
-      registerSensorUpdate(componentId, (values) => {
-        sim.updateSensor(virtualPin, values);
-        if ('temperature' in values) dev.temperatureC = values.temperature as number;
-      });
-      return () => {
-        sim.unregisterSensor(virtualPin);
-        sim.removeI2CDevice?.(dev.address, 0);
-        unregisterSensorUpdate(componentId);
-      };
-    } else if (typeof sim.addI2CDevice === 'function') {
-      // ── AVR / RP2040 path ──────────────────────────────────────────────────
-      const dev = new VirtualDS3231();
-      dev.temperatureC = initTemp;
-      sim.addI2CDevice(dev);
-      registerSensorUpdate(componentId, (values) => {
-        if ('temperature' in values) dev.temperatureC = values.temperature as number;
-      });
-      return () => {
-        removeI2CDevice(sim, dev.address);
-        unregisterSensorUpdate(componentId);
-      };
-    }
-
-    return () => {};
+    const dev = new VirtualDS3231();
+    dev.temperatureC = initTemp;
+    const part = attachI2cPart({
+      simulator,
+      componentId,
+      device: dev,
+      worker: { type: 'ds3231', props: { temperature: initTemp } },
+    });
+    registerSensorUpdate(componentId, (values) => {
+      part.updateWorker(values);
+      if ('temperature' in values) dev.temperatureC = values.temperature as number;
+    });
+    return () => {
+      part.dispose();
+      unregisterSensorUpdate(componentId);
+    };
   },
 });
 
@@ -1410,8 +1128,7 @@ PartSimulationRegistry.register('ds3231', {
  * which sets `element.value` so wokwi-LCD-I2C or similar elements can render.
  */
 PartSimulationRegistry.register('pcf8574', {
-  attachEvents: (element, simulator, _getPin) => {
-    const sim = simulator as any;
+  attachEvents: (element, simulator, _getPin, componentId) => {
     const el = element as any;
 
     // Parse address from element property (accepts '0x27', '39', or numeric)
@@ -1429,26 +1146,18 @@ PartSimulationRegistry.register('pcf8574', {
       el.value = value;
     };
 
-    if (typeof sim.registerSensor === 'function') {
-      // ── ESP32 path: backend slave + frontend bus mirror ─────────────────
-      const virtualPin = 200 + addr;
-      sim.registerSensor('pcf8574', virtualPin, { addr });
-      sim.addI2CTransactionListener?.(addr, (data: number[]) => {
-        if (data.length > 0) dev.writeByte(data[0]);
-      });
-      sim.addI2CDevice?.(dev);
-      return () => {
-        sim.unregisterSensor(virtualPin);
-        sim.removeI2CTransactionListener?.(addr);
-        sim.removeI2CDevice?.(addr, 0);
-      };
-    } else if (typeof sim.addI2CDevice === 'function') {
-      // ── AVR / RP2040 path ──────────────────────────────────────────────────
-      sim.addI2CDevice(dev);
-      return () => removeI2CDevice(sim, dev.address);
-    }
-
-    return () => {};
+    const part = attachI2cPart({
+      simulator,
+      componentId,
+      device: dev,
+      worker: {
+        type: 'pcf8574',
+        echo: (data: number[]) => {
+          if (data.length > 0) dev.writeByte(data[0]);
+        },
+      },
+    });
+    return () => part.dispose();
   },
 });
 
@@ -1492,8 +1201,8 @@ function makeI2cLcdAttach(cols: number, rows: number) {
     element: HTMLElement,
     simulator: unknown,
     _getPin: (name: string) => number | null,
+    componentId: string,
   ): (() => void) => {
-    const sim = simulator as any;
     const el = element as any;
 
     const addr = parseI2cAddress(el.i2cAddress ?? el.address, 0x27);
@@ -1529,32 +1238,23 @@ function makeI2cLcdAttach(cols: number, rows: number) {
     const pcf = new VirtualPCF8574(addr);
     pcf.onWrite = (v: number) => decoder.feedPCF8574Byte(v);
 
-    if (typeof sim.registerSensor === 'function') {
-      // ── ESP32 path: backend QEMU PCF8574 slave forwards transactions
-      //    back to us, and the same VirtualPCF8574 is also on the frontend
-      //    bus so peer boards can reach it via the I2C bridge. ─────────
-      const virtualPin = 200 + addr;
-      sim.registerSensor('pcf8574', virtualPin, { addr });
-      sim.addI2CTransactionListener?.(addr, (data: number[]) => {
-        for (const b of data) decoder.feedPCF8574Byte(b);
-      });
-      sim.addI2CDevice?.(pcf);
-      return () => {
-        sim.unregisterSensor(virtualPin);
-        sim.removeI2CTransactionListener?.(addr);
-        sim.removeI2CDevice?.(addr, 0);
-        decoder.reset();
-      };
-    } else if (typeof sim.addI2CDevice === 'function') {
-      // ── AVR / RP2040 path ────────────────────────────────────────────
-      sim.addI2CDevice(pcf);
-      return () => {
-        removeI2CDevice(sim, pcf.address);
-        decoder.reset();
-      };
-    }
-
-    return () => decoder.reset();
+    // On a QEMU board the worker's expander echoes each write phase, and the
+    // decoder here takes the bytes as the backpack would.
+    const part = attachI2cPart({
+      simulator,
+      componentId,
+      device: pcf,
+      worker: {
+        type: 'pcf8574',
+        echo: (data: number[]) => {
+          for (const b of data) decoder.feedPCF8574Byte(b);
+        },
+      },
+    });
+    return () => {
+      part.dispose();
+      decoder.reset();
+    };
   };
 }
 

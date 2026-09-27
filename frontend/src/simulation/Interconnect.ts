@@ -6,10 +6,18 @@
  * between boards along the wires the user drew. UART, I2C, SPI, and
  * SoftwareSerial protocols all "just work" on top of pin propagation
  * because each board's hardware peripherals decode the actual
- * transitions. For cross-process boards (ESP32 backend QEMU, Pi3B
- * QEMU) it additionally enables a byte-level shortcut on hardware
- * UART pins so that high-baud links don't drop bytes when the
- * WebSocket round-trip would be too slow for bit-level transport.
+ * transitions.
+ *
+ * UART between boards is the bus fabric's (project board-buses-2026-09,
+ * F6): a wire from one board's UART pin to another's is one net with a
+ * controller on each end (simulation/buses/registry.ts, relinkUart), and the
+ * byte a controller transmits reaches the other board's controller there.
+ * The byte-level fan-out below is kept for the boards the fabric cannot
+ * serve, an engine that publishes no UART controller port (every engine of
+ * the product does; the mocked engines of the multi-board suites do not):
+ * per byte, `busRegistry.servesUartWire` says whether the fabric carried the
+ * wire, and only then does this stay out of it, so a byte never arrives
+ * twice.
  *
  * Design:
  *   - Singleton `interconnect`. The store calls `bindBoard` /
@@ -30,7 +38,8 @@
 import type { BoardKind } from '../types/board';
 import type { Wire } from '../types/wire';
 import { boardPinToNumber } from '../utils/boardPinMapping';
-import { classifyPin, isUartWire } from '../utils/boardProtocols';
+import { isUartWire } from '../utils/boardProtocols';
+import { busRegistry } from './buses/registry';
 import {
   resolveCrossBoardChipNets,
   type ChipNetState,
@@ -158,15 +167,6 @@ export function getChipNetLinks(): CrossBoardChipNet[] {
   return [...chipNetLinks.values()];
 }
 
-/**
- * Cross-board I2C bridges installed when two boards share a wired
- * (SDA, SCL) pair on a given (busA, busB).  Keyed by a deterministic
- * "boardA:busA<->boardB:busB" string so we don't double-install when
- * `updateWires` is called repeatedly.  The value is the teardown that
- * detaches both halves of the bidirectional bridge.
- */
-const i2cBridges = new Map<string, () => void>();
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function isBrowserSim(boardKind: string): boolean {
@@ -284,19 +284,10 @@ export function registerSerialSink(
 export function feedBoardSerialOut(boardId: string, ch: string, uart = 0): void {
   const subs = boards.get(boardId)?.serialFanout.get(uart);
   if (subs) for (const cb of subs) cb(ch);
-  // ...and so the PARTS on this board's own canvas hear it too. The fan-out
-  // above only ever reaches other boards, and an in-browser Linux engine has
-  // no bridge to fire `onUartTx`, so this call is the only announcement it
-  // makes: without the line below every UART module on a browser-engine Pi is
-  // deaf, while the same module on the QEMU guest answers. A board simulator
-  // has no such method and does not call this seam anyway, so only the Pi
-  // shim is served here.
-  if (uart === 0) {
-    const sim = runtime?.getBoardSimulator(boardId) as
-      | { noteHeaderUartTxTemporary?: (text: string) => void }
-      | undefined;
-    sim?.noteHeaderUartTxTemporary?.(ch);
-  }
+  // Only other BOARDS are served here. The parts on this board's own canvas
+  // hear it through the board's UART controller port on the bus fabric
+  // (project board-buses-2026-09, F6): an in-browser engine hands its bytes
+  // to the board simulator itself (PiBridgeShim.headerUartTx).
 }
 
 /** Push a UART byte into the receiving board's UART RX. */
@@ -551,8 +542,10 @@ export function ensureChipNetHooks(): void {
 function installSerialFanout(
   fromBoardId: string,
   fromUart: number,
+  fromPin: number,
   toBoardId: string,
   toUart: number,
+  toPin: number,
 ): () => void {
   const entry = boards.get(fromBoardId);
   if (!entry) return () => {};
@@ -562,7 +555,15 @@ function installSerialFanout(
     set = new Set();
     entry.serialFanout.set(fromUart, set);
   }
-  const cb = (ch: string) => pushSerialByte(toBoardId, ch, toUart);
+  const cb = (ch: string) => {
+    // The fabric carried this byte from the transmitting controller to the
+    // receiving one (both ends are ports on it, linked by this wire): a
+    // second delivery here would be the byte twice. Asked per byte, because
+    // a port's routing follows the sketch (Serial1.begin) and an engine is
+    // bound at Run, both after this route was built.
+    if (busRegistry.servesUartWire(fromBoardId, fromPin, toBoardId, toPin)) return;
+    pushSerialByte(toBoardId, ch, toUart);
+  };
   set.add(cb);
   return () => {
     entry.serialFanout.get(fromUart)?.delete(cb);
@@ -602,31 +603,23 @@ function buildRouteForWire(wire: Wire): RouteHandle | null {
     teardowns.push(installBridgePinFanout(bEntry.id, bRes.pin, aEntry.id, aRes.pin));
   }
 
-  // ─ Optional UART byte-level shortcut ────────────────────────────────────
-  // Enable when at least one side is a cross-process bridge (latency
-  // would drop bit-level transport) AND when both pins classify as
-  // matching UART TX/RX endpoints.
-  const aIsCross = isEsp32Bridge(aEntry.kind) || isPi3Bridge(aEntry.kind);
-  const bIsCross = isEsp32Bridge(bEntry.kind) || isPi3Bridge(bEntry.kind);
+  // ─ UART byte-level fan-out, for the boards the fabric does not serve ────
+  // A hardware-UART pin pair by the boards' static tables. When the fabric
+  // links the two boards' nets and has a controller port on each end, the
+  // byte goes that way and the callback installed here stays out (see the
+  // header); otherwise this is the path, as it was for every board before
+  // the fabric.
   const uartInfo = isUartWire(aEntry.kind, wire.start.pinName, bEntry.kind, wire.end.pinName);
-
-  // Always wire the byte-level shortcut for hardware-UART pin pairs —
-  // even browser-only cases benefit: AVR/RP2040 sims emit per-byte
-  // events that cleanly arrive at the other side without depending on
-  // bit-level pin replay timing.
   if (uartInfo) {
-    const aRoleIsTx = classifyPin(aEntry.kind, wire.start.pinName).kind === 'uart-tx';
     const aUart = uartInfo.uartA;
     const bUart = uartInfo.uartB;
-    if (aRoleIsTx) {
-      // A.TX → B.RX
-      teardowns.push(installSerialFanout(aEntry.id, aUart, bEntry.id, bUart));
+    if (uartInfo.txSide === 'a') {
+      // A.TX -> B.RX
+      teardowns.push(installSerialFanout(aEntry.id, aUart, aRes.pin, bEntry.id, bUart, bRes.pin));
     } else {
-      // A.RX → B.TX (the wire's "start" was the RX side)
-      teardowns.push(installSerialFanout(bEntry.id, bUart, aEntry.id, aUart));
+      // A.RX -> B.TX (the wire's "start" was the RX side)
+      teardowns.push(installSerialFanout(bEntry.id, bUart, bRes.pin, aEntry.id, aUart, aRes.pin));
     }
-    void aIsCross;
-    void bIsCross;
   }
 
   return {
@@ -668,200 +661,6 @@ export function unbindBoard(boardId: string): void {
 
 let lastWireSnapshot: string = '';
 
-// ── Cross-board I2C bus bridges ─────────────────────────────────────────────
-//
-// On top of the bit-level GPIO propagation each wire already installs,
-// when two boards have BOTH SDA and SCL wired together on a (busA,
-// busB) pair we install a transaction-level bridge between their
-// `I2CBusManager` instances.  This lets one board act as I2C master
-// and the OTHER as the slave responder — something neither avr8js
-// AVRTWI nor rp2040js RPI2C supports natively (both are master-only
-// peripherals; they do not sample GPIO to decode an incoming
-// transaction as a slave).
-//
-// The bridge is symmetric: either side may initiate.  Addresses are
-// resolved against the peer's locally-registered virtual devices, so a
-// PCF8574 (or any I2CDevice) registered on board B's bus is reachable
-// from board A's master without any extra glue.
-
-/** Group i2c-classified wires by (boardA, busA, boardB, busB) and pin role. */
-function collectI2CWirePairs(
-  wires: readonly Wire[],
-): Map<
-  string,
-  {
-    aBoard: string;
-    aBus: number;
-    bBoard: string;
-    bBus: number;
-    sda: boolean;
-    scl: boolean;
-  }
-> {
-  const groups = new Map<
-    string,
-    {
-      aBoard: string;
-      aBus: number;
-      bBoard: string;
-      bBus: number;
-      sda: boolean;
-      scl: boolean;
-    }
-  >();
-
-  for (const w of wires) {
-    const aEntry = boards.get(w.start.componentId);
-    const bEntry = boards.get(w.end.componentId);
-    if (!aEntry || !bEntry) continue;
-
-    const aRole = classifyPin(aEntry.kind, w.start.pinName);
-    const bRole = classifyPin(bEntry.kind, w.end.pinName);
-    if (aRole.kind !== bRole.kind) continue;
-    if (aRole.kind !== 'i2c-sda' && aRole.kind !== 'i2c-scl') continue;
-
-    // Normalize ordering so (boardA < boardB) lexicographically.  The
-    // bridge is symmetric, but the map key must be deterministic.
-    const swap = aEntry.id > bEntry.id;
-    const A = swap ? bEntry : aEntry;
-    const B = swap ? aEntry : bEntry;
-    const aRoleN = swap ? bRole : aRole;
-    const bRoleN = swap ? aRole : bRole;
-
-    if (aRoleN.kind !== 'i2c-sda' && aRoleN.kind !== 'i2c-scl') continue;
-    const aBus =
-      'bus' in aRoleN && typeof aRoleN.bus === 'number' ? aRoleN.bus : 0;
-    const bBus =
-      'bus' in bRoleN && typeof bRoleN.bus === 'number' ? bRoleN.bus : 0;
-
-    const key = `${A.id}#${aBus}<->${B.id}#${bBus}`;
-    let entry = groups.get(key);
-    if (!entry) {
-      entry = {
-        aBoard: A.id,
-        aBus,
-        bBoard: B.id,
-        bBus,
-        sda: false,
-        scl: false,
-      };
-      groups.set(key, entry);
-    }
-    if (aRoleN.kind === 'i2c-sda') entry.sda = true;
-    else entry.scl = true;
-  }
-
-  return groups;
-}
-
-/**
- * Look up the `I2CBusManager` for `(boardId, bus)`.  Returns null
- * silently if the board does not expose `getI2CBus` (e.g. cross-process
- * bridges, RiscV, ESP32 backend), if the bus has not been constructed
- * yet (firmware not loaded), or if the runtime accessors are missing.
- */
-function getI2CBusFor(boardId: string, bus: number): unknown {
-  if (!runtime) return null;
-  const sim = runtime.getBoardSimulator(boardId);
-  if (!sim || typeof sim.getI2CBus !== 'function') return null;
-  try {
-    return sim.getI2CBus(bus as 0 | 1) ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Reconcile the bridge map with the latest wire layout.  Installs new
- * bridges, tears down stale ones, and is idempotent against repeated
- * calls with the same wires.
- */
-function updateI2CBridges(wires: readonly Wire[]): void {
-  const desired = collectI2CWirePairs(wires);
-
-  // Tear down bridges that no longer have both SDA and SCL wired.
-  for (const [key, teardown] of [...i2cBridges.entries()]) {
-    const want = desired.get(key);
-    if (!want || !(want.sda && want.scl)) {
-      teardown();
-      i2cBridges.delete(key);
-    }
-  }
-
-  // Install bridges that newly have both SDA and SCL wired.
-  for (const [key, want] of desired.entries()) {
-    if (!want.sda || !want.scl) continue;
-    if (i2cBridges.has(key)) continue;
-
-    const busA = getI2CBusFor(want.aBoard, want.aBus) as
-      | {
-          attachBridge(p: unknown): void;
-          detachBridge(p: unknown): void;
-        }
-      | null;
-    const busB = getI2CBusFor(want.bBoard, want.bBus) as
-      | {
-          attachBridge(p: unknown): void;
-          detachBridge(p: unknown): void;
-        }
-      | null;
-    if (!busA || !busB) continue; // one side does not expose a bus yet
-
-    busA.attachBridge(busB);
-    busB.attachBridge(busA);
-
-    // ── Cross-architecture proxy sync ─────────────────────────────────────
-    // When one side of the bridge is an ESP32 board, the I2CBusManager
-    // alone is not enough: ESP32 firmware runs in backend QEMU, and its
-    // Wire master reads land inside the QEMU thread synchronously.  A
-    // WebSocket round-trip to look up the peer device per byte would
-    // deadlock the I2C cycle.  Instead, snapshot the peer's local
-    // devices into a backend `ProxySlave` per address — QEMU then
-    // responds locally without leaving the worker.
-    if (isEsp32Bridge(boards.get(want.aBoard)?.kind ?? '')) {
-      const simA = runtime?.getBoardSimulator(want.aBoard);
-      if (simA?.syncProxyFromPeer) {
-        try { simA.syncProxyFromPeer(busB); } catch { /* ignore */ }
-      }
-    }
-    if (isEsp32Bridge(boards.get(want.bBoard)?.kind ?? '')) {
-      const simB = runtime?.getBoardSimulator(want.bBoard);
-      if (simB?.syncProxyFromPeer) {
-        try { simB.syncProxyFromPeer(busA); } catch { /* ignore */ }
-      }
-    }
-
-    i2cBridges.set(key, () => {
-      try {
-        busA.detachBridge(busB);
-      } catch {
-        /* ignore */
-      }
-      try {
-        busB.detachBridge(busA);
-      } catch {
-        /* ignore */
-      }
-      // Remove ONLY the proxy slaves this bridge installed.  Per-peer
-      // teardown so concurrent bridges to the same ESP32 (e.g. ESP32
-      // wired to both an Uno and a Pico simultaneously) retain their
-      // own proxies — addresses owned by another peer survive.
-      if (isEsp32Bridge(boards.get(want.aBoard)?.kind ?? '')) {
-        const simA = runtime?.getBoardSimulator(want.aBoard);
-        if (simA?.clearProxiesForPeer) {
-          try { simA.clearProxiesForPeer(busB); } catch { /* ignore */ }
-        }
-      }
-      if (isEsp32Bridge(boards.get(want.bBoard)?.kind ?? '')) {
-        const simB = runtime?.getBoardSimulator(want.bBoard);
-        if (simB?.clearProxiesForPeer) {
-          try { simB.clearProxiesForPeer(busA); } catch { /* ignore */ }
-        }
-      }
-    });
-  }
-}
-
 /**
  * Idempotent: rebuilds route table to match the supplied wires array.
  * Called by the store on every wire mutation and also on board
@@ -891,24 +690,15 @@ export function updateWires(wires: readonly Wire[]): void {
     if (r) routes.set(w.id, r);
   }
 
-  // After per-wire pin/UART routes are in place, reconcile the
-  // higher-level I2C bridges that need BOTH SDA and SCL present.
-  updateI2CBridges(wires);
+  // I2C between boards needs no route here: a chip is on a controller's bus
+  // because its SDA and SCL are on that controller's nets, and a net wired
+  // from one board's I2C pins to another's reaches both masters, so the bus
+  // fabric places the chip on both (simulation/buses/registry.ts).
 
   // Chip-to-chip nets are not routed per wire (the worker keys them by net id),
   // so the relay is installed per board rather than per route.
   ensureChipNetHooks();
   updateChipNetLinks();
-}
-
-/**
- * Called by the store when a board's simulator finishes initialising
- * (firmware loaded, peripherals constructed). At that point the
- * I2CBusManager finally exists, so we re-evaluate which bridges can
- * be installed.  Safe to call repeatedly.
- */
-export function notifyBoardReady(_boardId: string, wires: readonly Wire[]): void {
-  updateI2CBridges(wires);
 }
 
 /**
@@ -935,8 +725,6 @@ export function reensureSerialHooks(boardId: string): void {
 export function resetInterconnect(): void {
   for (const r of routes.values()) r.teardown();
   routes.clear();
-  for (const teardown of i2cBridges.values()) teardown();
-  i2cBridges.clear();
   for (const e of boards.values()) {
     e.pinChangeFanout.clear();
     e.serialFanout.clear();

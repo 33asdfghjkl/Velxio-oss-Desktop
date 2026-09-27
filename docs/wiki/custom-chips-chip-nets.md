@@ -7,8 +7,11 @@
 > which only knew the board GPIOs a chip pin was wired to. A chip pin wired
 > only to another chip's pin had nothing to stand on. This page documents the
 > net bus that carries such pins inside one worker, the bridge that carries
-> them between two workers, the UART binding that came with it, and the
-> limits measured on the way. Landed in PR #324 (2026-09).
+> them between two workers, and the limits measured on the way. Landed in
+> PR #324 (2026-09). The UART binding that landed with it (a `uart_map` the
+> frontend classified pin by pin, `CHIP_UART` as the fallback) was replaced
+> by the bus fabric in `board-buses-2026-09` F6; the UART section below says
+> what a chip's UART is on today.
 
 ---
 
@@ -108,25 +111,31 @@ real elapsed time.
 ## UART binding
 
 The chip names its own RX and TX pins in `vx_uart_config`, and `pin_map`
-already turns those into GPIOs. The missing hop is GPIO to UART number, which
-is board-specific, so it comes from the frontend: `CustomChipPart.ts`
-classifies each wired GPIO with the same board UART table the cross-board
-UART shortcut uses (`boardProtocols.classifyPin`) and sends it as `uart_map`.
-The runtime resolves at `vx_uart_attach`, and the worker dispatches `uart_tx`
-to the runtimes bound to that UART instead of to one hardcoded index.
+already turns those into GPIOs. Which guest UART those GPIOs belong to is
+decided from the wiring, in the worker's `uart_bus_table.py`
+(`backend/app/services/`), in this order:
 
-A chip's RX is wired to the board's TX and its TX to the board's RX, so either
-end names the same UART and the first one that resolves wins.
+1. the live routing of the pad the chip's RX leg is on, when the worker can
+   read it (the ESP32 GPIO matrix carries the `UnTXD_OUT` signal of the pad
+   the board transmits on; a pad the matrix does not route falls through,
+   because ESP-IDF 5 puts a UART on its IO_MUX pins without touching the
+   matrix);
+2. the `uart` half of the bus map the tab sends (`bus_map.uart`): one entry
+   per endpoint the fabric placed on this board, with the unit whose TX
+   feeds the chip's RX leg and the one whose RX its TX leg reaches. The tab
+   reads a user chip's pads by running its `chip_setup` in an inert instance
+   (`customChips/chipUartPads.ts`) and places them like any part's;
+3. nothing. A chip whose legs the fabric placed on no controller (unwired,
+   or on plain GPIOs the guest would have to bit-bang) hears nothing and is
+   heard by nobody. The worker has no bit-timed pins, so there is no
+   software UART there, and Serial1 is not a place a wire leads.
 
-When nothing resolves the chip stays on `CHIP_UART` (Serial1), not UART0.
-UART0 is the serial monitor on every ESP32 family: a chip defaulting there
-reads the sketch's own console output and writes garbage into it.
-
-**Behaviour change for existing projects.** A chip whose RX and TX are drawn
-to GPIO 1 and 3 on an ESP32 used to be fed from Serial1 and now binds to
-UART0, which is also the serial monitor. That is what the diagram says and
-what the hardware would do. A project that wants the old behaviour leaves the
-chip's UART pins unwired.
+The worker dispatches `uart_tx` only to the chip on that unit, and a chip's
+`vx_uart_write` lands in that unit's RX. There is no `uart_map` in the
+sensor record, no `CHIP_UART` and no fallback to UART0 or Serial1: a chip
+drawn to GPIO 1 and 3 on an ESP32 is on UART0, the console, because that is
+what the diagram says. The model, the diagnostics and the same rules for the
+in-browser engines are in [board-buses.md](./board-buses.md).
 
 ## Two faults fixed on the way
 
@@ -186,10 +195,11 @@ sockets preserve.
 ## Limits that remain
 
 - **The worker places edges with a Python sleep.** `_chip_timer_thread`
-  waits on `threading.Event.wait` and then fires due timers, so the
-  transmitter's own edges carry host jitter before the bridge adds any. The
-  browser chip runtime backs `vx_sim_now_nanos` with simulated time and has
-  no such jitter.
+  waits against the guest's virtual clock in naps of up to 20 ms and then
+  fires due timers, so the transmitter's own edges carry host jitter before
+  the bridge adds any (the callback still reads its exact deadline). The
+  browser chip runtime puts each deadline on the engine's event queue at its
+  guest cycle and has no such jitter.
 - **Every bridged edge is two WebSocket messages.** A protocol that toggles a
   line quickly saturates that path first, and a background tab widens the
   latency. The latency no longer reaches the bit timing, though: every edge
@@ -216,8 +226,8 @@ sockets preserve.
   loads at once through the live `sensor_attach` command, and one removed
   leaves every dispatch list and the net bus.
 - **The power-line fixture transmits across the bridge but does not decode.**
-  The KQ-130F pair was run at the 40 ms bit period: UART binding confirmed
-  live (`uartMap={"17":2}`, `UART chip registered on UART2`), the sender
+  The KQ-130F pair was run at the 40 ms bit period: the chip was confirmed
+  on UART2 (the log lines of the pre-F6 `uart_map` binding), the sender
   framed onto LINE and the bridge carried the edges, but the receiver never
   detected a frame start. Not chased further. The first thing to look at is
   the KQ model's 4 ms UART gap timer, which shares the worker timer thread
@@ -228,15 +238,16 @@ sockets preserve.
 | File | Role |
 |---|---|
 | `frontend/src/simulation/customChips/chipNets.ts` | `resolveChipNetMembers`, `resolveChipOwnerBoardId` |
-| `frontend/src/simulation/parts/CustomChipPart.ts` | sends `nets` and `uart_map`, filters synthetic pins |
+| `frontend/src/simulation/parts/CustomChipPart.ts` | sends `nets` and `component_id`, filters synthetic pins; the chip's UART placement travels in the bus map ([board-buses.md](./board-buses.md)) |
 | `frontend/src/simulation/Interconnect.ts` | `ensureChipNetHooks`, the cross-board relay |
 | `frontend/src/simulation/Esp32Bridge.ts` | `onChipNet`, `sendChipNet` |
 | `frontend/src/store/useSimulatorStore.ts` | `Esp32BridgeShim.sendPinEvent` |
-| `backend/app/services/wasm_chip_runtime.py` | `ChipNetBus`, net-aware `vx_pin_*`, `_resolve_uart_id` |
+| `backend/app/services/wasm_chip_runtime.py` | `ChipNetBus`, net-aware `vx_pin_*` |
+| `backend/app/services/uart_bus_table.py` | which guest UART each hosted chip is on, from the live routing and the tab's bus map |
 | `backend/app/services/esp32_worker.py` | bus creation, `chip_net` command, per-UART dispatch, latency log |
 | `backend/app/services/esp32_lib_manager.py`, `api/routes/simulation.py` | `esp32_chip_net` command path |
 | `test/backend/unit/test_chip_nets.py` | 10 cases: bus semantics, then two real chips over LINE and ANT nets |
-| `test/backend/unit/test_chip_uart_binding.py` | 5 cases on the KQ-130F WASM |
+| `test/backend/unit/test_chip_uart_binding.py` | 3 cases on the KQ-130F WASM: the attach keeps the config and names no UART, the runtime has no `CHIP_UART` and takes no `uart_map`, the bytes reach the writer over the net |
 | `frontend/src/__tests__/chipnets-esp32-members.test.ts` | 9 cases on the net description sent to the worker |
 | `test/fixtures/chip-nets/` | SX1262 and KQ-130F models (MIT, Martin Thuku), sources and a standalone self test |
 

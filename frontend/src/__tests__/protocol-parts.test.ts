@@ -31,6 +31,15 @@ import {
   NEC_REPEAT_PERIOD_MS,
 } from '../simulation/ir';
 import { useSimulatorStore } from '../store/useSimulatorStore';
+import { busRegistry } from '../simulation/buses';
+import type {
+  BoardPins,
+  I2cControllerPort,
+  I2cTransactionHandler,
+  NetResolver,
+  SpiControllerPort,
+} from '../simulation/buses';
+import { i2cPartWorkerPin } from '../simulation/parts/i2cPart';
 import '../simulation/parts/ProtocolParts';
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
@@ -44,6 +53,8 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  // No device and no board of one test on the bus fabric of the next.
+  busRegistry.clear();
 });
 
 // ─── Mock factories ───────────────────────────────────────────────────────────
@@ -106,6 +117,186 @@ const pinMap =
 
 const noPins = (_name: string): number | null => null;
 
+// ─── A board on the bus fabric (project board-buses-2026-09) ──────────────────
+//
+// The SPI parts no longer take a simulator's SPI object: they register a
+// device with the fabric, which decides from the CIRCUIT which bus they are on
+// and only clocks them while their own chip select is active. So a rig for
+// them provides what the app provides — where each pin of the part lands, and
+// a controller that clocks frames — through the real contracts of
+// simulation/buses/types.ts. Nothing here stands in for the part.
+
+/** Where a part pin is wired: a board pin, or a rail. */
+type RigPin = number | 'gnd' | 'vcc';
+
+interface SpiRig {
+  /** The controller clocks one frame; returns the MISO the guest reads back. */
+  xfer(mosi: number): number;
+  /** ...and several, in order. */
+  send(bytes: number[]): number[];
+  /** The MCU puts a level on one of its pins (chip select, D/C). */
+  write(pin: number, level: boolean): void;
+  /** The MCU was reset (Stop/Run). */
+  reset(): void;
+  dispose(): void;
+}
+
+const RIG_BOARD = 'rig-board';
+const RIG_SCK = 13;
+const RIG_MOSI = 11;
+const RIG_MISO = 12;
+
+/**
+ * One board with one SPI controller on pins 13/11/12, and a circuit in which
+ * `wiring` says where each pin of `componentId` lands.
+ */
+function spiRig(componentId: string, wiring: Record<string, RigPin>): SpiRig {
+  const levels = new Map<number, boolean>();
+  const listeners = new Map<number, Set<(p: number, l: boolean) => void>>();
+  const pins: BoardPins = {
+    onPinChange(pin, cb) {
+      let s = listeners.get(pin);
+      if (!s) listeners.set(pin, (s = new Set()));
+      s.add(cb);
+      return () => listeners.get(pin)?.delete(cb);
+    },
+    peekPinState: (pin) => levels.get(pin),
+  };
+
+  let handler: ((mosi: number, bits: number) => number) | null = null;
+  let onReset: (() => void) | null = null;
+  const port: SpiControllerPort = {
+    bus: 'spi',
+    unit: 0,
+    name: 'SPI',
+    setFrameHandler(h) {
+      handler = h;
+    },
+    config: () => ({ enabled: true, mode: 0, bitOrder: 'msb', bits: 8 }),
+    routing: () => ({ sck: RIG_SCK, mosi: RIG_MOSI, miso: RIG_MISO }),
+  };
+
+  const resolver: NetResolver = {
+    resolve(ref) {
+      if (ref.kind === 'board') return { kind: 'board', boardId: ref.boardId, pin: ref.pin };
+      if (ref.componentId !== componentId) return { kind: 'floating' };
+      const at = wiring[ref.pinName];
+      if (at === undefined) return { kind: 'floating' };
+      if (at === 'gnd' || at === 'vcc') return { kind: 'rail', rail: at };
+      return { kind: 'board', boardId: RIG_BOARD, pin: at };
+    },
+    boardKind: () => 'arduino-uno',
+    boards: () => [RIG_BOARD],
+  };
+
+  busRegistry.setResolver(resolver);
+  busRegistry.bindEngine(RIG_BOARD, {
+    pins,
+    spi: [port],
+    setResetHandler: (h) => {
+      onReset = h;
+    },
+  });
+
+  const rig: SpiRig = {
+    xfer: (mosi) => (handler ? handler(mosi, 8) : 0xff),
+    send: (bytes) => bytes.map((b) => rig.xfer(b)),
+    write(pin, level) {
+      const prev = levels.get(pin);
+      levels.set(pin, level);
+      if (prev !== level) for (const cb of listeners.get(pin) ?? []) cb(pin, level);
+    },
+    reset() {
+      levels.clear();
+      onReset?.();
+    },
+    dispose: () => busRegistry.clear(),
+  };
+  return rig;
+}
+
+// ─── The same board with an I2C controller (F5) ──────────────────────────────
+//
+// An I2C part is on the bus its SDA and SCL are wired to, like an SPI part on
+// its clock's: it registers with the fabric by its own pin names, and a
+// controller routed to that SDA net reaches it. The rig is that controller,
+// on SDA 18 / SCL 19 as on an Uno, driven the way a master drives the wire.
+
+const RIG_SDA = 18;
+const RIG_SCL = 19;
+
+interface I2cRig {
+  /** One write transaction: [address ACK, one ACK per byte]. */
+  write(addr: number, bytes: number[]): boolean[];
+  /** Point at `reg`, repeated START, read `n` bytes, STOP. Null on a NAK. */
+  readReg(addr: number, reg: number, n: number): number[] | null;
+  /** Whether anything ACKs the address (an I2C scanner's probe). */
+  ack(addr: number): boolean;
+  dispose(): void;
+}
+
+function i2cRig(wiring: Record<string, Record<string, RigPin>>): I2cRig {
+  let handler: I2cTransactionHandler | null = null;
+  const port: I2cControllerPort = {
+    bus: 'i2c',
+    unit: 0,
+    name: 'TWI',
+    setTransactionHandler(h) {
+      handler = h;
+    },
+    routing: () => ({ sda: RIG_SDA, scl: RIG_SCL }),
+  };
+  const resolver: NetResolver = {
+    resolve(ref) {
+      if (ref.kind === 'board') return { kind: 'board', boardId: ref.boardId, pin: ref.pin };
+      const at = wiring[ref.componentId]?.[ref.pinName];
+      if (at === undefined) return { kind: 'floating' };
+      if (at === 'gnd' || at === 'vcc') return { kind: 'rail', rail: at };
+      return { kind: 'board', boardId: RIG_BOARD, pin: at };
+    },
+    boardKind: () => 'arduino-uno',
+    boards: () => [RIG_BOARD],
+  };
+  busRegistry.setResolver(resolver);
+  busRegistry.bindEngine(RIG_BOARD, {
+    pins: { onPinChange: () => () => {}, peekPinState: () => undefined },
+    spi: [],
+    i2c: [port],
+  });
+  const bus = () => handler!;
+  return {
+    write(addr, bytes) {
+      const acks = [bus().start(addr, false)];
+      if (acks[0]) for (const b of bytes) acks.push(bus().write(b));
+      bus().stop();
+      return acks;
+    },
+    readReg(addr, reg, n) {
+      if (!bus().start(addr, false) || !bus().write(reg)) {
+        bus().stop();
+        return null;
+      }
+      if (!bus().start(addr, true)) {
+        bus().stop();
+        return null;
+      }
+      const out = Array.from({ length: n }, () => bus().read());
+      bus().stop();
+      return out;
+    },
+    ack(addr) {
+      const ok = bus().start(addr, false);
+      bus().stop();
+      return ok;
+    },
+    dispose: () => busRegistry.clear(),
+  };
+}
+
+const HW_I2C_PINS = { SDA: RIG_SDA, SCL: RIG_SCL };
+/** The 8-pin SSD1306 module in I2C mode: D1 (DATA) is SDA, D0 (CLK) is SCL. */
+const OLED_I2C_PINS = { DATA: RIG_SDA, CLK: RIG_SCL };
+
 /**
  * Simulator mock that triggers the ESP32 dual-path branch in ProtocolParts.
  *
@@ -163,54 +354,59 @@ describe('Protocol parts — registration', () => {
 // ─── ssd1306 ──────────────────────────────────────────────────────────────────
 
 describe('ssd1306 — I2C device', () => {
-  it('calls addI2CDevice with address 0x3C', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ssd1306')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-    expect(sim.addI2CDevice).toHaveBeenCalledOnce();
-    const device = sim.addI2CDevice.mock.calls[0][0];
-    expect(device.address).toBe(0x3c);
+  it('is on the bus its DATA/CLK are wired to, at 0x3C', () => {
+    const rig = i2cRig({ oled: OLED_I2C_PINS });
+    PartSimulationRegistry.get('ssd1306')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'oled');
+    expect(busRegistry.i2cPlacement('oled')).toEqual({
+      boardId: RIG_BOARD,
+      sdaPin: RIG_SDA,
+      sclPin: RIG_SCL,
+      clocked: true,
+    });
+    expect(rig.ack(0x3c)).toBe(true);
+    expect(rig.ack(0x3d)).toBe(false);
   });
 
-  it('cleanup calls removeDevice on i2cBus', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ssd1306')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins);
+  it('cleanup takes it off the bus', () => {
+    const rig = i2cRig({ oled: OLED_I2C_PINS });
+    const cleanup = PartSimulationRegistry.get('ssd1306')!.attachEvents!(
+      makeElement(),
+      makeI2CSim() as any,
+      noPins,
+      'oled',
+    );
     cleanup();
-    expect(sim.i2cBus.removeDevice).toHaveBeenCalledWith(0x3c);
+    expect(busRegistry.i2cPlacement('oled')).toBeNull();
+    expect(rig.ack(0x3c)).toBe(false);
   });
 
-  it('decodes horizontal addressing: write data bytes into buffer correctly', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ssd1306')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-    const device = sim.addI2CDevice.mock.calls[0][0];
-    // Set column address 0–127, page address 0–7 (via commands)
-    device.writeByte(0x00); // control: command stream
-    device.writeByte(0x21); // cmd: set column address
-    device.writeByte(0x00); // col start = 0
-    device.writeByte(0x7f); // col end   = 127
-    device.writeByte(0x22); // cmd: set page address
-    device.writeByte(0x00); // page start = 0
-    device.writeByte(0x07); // page end   = 7
-    device.stop(); // flushes command state
-
-    device.writeByte(0x40); // control: data stream
-    device.writeByte(0xab); // column 0 of page 0 = 0xAB
-    device.stop();
-
-    expect(device.buffer[0]).toBe(0xab);
+  it('an OLED whose SDA/SCL are not wired does not answer', () => {
+    const rig = i2cRig({});
+    PartSimulationRegistry.get('ssd1306')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'oled');
+    expect(busRegistry.i2cPlacement('oled')).toBeNull();
+    expect(rig.ack(0x3c)).toBe(false);
   });
 
-  it('readByte returns 0xFF (read not supported)', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ssd1306')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-    const device = sim.addI2CDevice.mock.calls[0][0];
-    expect(device.readByte()).toBe(0xff);
+  it('decodes horizontal addressing: write data bytes into the element', () => {
+    const rig = i2cRig({ oled: OLED_I2C_PINS });
+    const imageData = { width: 128, height: 64, data: new Uint8ClampedArray(128 * 64 * 4) };
+    const el = makeElement({ imageData, redraw: vi.fn() });
+    PartSimulationRegistry.get('ssd1306')!.attachEvents!(el, makeI2CSim() as any, noPins, 'oled');
+    // Command stream: column 0-127, page 0-7.
+    expect(rig.write(0x3c, [0x00, 0x21, 0x00, 0x7f, 0x22, 0x00, 0x07])).not.toContain(false);
+    // Data stream: column 0 of page 0 = 0xAB (bits 0, 1, 3, 5, 7 lit).
+    rig.write(0x3c, [0x40, 0xab]);
+    const px = (y: number) => (el as unknown as { imageData: ImageData }).imageData.data[y * 128 * 4];
+    expect([0, 1, 2, 3].map((y) => px(y) > 0)).toEqual([true, true, false, true]);
   });
 
-  it('no-op when simulator has no addI2CDevice', () => {
+  it('reads back 0xFF (a write-only panel drives nothing)', () => {
+    const rig = i2cRig({ oled: OLED_I2C_PINS });
+    PartSimulationRegistry.get('ssd1306')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'oled');
+    expect(rig.readReg(0x3c, 0x00, 1)).toEqual([0xff]);
+  });
+
+  it('no-op with no canvas identity', () => {
     const sim = { ...makeI2CSim(), addI2CDevice: undefined };
     const logic = PartSimulationRegistry.get('ssd1306')!;
     expect(() => {
@@ -224,32 +420,96 @@ describe('ssd1306 — I2C device', () => {
 
 describe('ssd1306 — protocol auto-detect', () => {
   it('runs I2C when neither CS nor DC is wired', () => {
+    i2cRig({ oled: OLED_I2C_PINS });
     const sim = makeI2CSim();
-    PartSimulationRegistry.get('ssd1306')!.attachEvents!(makeElement(), sim as any, noPins);
-    expect(sim.addI2CDevice).toHaveBeenCalledOnce();
-    expect(sim.spi).toBeNull();
+    PartSimulationRegistry.get('ssd1306')!.attachEvents!(makeElement(), sim as any, noPins, 'oled');
+    expect(busRegistry.i2cPlacement('oled')).not.toBeNull();
+    expect(busRegistry.placement('oled')).toBeNull();
   });
 
   it('runs SPI when CS is wired to a GPIO', () => {
-    const sim = makeSPISim();
-    PartSimulationRegistry.get('ssd1306')!.attachEvents!(
-      makeElement(),
-      sim as any,
-      pinMap({ CS: 5 }),
-    );
-    // SPI decoder hooks spi.onByte; the I2C path would call addI2CDevice instead.
-    expect(typeof sim.spi.onByte).toBe('function');
-    expect(sim.addI2CDevice).not.toHaveBeenCalled();
+    // The SPI path joins the board's SPI bus; the I2C one would call
+    // addI2CDevice. (It used to hook spi.onByte, the chain that F3 removed.)
+    const rig = spiRig('oled-spi', { CLK: RIG_SCK, DATA: RIG_MOSI, CS: 5 });
+    try {
+      const sim = makeSPISim();
+      PartSimulationRegistry.get('ssd1306')!.attachEvents!(
+        makeElement(),
+        sim as any,
+        pinMap({ CS: 5 }),
+        'oled-spi',
+      );
+      expect(busRegistry.placement('oled-spi')).toEqual({
+        boardId: RIG_BOARD,
+        sckPin: RIG_SCK,
+        selected: false,
+      });
+      expect(sim.addI2CDevice).not.toHaveBeenCalled();
+    } finally {
+      rig.dispose();
+    }
+  });
+
+  it('paints the frames clocked while its CS is low, and nothing else', () => {
+    // D/C already high when the part attaches (F0: spi-part-state-not-seeded-
+    // on-reattach), so every byte here is pixel data.
+    const rig = spiRig('oled-spi', { CLK: RIG_SCK, DATA: RIG_MOSI, CS: 5 });
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => frames.push(cb));
+    const flush = () => {
+      const due = frames.splice(0, frames.length);
+      for (const cb of due) cb(0);
+    };
+    const el = makeElement({
+      imageData: { width: 128, height: 64, data: new Uint8ClampedArray(128 * 64 * 4) },
+      redraw: vi.fn(),
+    });
+    const lit = () => {
+      const px = (el as unknown as { imageData: { data: Uint8ClampedArray } }).imageData.data;
+      let n = 0;
+      for (let i = 0; i < px.length; i += 4) if (px[i] !== 0) n++;
+      return n;
+    };
+    try {
+      const sim = {
+        ...makeSPISim(),
+        pinManager: { onPinChange: vi.fn().mockReturnValue(() => {}), peekPinState: () => true },
+      };
+      const cleanup = PartSimulationRegistry.get('ssd1306')!.attachEvents!(
+        el,
+        sim as any,
+        pinMap({ CS: 5, DC: 9 }),
+        'oled-spi',
+      )!;
+      // Somebody else's traffic, clocked while the panel is deselected. A
+      // write-only panel drives no MISO either: the line keeps its idle level.
+      rig.write(5, true);
+      expect(rig.send([0xff, 0xff])).toEqual([0xff, 0xff]);
+      flush();
+      expect(lit()).toBe(0);
+      // Its own: one column of eight pixels per byte.
+      rig.write(5, false);
+      rig.send([0xff, 0xff]);
+      flush();
+      expect(lit()).toBe(16);
+      cleanup();
+      expect(busRegistry.placement('oled-spi')).toBeNull();
+    } finally {
+      rig.dispose();
+    }
   });
 
   it('runs I2C when only DC is wired (DC is the I2C address-select, not SPI)', () => {
+    i2cRig({ oled: { ...OLED_I2C_PINS, DC: 4 } });
     const sim = makeI2CSim();
     PartSimulationRegistry.get('ssd1306')!.attachEvents!(
       makeElement(),
       sim as any,
       pinMap({ DC: 4 }),
+      'oled',
     );
-    expect(sim.addI2CDevice).toHaveBeenCalledOnce();
+    expect(busRegistry.i2cPlacement('oled')).not.toBeNull();
+    expect(busRegistry.placement('oled')).toBeNull();
   });
 
   it('honors an explicit protocol property (migrated legacy projects)', () => {
@@ -258,6 +518,7 @@ describe('ssd1306 — protocol auto-detect', () => {
     useSimulatorStore.setState({
       components: [{ id: 'oled-legacy', metadataId: 'ssd1306', properties: { protocol: 'spi' } }],
     } as any);
+    const rig = spiRig('oled-legacy', { CLK: RIG_SCK, DATA: RIG_MOSI });
     try {
       const sim = makeSPISim();
       PartSimulationRegistry.get('ssd1306')!.attachEvents!(
@@ -266,9 +527,16 @@ describe('ssd1306 — protocol auto-detect', () => {
         noPins,
         'oled-legacy',
       );
-      expect(typeof sim.spi.onByte).toBe('function');
-      expect(sim.addI2CDevice).not.toHaveBeenCalled();
+      // On the bus, and selected: a panel wired for SPI whose CS pad nobody
+      // drives is the only chip on that bus (csWhenFloating: 'selected').
+      expect(busRegistry.placement('oled-legacy')).toEqual({
+        boardId: RIG_BOARD,
+        sckPin: RIG_SCK,
+        selected: true,
+      });
+      expect(busRegistry.i2cPlacement('oled-legacy')).toBeNull();
     } finally {
+      rig.dispose();
       useSimulatorStore.setState({ components: [] } as any);
     }
   });
@@ -277,81 +545,107 @@ describe('ssd1306 — protocol auto-detect', () => {
 // ─── ds1307 ───────────────────────────────────────────────────────────────────
 
 describe('ds1307 — I2C RTC', () => {
-  it('calls addI2CDevice with address 0x68', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ds1307')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-    const dev = sim.addI2CDevice.mock.calls[0][0];
-    expect(dev.address).toBe(0x68);
+  it('answers at 0x68 on the bus it is wired to', () => {
+    const rig = i2cRig({ rtc: HW_I2C_PINS });
+    PartSimulationRegistry.get('ds1307')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'rtc');
+    expect(rig.ack(0x68)).toBe(true);
   });
 
-  it('readByte returns valid BCD for seconds (register 0)', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ds1307')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-    const dev = sim.addI2CDevice.mock.calls[0][0];
-    dev.writeByte(0x00); // set register pointer to 0 (seconds)
-    const seconds = dev.readByte();
+  it('returns valid BCD for seconds (register 0)', () => {
+    const rig = i2cRig({ rtc: HW_I2C_PINS });
+    PartSimulationRegistry.get('ds1307')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'rtc');
+    const [seconds] = rig.readReg(0x68, 0x00, 1)!;
     // BCD: upper nibble = tens digit, lower nibble = units digit
-    const tens = (seconds >> 4) & 0xf;
-    const units = seconds & 0xf;
-    expect(tens).toBeLessThanOrEqual(5);
-    expect(units).toBeLessThanOrEqual(9);
+    expect((seconds >> 4) & 0xf).toBeLessThanOrEqual(5);
+    expect(seconds & 0xf).toBeLessThanOrEqual(9);
   });
 
-  it('cleanup removes device from i2cBus', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ds1307')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins);
+  it('cleanup takes it off the bus', () => {
+    const rig = i2cRig({ rtc: HW_I2C_PINS });
+    const cleanup = PartSimulationRegistry.get('ds1307')!.attachEvents!(
+      makeElement(),
+      makeI2CSim() as any,
+      noPins,
+      'rtc',
+    );
     cleanup();
-    expect(sim.i2cBus.removeDevice).toHaveBeenCalledWith(0x68);
+    expect(rig.ack(0x68)).toBe(false);
   });
 });
 
 // ─── mpu6050 ──────────────────────────────────────────────────────────────────
 
 describe('mpu6050 — I2C IMU', () => {
-  it('calls addI2CDevice with address 0x68 (AD0=0)', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('mpu6050')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-    const dev = sim.addI2CDevice.mock.calls[0][0];
-    expect(dev.address).toBe(0x68);
+  it('answers at 0x68 with AD0 low', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imu');
+    expect([rig.ack(0x68), rig.ack(0x69)]).toEqual([true, false]);
   });
 
-  it('uses address 0x69 when element.ad0 is true', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('mpu6050')!;
-    logic.attachEvents!(makeElement({ ad0: true }), sim as any, noPins);
-    const dev = sim.addI2CDevice.mock.calls[0][0];
-    expect(dev.address).toBe(0x69);
+  it('answers at 0x69 when element.ad0 is true', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    PartSimulationRegistry.get('mpu6050')!.attachEvents!(
+      makeElement({ ad0: true }),
+      makeI2CSim() as any,
+      noPins,
+      'imu',
+    );
+    expect([rig.ack(0x68), rig.ack(0x69)]).toEqual([false, true]);
   });
 
   it('WHO_AM_I register (0x75) returns 0x68', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('mpu6050')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-    const dev = sim.addI2CDevice.mock.calls[0][0];
-    dev.writeByte(0x75); // set register pointer
-    expect(dev.readByte()).toBe(0x68);
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imu');
+    expect(rig.readReg(0x68, 0x75, 1)).toEqual([0x68]);
   });
 
   it('ACCEL_ZOUT reports +1g (0x40, 0x00)', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('mpu6050')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-    const dev = sim.addI2CDevice.mock.calls[0][0];
-    dev.writeByte(0x3f); // ACCEL_ZOUT_H
-    expect(dev.readByte()).toBe(0x40);
-    expect(dev.readByte()).toBe(0x00);
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imu');
+    expect(rig.readReg(0x68, 0x3f, 2)).toEqual([0x40, 0x00]);
   });
 
-  it('cleanup removes device', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('mpu6050')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins);
+  it('a repeated START for writing starts a new register pointer (no STOP in between)', () => {
+    // M5Unified reads an IMU id twice with no STOP between the two reads: the
+    // second pointer write must be taken as a pointer, not as data.
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imu');
+    const h = (busRegistry.fabric(RIG_BOARD).i2cBuses.get(RIG_SDA)!);
+    h.start(0x68, false);
+    h.write(0x75);
+    h.start(0x68, true);
+    expect(h.read()).toBe(0x68);
+    h.start(0x68, false);
+    h.write(0x75);
+    h.start(0x68, true);
+    expect(h.read()).toBe(0x68);
+    h.stop();
+    expect(rig.readReg(0x68, 0x75, 1)).toEqual([0x68]);
+  });
+
+  it('cleanup takes it off the bus', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    const cleanup = PartSimulationRegistry.get('mpu6050')!.attachEvents!(
+      makeElement(),
+      makeI2CSim() as any,
+      noPins,
+      'imu',
+    );
     cleanup();
-    expect(sim.i2cBus.removeDevice).toHaveBeenCalledWith(0x68);
+    expect(rig.ack(0x68)).toBe(false);
+  });
+
+  it('two IMUs at 0x68: deleting one leaves the other answering', () => {
+    const rig = i2cRig({ imuA: HW_I2C_PINS, imuB: HW_I2C_PINS });
+    const offA = PartSimulationRegistry.get('mpu6050')!.attachEvents!(
+      makeElement(),
+      makeI2CSim() as any,
+      noPins,
+      'imuA',
+    );
+    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imuB');
+    offA();
+    expect(rig.readReg(0x68, 0x75, 1)).toEqual([0x68]);
   });
 });
 
@@ -830,88 +1124,113 @@ describe('ir-remote — the handset', () => {
 // ─── microsd-card ─────────────────────────────────────────────────────────────
 
 describe('microsd-card — SPI init handshake', () => {
-  it('hooks into simulator.spi.onByte', () => {
-    const sim = makeSPISim();
-    const logic = PartSimulationRegistry.get('microsd-card')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-    expect(sim.spi.onByte).toBeTypeOf('function');
+  // The card is a responder on the bus fabric now: it is clocked through its
+  // board's SPI controller while its own chip select is low, and its answer is
+  // the MISO the guest reads back for that frame. (It used to take over
+  // spi.onByte and answer through completeTransfer, the chain F3 removed.)
+  const CS = 10;
+  function card(props: Record<string, unknown> = {}, wiring: Record<string, RigPin> = { CS }) {
+    const rig = spiRig('sd1', { SCK: RIG_SCK, DI: RIG_MOSI, DO: RIG_MISO, ...wiring });
+    const cleanup = PartSimulationRegistry.get('microsd-card')!.attachEvents!(
+      makeElement(props),
+      makeSPISim() as any,
+      noPins,
+      'sd1',
+    );
+    if (wiring.CS === CS) rig.write(CS, false); // the host selects the card
+    return { rig, cleanup, send: (bytes: number[]) => rig.send(bytes) };
+  }
+
+  it('joins the bus its wiring puts it on, and leaves it on cleanup', () => {
+    const { rig, cleanup } = card();
+    try {
+      expect(busRegistry.placement('sd1')).toEqual({
+        boardId: RIG_BOARD,
+        sckPin: RIG_SCK,
+        selected: true,
+      });
+      cleanup!();
+      expect(busRegistry.placement('sd1')).toBeNull();
+    } finally {
+      rig.dispose();
+    }
   });
 
   it('CMD0 (0x40 + 4 zeroes + CRC) returns R1=0x01 (idle)', () => {
-    const sim = makeSPISim();
-    const logic = PartSimulationRegistry.get('microsd-card')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-
-    const tx = sim.spi.onByte as (b: number) => void;
-    // Send CMD0: [0x40, 0x00, 0x00, 0x00, 0x00, 0x95]
-    [0x40, 0x00, 0x00, 0x00, 0x00, 0x95].forEach((b) => tx(b));
-    // Poll with 0xFF to receive response
-    tx(0xff);
-    const replies = (sim.spi.completeTransfer as ReturnType<typeof vi.fn>).mock.calls.map(
-      ([v]) => v,
-    );
-    expect(replies).toContain(0x01);
+    const { rig, send } = card();
+    try {
+      // The command, then the 0xFF clocks the host sends to read the answer.
+      const replies = [...send([0x40, 0x00, 0x00, 0x00, 0x00, 0x95]), ...send([0xff, 0xff])];
+      expect(replies).toContain(0x01);
+    } finally {
+      rig.dispose();
+    }
   });
 
   it('CMD8 returns R7 with echo-back 0x1AA', () => {
-    const sim = makeSPISim();
-    const logic = PartSimulationRegistry.get('microsd-card')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-
-    const tx = sim.spi.onByte as (b: number) => void;
-    // CMD8: [0x48, 0x00, 0x00, 0x01, 0xAA, 0x87]
-    [0x48, 0x00, 0x00, 0x01, 0xaa, 0x87].forEach((b) => tx(b));
-    // Read 5 bytes of R7 response
-    for (let i = 0; i < 5; i++) tx(0xff);
-    const replies = (sim.spi.completeTransfer as ReturnType<typeof vi.fn>).mock.calls.map(
-      ([v]) => v,
-    );
-    // R7 = 0x01, 0x00, 0x00, 0x01, 0xAA
-    expect(replies).toContain(0x01);
-    expect(replies).toContain(0xaa);
+    const { rig, send } = card();
+    try {
+      send([0x48, 0x00, 0x00, 0x01, 0xaa, 0x87]);
+      const replies = send([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+      // R7 = 0x01, 0x00, 0x00, 0x01, 0xAA, behind the N_CR fill byte.
+      expect(replies).toContain(0x01);
+      expect(replies).toContain(0xaa);
+    } finally {
+      rig.dispose();
+    }
   });
 
   it('ACMD41 (CMD55 + CMD41) returns R1=0x00 (ready)', () => {
-    const sim = makeSPISim();
-    const logic = PartSimulationRegistry.get('microsd-card')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-
-    const tx = sim.spi.onByte as (b: number) => void;
-    [0x77, 0x00, 0x00, 0x00, 0x00, 0x65].forEach((b) => tx(b)); // CMD55
-    tx(0xff); // poll
-    sim.spi.completeTransfer.mockClear();
-    [0x69, 0x40, 0x00, 0x00, 0x00, 0x77].forEach((b) => tx(b)); // ACMD41
-    tx(0xff);
-    const replies = (sim.spi.completeTransfer as ReturnType<typeof vi.fn>).mock.calls.map(
-      ([v]) => v,
-    );
-    expect(replies).toContain(0x00);
+    const { rig, send } = card();
+    try {
+      send([0x77, 0x00, 0x00, 0x00, 0x00, 0x65]); // CMD55
+      send([0xff, 0xff]); // poll
+      send([0x69, 0x40, 0x00, 0x00, 0x00, 0x77]); // ACMD41
+      expect(send([0xff, 0xff])).toContain(0x00);
+    } finally {
+      rig.dispose();
+    }
   });
 
   it('0xFF clock bytes return 0xFF (idle) when no pending response', () => {
-    const sim = makeSPISim();
-    const logic = PartSimulationRegistry.get('microsd-card')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
-
-    const tx = sim.spi.onByte as (b: number) => void;
-    tx(0xff);
-    expect(sim.spi.completeTransfer).toHaveBeenLastCalledWith(0xff);
+    const { rig, send } = card();
+    try {
+      expect(send([0xff])).toEqual([0xff]);
+    } finally {
+      rig.dispose();
+    }
   });
 
-  it('cleanup restores previous onByte and is callable without SPI', () => {
-    const sim = makeSPISim();
-    const logic = PartSimulationRegistry.get('microsd-card')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins);
-    expect(() => cleanup()).not.toThrow();
-    expect(sim.spi.onByte).toBeNull();
+  it('answers nothing at all while its chip select is high', () => {
+    const { rig, send } = card();
+    try {
+      rig.write(CS, true);
+      // Another chip's command, clocked on the same wires.
+      expect(send([0x40, 0x00, 0x00, 0x00, 0x00, 0x95, 0xff, 0xff])).toEqual(new Array(8).fill(0xff));
+      // And the card did not take it as its own: it is still waiting for a
+      // command when the host comes back for it.
+      rig.write(CS, false);
+      expect([...send([0x40, 0x00, 0x00, 0x00, 0x00, 0x95]), ...send([0xff, 0xff])]).toContain(0x01);
+    } finally {
+      rig.dispose();
+    }
   });
 
-  it('no-op when simulator has no spi', () => {
-    const sim = { ...makeSPISim(), spi: null };
+  it('a card whose CS nothing drives stays quiet (its DAT3 pull-up deselects it)', () => {
+    const { rig, send } = card({}, {});
+    try {
+      expect(busRegistry.placement('sd1')?.selected).toBe(false);
+      expect(send([0x40, 0x00, 0x00, 0x00, 0x00, 0x95, 0xff, 0xff])).toEqual(new Array(8).fill(0xff));
+    } finally {
+      rig.dispose();
+    }
+  });
+
+  it('cleanup is callable with no board on the other side', () => {
     const logic = PartSimulationRegistry.get('microsd-card')!;
     expect(() => {
-      const c = logic.attachEvents!(makeElement(), sim as any, noPins);
-      c();
+      const c = logic.attachEvents!(makeElement(), makeSPISim() as any, noPins, 'sd-nowhere');
+      c!();
     }).not.toThrow();
   });
 });
@@ -924,98 +1243,121 @@ describe('microsd-card — SPI init handshake', () => {
 
 // NOTE: 0x3C = 60 decimal → virtual pin = 200 + 60 = 260
 describe('ssd1306 — ESP32 relay path', () => {
-  it('registers sensor with type ssd1306 and virtual pin 260 (200+0x3C)', () => {
+  it('registers a worker record under its own slot, with its address and owner', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ssd1306')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
+    PartSimulationRegistry.get('ssd1306')!.attachEvents!(makeElement(), sim as any, noPins, 'oled-q1');
     expect(sim.registerSensor).toHaveBeenCalledWith(
       'ssd1306',
-      260,
-      expect.objectContaining({ addr: 0x3c }),
+      i2cPartWorkerPin('oled-q1'),
+      expect.objectContaining({ addr: 0x3c, owner: 'oled-q1' }),
     );
   });
 
   it('adds I2C transaction listener for addr 0x3C', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ssd1306')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
+    PartSimulationRegistry.get('ssd1306')!.attachEvents!(makeElement(), sim as any, noPins, 'oled-q2');
     expect(sim.addI2CTransactionListener).toHaveBeenCalledWith(0x3c, expect.any(Function));
   });
 
   it('transaction data is forwarded to VirtualSSD1306 device', () => {
     const el = makeElement();
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ssd1306')!;
-    logic.attachEvents!(el, sim as any, noPins);
+    PartSimulationRegistry.get('ssd1306')!.attachEvents!(el, sim as any, noPins, 'oled-q3');
     // Send a command-mode control byte + set-page command — should not throw
     expect(() => {
       sim._fireTransaction(0x3c, [0x00, 0xb0]);
     }).not.toThrow();
   });
 
-  it('cleanup calls unregisterSensor(260) and removeI2CTransactionListener(0x3C)', () => {
+  it('cleanup unregisters its record and removes the listener', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ssd1306')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins);
+    const cleanup = PartSimulationRegistry.get('ssd1306')!.attachEvents!(
+      makeElement(),
+      sim as any,
+      noPins,
+      'oled-q4',
+    );
     cleanup();
-    expect(sim.unregisterSensor).toHaveBeenCalledWith(260);
+    expect(sim.unregisterSensor).toHaveBeenCalledWith(i2cPartWorkerPin('oled-q4'));
     expect(sim.removeI2CTransactionListener).toHaveBeenCalledWith(0x3c);
+  });
+
+  it('a board whose engine runs in the tab gets no worker record', () => {
+    // An in-browser ESP32 engine answers the part from the fabric; a record
+    // would file a stub that ACKs the address whatever the wiring.
+    const sim = { ...makeEsp32Sim(), hostsCustomChips: () => false };
+    PartSimulationRegistry.get('ssd1306')!.attachEvents!(makeElement(), sim as any, noPins, 'oled-q5');
+    expect(sim.registerSensor).not.toHaveBeenCalled();
+    expect(sim.addI2CTransactionListener).not.toHaveBeenCalled();
   });
 });
 
 // ─── ds1307 — ESP32 path ──────────────────────────────────────────────────────
 
 describe('ds1307 — ESP32 path', () => {
-  it('registers sensor with type ds1307 and virtual pin 304 (200+0x68)', () => {
+  it('registers a worker record under its own slot at 0x68', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ds1307')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
+    PartSimulationRegistry.get('ds1307')!.attachEvents!(makeElement(), sim as any, noPins, 'rtc-q1');
     expect(sim.registerSensor).toHaveBeenCalledWith(
       'ds1307',
-      304,
-      expect.objectContaining({ addr: 0x68 }),
+      i2cPartWorkerPin('rtc-q1'),
+      expect.objectContaining({ addr: 0x68, owner: 'rtc-q1' }),
     );
   });
 
   it('does NOT add I2C transaction listener (read-only: backend handles reads)', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ds1307')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
+    PartSimulationRegistry.get('ds1307')!.attachEvents!(makeElement(), sim as any, noPins, 'rtc-q2');
     expect(sim.addI2CTransactionListener).not.toHaveBeenCalled();
   });
 
-  it('cleanup calls unregisterSensor(304)', () => {
+  it('cleanup unregisters its own record', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ds1307')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins);
+    const cleanup = PartSimulationRegistry.get('ds1307')!.attachEvents!(
+      makeElement(),
+      sim as any,
+      noPins,
+      'rtc-q3',
+    );
     cleanup();
-    expect(sim.unregisterSensor).toHaveBeenCalledWith(304);
+    expect(sim.unregisterSensor).toHaveBeenCalledWith(i2cPartWorkerPin('rtc-q3'));
   });
 });
 
 // ─── bmp280 — ESP32 path ──────────────────────────────────────────────────────
 
 describe('bmp280 — ESP32 path', () => {
-  it('registers sensor with type bmp280 and virtual pin 318 (200+0x76)', () => {
+  it('registers a worker record under its own slot at 0x76', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('bmp280')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins, 'bmp-esp-1');
+    PartSimulationRegistry.get('bmp280')!.attachEvents!(makeElement(), sim as any, noPins, 'bmp-esp-1');
     expect(sim.registerSensor).toHaveBeenCalledWith(
       'bmp280',
-      318,
-      expect.objectContaining({ addr: 0x76 }),
+      i2cPartWorkerPin('bmp-esp-1'),
+      expect.objectContaining({ addr: 0x76, owner: 'bmp-esp-1' }),
     );
   });
 
-  it('uses virtual pin 319 (200+0x77) when address is 0x77', () => {
+  it('carries address 0x77 when the element says so', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('bmp280')!;
-    logic.attachEvents!(makeElement({ address: '0x77' }), sim as any, noPins, 'bmp-esp-2');
+    PartSimulationRegistry.get('bmp280')!.attachEvents!(
+      makeElement({ address: '0x77' }),
+      sim as any,
+      noPins,
+      'bmp-esp-2',
+    );
     expect(sim.registerSensor).toHaveBeenCalledWith(
       'bmp280',
-      319,
+      i2cPartWorkerPin('bmp-esp-2'),
       expect.objectContaining({ addr: 0x77 }),
     );
+  });
+
+  it('two sensors at one address are two records', () => {
+    const sim = makeEsp32Sim();
+    PartSimulationRegistry.get('bmp280')!.attachEvents!(makeElement(), sim as any, noPins, 'bmp-esp-7');
+    PartSimulationRegistry.get('bmp280')!.attachEvents!(makeElement(), sim as any, noPins, 'bmp-esp-8');
+    const pins = sim.registerSensor.mock.calls.map((c: unknown[]) => c[1]);
+    expect(new Set(pins).size).toBe(2);
   });
 
   it('forwards initial temperature from element.temperature', () => {
@@ -1040,7 +1382,7 @@ describe('bmp280 — ESP32 path', () => {
     logic.attachEvents!(makeElement(), sim as any, noPins, 'bmp-esp-5');
     dispatchSensorUpdate('bmp-esp-5', { temperature: 40, pressure: 950 });
     expect(sim.updateSensor).toHaveBeenCalledWith(
-      318,
+      i2cPartWorkerPin('bmp-esp-5'),
       expect.objectContaining({ temperature: 40 }),
     );
   });
@@ -1050,7 +1392,7 @@ describe('bmp280 — ESP32 path', () => {
     const logic = PartSimulationRegistry.get('bmp280')!;
     const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins, 'bmp-esp-6');
     cleanup();
-    expect(sim.unregisterSensor).toHaveBeenCalledWith(318);
+    expect(sim.unregisterSensor).toHaveBeenCalledWith(i2cPartWorkerPin('bmp-esp-6'));
     // After cleanup, dispatching an update must NOT call updateSensor again
     sim.updateSensor.mockClear();
     dispatchSensorUpdate('bmp-esp-6', { temperature: 99 });
@@ -1061,102 +1403,108 @@ describe('bmp280 — ESP32 path', () => {
 // ─── ds3231 — ESP32 path ──────────────────────────────────────────────────────
 
 describe('ds3231 — ESP32 path', () => {
-  it('registers sensor with type ds3231 and virtual pin 304 (200+0x68)', () => {
+  it('registers a worker record under its own slot at 0x68', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ds3231')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
+    PartSimulationRegistry.get('ds3231')!.attachEvents!(makeElement(), sim as any, noPins, 'ds-q1');
     expect(sim.registerSensor).toHaveBeenCalledWith(
       'ds3231',
-      304,
-      expect.objectContaining({ addr: 0x68 }),
+      i2cPartWorkerPin('ds-q1'),
+      expect.objectContaining({ addr: 0x68, owner: 'ds-q1' }),
     );
   });
 
   it('forwards initial temperature from element.temperature', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ds3231')!;
-    logic.attachEvents!(makeElement({ temperature: '28.5' }), sim as any, noPins);
+    PartSimulationRegistry.get('ds3231')!.attachEvents!(
+      makeElement({ temperature: '28.5' }),
+      sim as any,
+      noPins,
+      'ds-q2',
+    );
     const [, , props] = sim.registerSensor.mock.calls[0];
     expect(props.temperature).toBeCloseTo(28.5);
   });
 
-  it('cleanup calls unregisterSensor(304)', () => {
+  it('cleanup unregisters its own record', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('ds3231')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins);
+    const cleanup = PartSimulationRegistry.get('ds3231')!.attachEvents!(
+      makeElement(),
+      sim as any,
+      noPins,
+      'ds-q3',
+    );
     cleanup();
-    expect(sim.unregisterSensor).toHaveBeenCalledWith(304);
+    expect(sim.unregisterSensor).toHaveBeenCalledWith(i2cPartWorkerPin('ds-q3'));
   });
 });
 
-// ─── ds3231 — AVR / RP2040 path ───────────────────────────────────────────────
+// ─── ds3231 — on a board whose firmware runs in the tab ───────────────────────
 
 describe('ds3231 — AVR/RP2040 path', () => {
-  it('adds an I2C device at 0x68 seeded with element.temperature', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ds3231')!;
-    logic.attachEvents!(makeElement({ temperature: '31.25' }), sim as any, noPins, 'ds3231-avr-1');
-    expect(sim.addI2CDevice).toHaveBeenCalledOnce();
-    const dev = sim.addI2CDevice.mock.calls[0][0];
-    expect(dev.address).toBe(0x68);
-    expect(dev.temperatureC).toBeCloseTo(31.25);
+  const tempRegs = (rig: I2cRig) => rig.readReg(0x68, 0x11, 2)!;
+
+  it('answers at 0x68 seeded with element.temperature', () => {
+    const rig = i2cRig({ 'ds3231-avr-1': HW_I2C_PINS });
+    PartSimulationRegistry.get('ds3231')!.attachEvents!(
+      makeElement({ temperature: '31.25' }),
+      makeI2CSim() as any,
+      noPins,
+      'ds3231-avr-1',
+    );
+    expect(tempRegs(rig)).toEqual([31, 0b01 << 6]);
   });
 
   it('SensorControlPanel updates reach the virtual device live', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ds3231')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins, 'ds3231-avr-2');
-    const dev = sim.addI2CDevice.mock.calls[0][0];
-    expect(dev.temperatureC).toBeCloseTo(25.0);
-
-    dispatchSensorUpdate('ds3231-avr-2', { temperature: -7.5 });
-    expect(dev.temperatureC).toBeCloseTo(-7.5);
-
-    // After cleanup the registry entry is gone — updates no longer land.
+    const rig = i2cRig({ 'ds3231-avr-2': HW_I2C_PINS });
+    const cleanup = PartSimulationRegistry.get('ds3231')!.attachEvents!(
+      makeElement(),
+      makeI2CSim() as any,
+      noPins,
+      'ds3231-avr-2',
+    );
+    expect(tempRegs(rig)[0]).toBe(25);
+    dispatchSensorUpdate('ds3231-avr-2', { temperature: 30 });
+    expect(tempRegs(rig)[0]).toBe(30);
     cleanup();
-    dispatchSensorUpdate('ds3231-avr-2', { temperature: 60 });
-    expect(dev.temperatureC).toBeCloseTo(-7.5);
+    expect(rig.ack(0x68)).toBe(false);
   });
 
   it('temperature registers 0x11/0x12 encode integer + quarter-degree fraction', () => {
-    const sim = makeI2CSim();
-    const logic = PartSimulationRegistry.get('ds3231')!;
-    logic.attachEvents!(makeElement({ temperature: '25.75' }), sim as any, noPins, 'ds3231-avr-3');
-    const dev = sim.addI2CDevice.mock.calls[0][0];
+    const rig = i2cRig({ 'ds3231-avr-3': HW_I2C_PINS });
+    PartSimulationRegistry.get('ds3231')!.attachEvents!(
+      makeElement({ temperature: '25.75' }),
+      makeI2CSim() as any,
+      noPins,
+      'ds3231-avr-3',
+    );
     // Point at 0x11 and read MSB + LSB like RTClib's getTemperature().
-    dev.writeByte(0x11);
-    dev.stop();
-    expect(dev.readByte()).toBe(25); // integer °C
-    expect(dev.readByte()).toBe(0b11 << 6); // 0.75 °C = 3 quarter-steps in bits 7:6
+    expect(tempRegs(rig)).toEqual([25, 0b11 << 6]); // 0.75 °C = 3 quarter-steps in bits 7:6
   });
 });
 
 // ─── pcf8574 — ESP32 relay path ───────────────────────────────────────────────
 
 describe('pcf8574 — ESP32 relay path', () => {
-  it('registers sensor with type pcf8574 and virtual pin 239 (200+0x27)', () => {
+  it('registers a worker record under its own slot at 0x27', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('pcf8574')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
+    PartSimulationRegistry.get('pcf8574')!.attachEvents!(makeElement(), sim as any, noPins, 'pcf-q1');
     expect(sim.registerSensor).toHaveBeenCalledWith(
       'pcf8574',
-      239,
-      expect.objectContaining({ addr: 0x27 }),
+      i2cPartWorkerPin('pcf-q1'),
+      expect.objectContaining({ addr: 0x27, owner: 'pcf-q1' }),
     );
   });
 
   it('adds I2C transaction listener for addr 0x27', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('pcf8574')!;
-    logic.attachEvents!(makeElement(), sim as any, noPins);
+    PartSimulationRegistry.get('pcf8574')!.attachEvents!(makeElement(), sim as any, noPins, 'pcf-q2');
     expect(sim.addI2CTransactionListener).toHaveBeenCalledWith(0x27, expect.any(Function));
   });
 
   it('transaction byte is forwarded to VirtualPCF8574 — onWrite fires', () => {
     const el = makeElement();
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('pcf8574')!;
-    logic.attachEvents!(el, sim as any, noPins);
+    PartSimulationRegistry.get('pcf8574')!.attachEvents!(el, sim as any, noPins, 'pcf-q3');
     // Fire a transaction: MCU wrote byte 0xAB to I2C address 0x27
     sim._fireTransaction(0x27, [0xab]);
     expect((el as any).value).toBe(0xab);
@@ -1165,34 +1513,39 @@ describe('pcf8574 — ESP32 relay path', () => {
   it('transaction at different address does NOT update element', () => {
     const el = makeElement();
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('pcf8574')!;
-    logic.attachEvents!(el, sim as any, noPins);
+    PartSimulationRegistry.get('pcf8574')!.attachEvents!(el, sim as any, noPins, 'pcf-q4');
     sim._fireTransaction(0x20, [0xff]); // wrong address
     expect((el as any).value).toBeUndefined();
   });
 
-  it('cleanup calls unregisterSensor(239) and removeI2CTransactionListener(0x27)', () => {
+  it('cleanup unregisters its record and removes the listener', () => {
     const sim = makeEsp32Sim();
-    const logic = PartSimulationRegistry.get('pcf8574')!;
-    const cleanup = logic.attachEvents!(makeElement(), sim as any, noPins);
+    const cleanup = PartSimulationRegistry.get('pcf8574')!.attachEvents!(
+      makeElement(),
+      sim as any,
+      noPins,
+      'pcf-q5',
+    );
     cleanup();
-    expect(sim.unregisterSensor).toHaveBeenCalledWith(239);
+    expect(sim.unregisterSensor).toHaveBeenCalledWith(i2cPartWorkerPin('pcf-q5'));
     expect(sim.removeI2CTransactionListener).toHaveBeenCalledWith(0x27);
   });
 });
 
 // ─── microSD card — SD-over-SPI storage (Phase 1) ───────────────────────────────
 describe('microsd-card — SD-over-SPI storage', () => {
+  const CS = 10;
+  /** A card selected on the rig's bus; `replies` collects every MISO byte. */
   function setupSD(props: Record<string, unknown> = {}) {
-    const sim = makeSPISim();
-    const replies: number[] = [];
-    sim.spi.completeTransfer = vi.fn((r: number) => replies.push(r));
+    const rig = spiRig('sd1', { SCK: RIG_SCK, DI: RIG_MOSI, DO: RIG_MISO, CS });
     const logic = PartSimulationRegistry.get('microsd-card')!;
-    const cleanup = logic.attachEvents!(makeElement(props), sim as any, noPins);
+    const cleanup = logic.attachEvents!(makeElement(props), makeSPISim() as any, noPins, 'sd1');
+    rig.write(CS, false);
+    const replies: number[] = [];
     const send = (bytes: number[]) => {
-      for (const b of bytes) sim.spi.onByte!(b);
+      for (const b of rig.send(bytes)) replies.push(b);
     };
-    return { sim, replies, send, cleanup };
+    return { rig, replies, send, cleanup };
   }
 
   const cmd = (index: number, arg = 0): number[] => [
@@ -1219,23 +1572,24 @@ describe('microsd-card — SD-over-SPI storage', () => {
 
   it('init handshake: CMD0/CMD8/ACMD41/CMD58 give the expected R1/R7/OCR', () => {
     const { send, replies } = setupSD();
-    // 1-byte Ncr latency: the response is shifted out AFTER the 6 command bytes,
-    // so R1 lands on the first 0xFF clock (index 6), not the last command byte.
+    // N_CR: nothing comes back on the 6 command bytes, then the card clocks
+    // out one fill byte (index 6) and its response from index 7. SdFat throws
+    // that fill byte away before it polls, which is why it has to be there.
     const after = (c: number[], extra: number) => {
       replies.length = 0;
       send(c);
-      send(FF(extra));
+      send(FF(extra + 1));
     };
     after(cmd(0), 1);
-    expect(replies[6]).toBe(0x01); // idle
+    expect(replies.slice(6, 8)).toEqual([0xff, 0x01]); // fill, then idle
     after(cmd(8, 0x1aa), 5);
-    expect(replies.slice(6, 11)).toEqual([0x01, 0x00, 0x00, 0x01, 0xaa]); // R7
+    expect(replies.slice(6, 12)).toEqual([0xff, 0x01, 0x00, 0x00, 0x01, 0xaa]); // R7
     after(cmd(55), 1);
-    expect(replies[6]).toBe(0x01);
+    expect(replies[7]).toBe(0x01);
     after(cmd(41), 1);
-    expect(replies[6]).toBe(0x00); // ACMD41 ready
+    expect(replies[7]).toBe(0x00); // ACMD41 ready
     after(cmd(58), 5);
-    expect(replies.slice(6, 11)).toEqual([0x00, 0x80, 0xff, 0x80, 0x00]); // OCR (SDSC)
+    expect(replies.slice(7, 12)).toEqual([0x00, 0x80, 0xff, 0x80, 0x00]); // OCR (SDSC)
   });
 
   it('writes a block (CMD24 + data) and reads it back identically (CMD17)', () => {
@@ -1282,6 +1636,35 @@ describe('microsd-card — SD-over-SPI storage', () => {
     send(cmd(25, at(10))); // write starting at block 10
     send([0xfc, ...a, 0xff, 0xff]); // block 10 (multi data token 0xFC)
     send([0xfc, ...b, 0xff, 0xff]); // block 11
+    send([0xfd]); // stop-transmission token
+    expect(readSdBlock(send, replies, 10)).toEqual(a);
+    expect(readSdBlock(send, replies, 11)).toEqual(b);
+  });
+
+  it('multi-block write survives the chip select SdFat drops between blocks', () => {
+    // SdFat's SharedSpiCard (arduino-pico's SD.h, and every build whose bus is
+    // shared) releases CS between writeStart, each writeData and writeStop, so
+    // the card meets the 0xFC token of the next block in a NEW transaction and
+    // has to still be in its data phase. Ending the whole transfer on deselect
+    // sent that token, and then 512 bytes of user data, through the command
+    // parser.
+    const { rig, send, replies } = setupSD();
+    const a = Array.from({ length: 512 }, (_, i) => (i + 1) & 0xff);
+    const b = Array.from({ length: 512 }, (_, i) => (i + 2) & 0xff);
+    const cycleCs = () => {
+      rig.write(CS, true);
+      rig.write(CS, false);
+    };
+    send(cmd(25, at(10)));
+    send(FF(4)); // R1
+    cycleCs();
+    send([0xff, 0xfc, ...a, 0xff, 0xff]); // block 10, its own transaction
+    send(FF(4));
+    expect(replies).toContain(0x05); // data-response: accepted
+    cycleCs();
+    send([0xff, 0xfc, ...b, 0xff, 0xff]); // block 11
+    send(FF(4));
+    cycleCs();
     send([0xfd]); // stop-transmission token
     expect(readSdBlock(send, replies, 10)).toEqual(a);
     expect(readSdBlock(send, replies, 11)).toEqual(b);

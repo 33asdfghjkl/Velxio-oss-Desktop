@@ -171,3 +171,4 @@ For a Velxio-native part:
 - [Component metadata generator](./wiki/component-metadata-generator.md) — Pipeline internals
 - [E-Paper Emulation](./wiki/epaper-emulation.md) — Waveshare panel driver
 - [Component interaction](./wiki/component-interaction.md) — How clicks, drags, and pin events flow
+- [Board buses part author guide](./wiki/board-buses-part-authoring.md): Writing a part that talks SPI, I2C or UART

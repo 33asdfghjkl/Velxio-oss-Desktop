@@ -1,35 +1,58 @@
 /**
- * GpsParts.ts — Simulation for the u-blox NEO-6M GPS module.
+ * GpsParts.ts: the u-blox NEO-6M GPS module, and the bricks that borrow it
+ * (the Grove SIM28 and Air530Z alias this logic).
  *
- * The NEO-6M is a UART talker: it EMITS an NMEA-0183 stream at 9600 baud
- * out of its TX pin, once per second. This part synthesises a valid
- * GPGGA + GPRMC cycle (correct checksums, position from the element's
- * lat/lng/altitude/speed properties, UTC time that advances 1 s per cycle)
- * and pushes it into whatever the TX pin is wired to:
+ * A GNSS receiver is a UART talker: it computes a fix and prints an NMEA-0183
+ * cycle (GPGGA + GPRMC, correct checksums, position from the element's
+ * lat/lng/altitude/speed/course, UTC that advances one second per cycle) out
+ * of its TX pin at 9600 baud, once a second, and never listens. So the module
+ * is a UART endpoint of the bus fabric (project board-buses-2026-09, F6) with
+ * a TX leg and no RX leg. The fabric walks the wire from the TX pad to
+ * whichever board pin it reaches and decides what is there:
  *
- *   1. Hardware UART RX pin  → byte-level injection through the uniform
- *      `sim.feedUart(uart, data)` seam (AVR USART0, RP2040 uart0/1,
- *      ESP32 uart0/2 via the backend QEMU bridge, STM32 USART1/2), with
- *      `sim.serialWrite` as a uart-0 fallback for sims without feedUart.
- *   2. Any other digital pin on a cycle-accurate sim (AVR) → real 8N1
- *      bit-banged waveform via `schedulePinChange`, so SoftwareSerial
- *      (the classic NEO-6M wiring in Arduino tutorials) decodes it.
+ *   - a hardware UART's RX (Uno D0, Mega RX1, ESP32 RX2, the pins a sketch
+ *     moved Serial1 to): the bytes go into that controller's port;
+ *   - a plain GPIO the sketch samples itself (SoftwareSerial, the wiring of
+ *     every NEO-6M tutorial): the fabric's software emitter puts each frame on
+ *     the pin as edges at exact guest instants;
+ *   - the board's own TX pin: two drivers on one wire, reported as
+ *     uart-tx-contention, and the board hears nothing;
+ *   - nothing: the module is on no wire, and no byte reaches any UART.
  *
- * Byte-level injection is paced at ~9600 baud in wall-clock chunks so
- * small RX FIFOs (rp2040js PL011 = 32 bytes) never overflow: the sketch
- * gets simulated time to drain between chunks.
+ * Nothing here classifies pins, picks a UART or falls back to UART0: a module
+ * on a pin no table knew used to answer on the console, and now it is on
+ * whatever wire its TX pad reaches.
  *
- * Defaults: 40.4168 N, 3.7038 W (Madrid), 667 m — overridable via the
- * property dialog and live via the SensorControlPanel.
+ * Time is the GUEST's. The cycle cadence and the byte spacing are measured on
+ * the clock the sketch sees (guestMillis: the cycle counter on AVR/RP2040, the
+ * engine's virtual clock on the in-browser ESP32s), never on the browser's: an
+ * emulated board under load runs a fraction of real time, and a stream paced
+ * on the wall clock would flood its FIFO and overrun the sketch's parser. The
+ * bytes of a cycle leave one character time apart (10 bits at 9600 baud), as
+ * the silicon shifts them out: a 128-byte RX FIFO never sees a whole cycle
+ * land in one instant. Only the DATE the receiver reports is taken from the
+ * host once, at attach: satellites tell a receiver the real UTC, and the guest
+ * has no calendar to ask.
  */
 
 import { PartSimulationRegistry } from './PartSimulationRegistry';
 import { registerSensorUpdate, unregisterSensorUpdate } from '../SensorUpdateRegistry';
-import { useSimulatorStore } from '../../store/useSimulatorStore';
-import { classifyPin } from '../../utils/boardProtocols';
-import { isBoardComponent } from '../../utils/boardPinMapping';
+import { attachUartEndpoint } from '../buses';
+import { guestMillis } from './partUtils';
 
 export const GPS_BAUD = 9600;
+
+/** Wall-clock poll of the guest clock: one cycle a second at 9600 baud needs no finer step. */
+export const GPS_TICK_MS = 20;
+
+/** One 8N1 character at GPS_BAUD, in milliseconds of guest time. */
+export const GPS_BYTE_MS = (1000 * 10) / GPS_BAUD;
+
+/** Guest milliseconds between two NMEA cycles (1 Hz, the NEO-6M default). */
+export const GPS_CYCLE_MS = 1000;
+
+/** How long the PPS marker stays lit after a cycle, in guest milliseconds. */
+export const GPS_PPS_MS = 120;
 
 // ─── NMEA sentence builders (exported for tests) ─────────────────────────────
 
@@ -47,7 +70,7 @@ export function nmeaSentence(body: string): string {
 
 const pad2 = (n: number) => String(Math.trunc(Math.abs(n))).padStart(2, '0');
 
-/** Decimal degrees → NMEA ddmm.mmmmm (lat) / dddmm.mmmmm (lon) + hemisphere. */
+/** Decimal degrees to NMEA ddmm.mmmmm (lat) / dddmm.mmmmm (lon) + hemisphere. */
 export function formatNmeaCoord(
   decimalDegrees: number,
   axis: 'lat' | 'lon',
@@ -81,7 +104,7 @@ export interface GpsFix {
   course: number;
 }
 
-/** GGA — fix data: time, position, fix quality 1 (GPS), 7 sats, altitude. */
+/** GGA, fix data: time, position, fix quality 1 (GPS), 7 sats, altitude. */
 export function buildGpgga(date: Date, fix: GpsFix): string {
   const lat = formatNmeaCoord(fix.lat, 'lat');
   const lon = formatNmeaCoord(fix.lng, 'lon');
@@ -91,7 +114,7 @@ export function buildGpgga(date: Date, fix: GpsFix): string {
   return nmeaSentence(body);
 }
 
-/** RMC — recommended minimum: time, status A, position, speed, course, date. */
+/** RMC, recommended minimum: time, status A, position, speed, course, date. */
 export function buildGprmc(date: Date, fix: GpsFix): string {
   const lat = formatNmeaCoord(fix.lat, 'lat');
   const lon = formatNmeaCoord(fix.lng, 'lon');
@@ -107,92 +130,6 @@ export function buildNmeaCycle(date: Date, fix: GpsFix): string {
   return `${buildGpgga(date, fix)}\r\n${buildGprmc(date, fix)}\r\n`;
 }
 
-// ─── Wiring resolution ───────────────────────────────────────────────────────
-
-/**
- * Find the board endpoint directly wired to (componentId, pinName).
- * Returns the board kind + the board-side pin label, or null when the pin
- * is unwired or reaches the board only through other components.
- */
-function findDirectBoardEndpoint(
-  componentId: string,
-  pinName: string,
-): { boardKind: string; pinName: string } | null {
-  const s = useSimulatorStore.getState();
-  for (const w of s.wires) {
-    let other = null;
-    if (w.start.componentId === componentId && w.start.pinName === pinName) other = w.end;
-    else if (w.end.componentId === componentId && w.end.pinName === pinName) other = w.start;
-    if (!other) continue;
-
-    const board = s.boards.find((b) => b.id === other.componentId);
-    if (board) return { boardKind: board.boardKind as string, pinName: other.pinName };
-    if (isBoardComponent(other.componentId)) {
-      return { boardKind: other.componentId, pinName: other.pinName };
-    }
-  }
-  return null;
-}
-
-/** Board kind of the active board (fallback for indirect wiring). */
-function activeBoardKind(): string | null {
-  const s = useSimulatorStore.getState();
-  const board = s.boards.find((b) => b.id === s.activeBoardId) ?? s.boards[0];
-  return board ? (board.boardKind as string) : null;
-}
-
-// ─── Bit-banged UART frames (AVR SoftwareSerial path) ────────────────────────
-
-/**
- * Schedule `text` as an 8N1 bitstream on `pin` using the sim's
- * cycle-accurate pin queue. Emits only state TRANSITIONS (the line idles
- * HIGH), mirroring AVRSimulator.emitUartTxFrame. `tail` carries the cycle
- * where the previous frame ended so back-to-back emissions stay contiguous.
- */
-export function scheduleUartBitstream(
-  simulator: {
-    getCurrentCycles(): number;
-    getClockHz?(): number;
-    schedulePinChange(pin: number, state: boolean, atCycle: number): void;
-  },
-  pin: number,
-  text: string,
-  tail: { cycle: number; lastNow: number },
-  baud = GPS_BAUD,
-): void {
-  const clockHz = typeof simulator.getClockHz === 'function' ? simulator.getClockHz() : 16_000_000;
-  const cyclesPerBit = clockHz / baud;
-  const now = simulator.getCurrentCycles();
-
-  // CPU cycle counter went backwards → the sim was reset; drop stale tail.
-  if (now < tail.lastNow) tail.cycle = 0;
-  tail.lastNow = now;
-
-  // More than ~2 s of sim-time backlog means the sim runs far below real
-  // time — skip this cycle instead of growing the queue without bound.
-  if (tail.cycle > now + 2 * clockHz) return;
-
-  // Start after the previous frame, leaving at least one idle bit from now.
-  let t = Math.max(now + cyclesPerBit, tail.cycle);
-  let prev = true; // idle HIGH
-
-  for (let i = 0; i < text.length; i++) {
-    const byte = text.charCodeAt(i) & 0xff;
-    // start LOW, 8 data bits LSB-first, stop HIGH
-    const bits: boolean[] = [false];
-    for (let b = 0; b < 8; b++) bits.push(((byte >> b) & 1) !== 0);
-    bits.push(true);
-    for (const bit of bits) {
-      if (bit !== prev) {
-        simulator.schedulePinChange(pin, bit, Math.round(t));
-        prev = bit;
-      }
-      t += cyclesPerBit;
-    }
-  }
-  tail.cycle = t; // stop bit leaves the line HIGH (idle) — no trailing edge
-}
-
 // ─── Part registration ───────────────────────────────────────────────────────
 
 const num = (v: unknown, dflt: number): number => {
@@ -200,22 +137,26 @@ const num = (v: unknown, dflt: number): number => {
   return typeof n === 'number' && Number.isFinite(n) ? n : dflt;
 };
 
-/** Wall-clock pacing for byte-level injection: ≈9600 baud in 8-byte chunks. */
-const FEED_CHUNK_BYTES = 8;
-const FEED_CHUNK_MS = 8;
+/**
+ * The most bytes one poll may hand the wire. A poll normally owes a handful
+ * (20 ms of guest at 9600 baud is 19 characters); the cap only matters when
+ * the guest outran the wall clock between polls, and it keeps such a catch-up
+ * under the smallest hardware RX FIFO a controller port injects into without
+ * pacing of its own (the ESP32 UARTs: 128 bytes). What is left goes next poll.
+ */
+const BURST_MAX = 64;
+
+/** Guest time a stream may lag its schedule before it is re-based, not caught up. */
+const LAG_RESYNC_MS = 500;
 
 PartSimulationRegistry.register('gps-neo6m', {
-  attachEvents: (element, simulator, getPin, componentId) => {
+  attachEvents: (element, simulator, _getPin, componentId) => {
     const el = element as unknown as Record<string, unknown> & HTMLElement;
-    const sim = simulator as unknown as {
-      isRunning?: () => boolean;
-      feedUart?: (uart: number, data: string) => boolean;
-      serialWrite?: (text: string) => void;
-      setPinState?: (pin: number, state: boolean) => void;
-      getCurrentCycles?: () => number;
-      getClockHz?: () => number;
-      schedulePinChange?: (pin: number, state: boolean, atCycle: number) => void;
-    };
+    const sim = simulator as unknown as { isRunning?: () => boolean };
+
+    // The fabric identifies the module by its component id; a part without
+    // one has no pins the netlist can name, so it can be on no wire.
+    if (!componentId) return () => {};
 
     const fix: GpsFix = {
       lat: num(el.lat, 40.4168),
@@ -225,140 +166,116 @@ PartSimulationRegistry.register('gps-neo6m', {
       course: num(el.course, 0),
     };
 
-    // UTC clock: seeded at attach, advanced one second per emission so the
-    // stream stays monotonic under fake timers and sim-speed changes.
+    // The date and time of day the receiver reports (see the file header).
+    // Every later cycle is one GUEST second after the previous one.
     const baseTime = Date.now();
-    let tick = 0;
+    let cycles = 0;
 
-    // ── Resolve the injection route once per attach (DynamicComponent
-    //    re-attaches on every wire change, so this stays current). ──────────
-    const arduinoPin = getPin('TX');
-    const direct = componentId ? findDirectBoardEndpoint(componentId, 'TX') : null;
-    let role = direct ? classifyPin(direct.boardKind, direct.pinName) : null;
-    if ((!role || role.kind === 'digital') && arduinoPin !== null && arduinoPin >= 0) {
-      // Indirect wiring (e.g. through a level-shift resistor): classify the
-      // resolved pin number against the active board's protocol table.
-      const kind = activeBoardKind();
-      if (kind) {
-        const numericRole = classifyPin(kind, String(arduinoPin));
-        if (numericRole.kind === 'uart-rx') role = numericRole;
-      }
-    }
+    // Only a TX leg: the descriptor says a receiver never listens, so the
+    // fabric never places an RX leg for it, whatever its RX pad is wired to.
+    // receive() exists because the endpoint contract has it; with no RX leg
+    // on any wire the fabric has nothing to hand it.
+    const handle = attachUartEndpoint(
+      { owner: componentId, pins: { tx: 'TX' }, baud: GPS_BAUD },
+      { receive: () => {} },
+    );
 
-    const canBitBang =
-      typeof sim.schedulePinChange === 'function' &&
-      typeof sim.getCurrentCycles === 'function' &&
-      arduinoPin !== null &&
-      arduinoPin >= 0;
+    // ── The stream, on the guest clock ────────────────────────────────────
+    // `pending` is the cycle being shifted out, one character every
+    // GPS_BYTE_MS of guest time from `byteDueAt`; a new cycle opens at
+    // `nextCycleAt`, once the previous one is out. All in guest milliseconds
+    // from guestMillis(); a board whose clock lives in another process (the
+    // QEMU lanes) has none readable here and gets the wall clock, which is
+    // the rate such a guest runs at anyway.
+    let pending: number[] = [];
+    let byteDueAt = 0;
+    let nextCycleAt: number | null = null;
+    let ppsOffAt: number | null = null;
+    let onGuestClock: boolean | null = null;
 
-    // ── Byte-level feed queue, drained at ~9600 baud wall-clock ────────────
-    // When `feedUart` reports the target UART unsupported (e.g. Mega
-    // USART1-3, which avr8js doesn't model), flip to the bit-banged path
-    // permanently so SoftwareSerial on that pin still gets the stream.
-    let byteFeedRejected = false;
-    let feedQueue = '';
-    let feedTimer: ReturnType<typeof setInterval> | null = null;
-    const drainFeedQueue = () => {
-      if (feedQueue.length === 0) {
-        if (feedTimer !== null) {
-          clearInterval(feedTimer);
-          feedTimer = null;
-        }
-        return;
-      }
-      const chunk = feedQueue.slice(0, FEED_CHUNK_BYTES);
-      feedQueue = feedQueue.slice(FEED_CHUNK_BYTES);
-      if (role?.kind === 'uart-rx' && typeof sim.feedUart === 'function') {
-        if (sim.feedUart(role.uart, chunk) === false) {
-          byteFeedRejected = true;
-          feedQueue = '';
-        }
-      } else if (typeof sim.serialWrite === 'function') {
-        sim.serialWrite(chunk);
-      }
-    };
-    const enqueueBytes = (text: string) => {
-      // Never buffer more than ~2 cycles — a stalled sim must not grow this.
-      if (feedQueue.length > text.length * 2) return;
-      feedQueue += text;
-      if (feedTimer === null) {
-        feedTimer = setInterval(drainFeedQueue, FEED_CHUNK_MS);
-        drainFeedQueue();
-      }
+    const now = (): number => {
+      const guest = guestMillis(simulator);
+      const useGuest = guest !== null;
+      // Switching clocks (the engine came up, or went away) restarts the
+      // schedule rather than measuring across two unrelated timebases.
+      if (onGuestClock !== null && useGuest !== onGuestClock) nextCycleAt = null;
+      onGuestClock = useGuest;
+      return useGuest ? (guest as number) : performance.now();
     };
 
-    // ── Bit-bang state (AVR SoftwareSerial path) ───────────────────────────
-    const tail = { cycle: 0, lastNow: 0 };
-    if (canBitBang) {
-      // Seed the line at idle HIGH so SoftwareSerial doesn't read a break.
-      // (Harmless on byte-fed hardware-UART pins: a UART line idles HIGH.)
-      sim.setPinState?.(arduinoPin as number, true);
-    }
-
-    let ppsTimeout: ReturnType<typeof setTimeout> | null = null;
-    const pulsePps = () => {
+    const setPps = (lit: boolean) => {
       try {
-        (el as { pps?: boolean }).pps = true;
-        ppsTimeout = setTimeout(() => {
-          (el as { pps?: boolean }).pps = false;
-        }, 120);
+        (el as { pps?: boolean }).pps = lit;
       } catch {
         /* headless element */
       }
     };
 
-    const emit = () => {
-      if (typeof sim.isRunning === 'function' && !sim.isRunning()) return;
-
-      const date = new Date(baseTime + tick * 1000);
-      tick++;
-      const cycle = buildNmeaCycle(date, fix);
-
-      const byteCapable =
-        !byteFeedRejected &&
-        role?.kind === 'uart-rx' &&
-        (typeof sim.feedUart === 'function' || (role.uart === 0 && typeof sim.serialWrite === 'function'));
-
-      if (byteCapable) {
-        enqueueBytes(cycle);
-      } else if (canBitBang) {
-        scheduleUartBitstream(
-          sim as Parameters<typeof scheduleUartBitstream>[0],
-          arduinoPin as number,
-          cycle,
-          tail,
-        );
-      } else if (typeof sim.serialWrite === 'function') {
-        // Last resort: deliver on the default serial so raw Serial.read()
-        // sketches still see the stream.
-        enqueueBytes(cycle);
-      } else {
-        return; // nowhere to deliver — skip the PPS pulse too
-      }
-      pulsePps();
+    const openCycle = (t: number) => {
+      const date = new Date(baseTime + cycles * 1000);
+      cycles++;
+      const text = buildNmeaCycle(date, fix);
+      pending = Array.from(text, (ch) => ch.charCodeAt(0) & 0xff);
+      byteDueAt = t;
+      // The marker is the receiver's own 1PPS: it goes with the cycle whether
+      // or not anything is wired to hear the sentences.
+      setPps(true);
+      ppsOffAt = t + GPS_PPS_MS;
     };
 
-    const interval = setInterval(emit, 1000);
-
-    if (componentId) {
-      registerSensorUpdate(componentId, (values) => {
-        if ('lat' in values) fix.lat = values.lat as number;
-        if ('lng' in values) fix.lng = values.lng as number;
-        if ('altitude' in values) fix.altitude = values.altitude as number;
-        if ('speed' in values) fix.speed = values.speed as number;
-        if ('course' in values) fix.course = values.course as number;
-        // Mirror onto the element so the property dialog shows live values.
-        for (const k of ['lat', 'lng', 'altitude', 'speed', 'course'] as const) {
-          if (k in values) (el as Record<string, unknown>)[k] = values[k];
+    const tick = () => {
+      if (typeof sim.isRunning === 'function' && !sim.isRunning()) {
+        // The board is the module's supply: stopped, the module is dark. Its
+        // first fix after the next Run comes a second later, as after power-on.
+        pending = [];
+        nextCycleAt = null;
+        if (ppsOffAt !== null) {
+          setPps(false);
+          ppsOffAt = null;
         }
-      });
-    }
+        return;
+      }
+      const t = now();
+      if (nextCycleAt === null) nextCycleAt = t + GPS_CYCLE_MS;
+      if (ppsOffAt !== null && t >= ppsOffAt) {
+        setPps(false);
+        ppsOffAt = null;
+      }
+      if (pending.length === 0 && t >= nextCycleAt) {
+        openCycle(t);
+        nextCycleAt += GPS_CYCLE_MS;
+        // The guest jumped, or the tab slept: the cadence resumes from now
+        // instead of firing the missed cycles back to back.
+        if (nextCycleAt <= t) nextCycleAt = t + GPS_CYCLE_MS;
+      }
+      if (pending.length === 0) return;
+      if (t - byteDueAt > LAG_RESYNC_MS) byteDueAt = t;
+      let sent = 0;
+      while (pending.length > 0 && t >= byteDueAt && sent < BURST_MAX) {
+        handle.transmit(pending.shift()!);
+        byteDueAt += GPS_BYTE_MS;
+        sent++;
+      }
+    };
+
+    const timer = setInterval(tick, GPS_TICK_MS);
+
+    registerSensorUpdate(componentId, (values) => {
+      if ('lat' in values) fix.lat = values.lat as number;
+      if ('lng' in values) fix.lng = values.lng as number;
+      if ('altitude' in values) fix.altitude = values.altitude as number;
+      if ('speed' in values) fix.speed = values.speed as number;
+      if ('course' in values) fix.course = values.course as number;
+      // Mirror onto the element so the property dialog shows live values.
+      for (const k of ['lat', 'lng', 'altitude', 'speed', 'course'] as const) {
+        if (k in values) (el as Record<string, unknown>)[k] = values[k];
+      }
+    });
 
     return () => {
-      clearInterval(interval);
-      if (feedTimer !== null) clearInterval(feedTimer);
-      if (ppsTimeout !== null) clearTimeout(ppsTimeout);
-      if (componentId) unregisterSensorUpdate(componentId);
+      clearInterval(timer);
+      handle.dispose();
+      unregisterSensorUpdate(componentId);
     };
   },
 });

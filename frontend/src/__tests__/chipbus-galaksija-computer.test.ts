@@ -52,7 +52,16 @@ const STATE: ChipNetState = {
 const pinKey = (c: string, p: string): number => resolveChipNetKey(STATE, c, p) ?? syntheticChipPin(c, p);
 const wiresFor = (c: string, pins: string[]) => new Map(pins.map((p) => [p, pinKey(c, p)] as [string, number]));
 
-describe.skipIf(!have)('chipbus Phase 3 — full Galaksija computer renders READY', () => {
+/**
+ * Gated behind `RUN_CHIPBUS_TESTS=1` so the default `npm test` skips the whole
+ * Galaksija set. It is a real Z80 home computer booting over the chip-to-chip
+ * bus: five WASM chips clocked against each other, minutes of CPU across the
+ * seven files, and it dominated the wall clock of a suite of ~470 files. Run
+ * it with `npm run test:chipbus`, or set the variable and run the file.
+ */
+const RUN_CHIPBUS = process.env.RUN_CHIPBUS_TESTS === '1';
+
+describe.skipIf(!RUN_CHIPBUS || !have)('chipbus Phase 3 — full Galaksija computer renders READY', () => {
   beforeEach(() => { setChipBusEnabledForTest(true); resetChipNetIndexForTest(); resetBusNets(); });
   afterEach(() => { setChipBusEnabledForTest(null); resetChipNetIndexForTest(); resetBusNets(); });
 
@@ -84,5 +93,5 @@ describe.skipIf(!have)('chipbus Phase 3 — full Galaksija computer renders READ
     expect(litReady, 'the READY prompt is rendered on screen').toBeGreaterThan(20);
 
     z80.dispose(); rom.dispose(); ram.dispose(); inv.dispose(); disp.dispose();
-  }, 30_000);
+  }, 120_000);
 });

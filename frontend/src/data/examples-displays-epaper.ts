@@ -5,10 +5,10 @@
  * all driven through GxEPD2. Each example is wired against a different
  * board so users can see ePaper running across AVR / RP2040 / ESP32.
  *
- * The backend ESP32 path uses `Ssd168xEpaperSlave` in
- * `backend/app/services/esp32_spi_slaves.py`. The browser-side path
- * (AVR / RP2040) uses `frontend/src/simulation/displays/SSD168xDecoder.ts`.
- * Both render to the same `<velxio-epaper>` Web Component.
+ * On every board the panel is a device of the board's SPI bus fabric,
+ * decoded by `frontend/src/simulation/displays/SSD168xDecoder.ts` and
+ * rendered by the `<velxio-epaper>` Web Component; an ESP32 on the QEMU
+ * engine has its bytes relayed by the worker into that same decoder.
  */
 
 import type { ExampleProject } from './examples';
@@ -153,9 +153,9 @@ const weatherEsp29: ExampleProject = {
   id: 'epaper-2in9-esp32-weather',
   title: 'ePaper 2.9" Weather — ESP32',
   description:
-    'Mock weather widget on a 2.9" 296×128 SSD1680 panel. Demonstrates ePaper rendering via the ' +
-    'backend Ssd168xEpaperSlave — the QEMU worker decodes SPI traffic and ships the latched frame ' +
-    'back to the browser as an `epaper_update` WebSocket event.',
+    'Mock weather widget on a 2.9" 296×128 SSD1680 panel. Demonstrates ePaper rendering on an ' +
+    'ESP32: the panel sits on the board\'s SPI bus like on any other board, and the same decoder ' +
+    'paints it whether the sketch runs in the browser engine or in the QEMU worker.',
   category: 'displays',
   difficulty: 'intermediate',
   boardType: 'esp32-devkit-c-v4',

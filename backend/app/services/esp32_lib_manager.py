@@ -151,6 +151,15 @@ class _UartBuffer:
 
     def feed(self, byte_val: int) -> str | None:
         """Add one byte. Returns decoded string when a flush occurs, else None."""
+        raw = self.feed_raw(byte_val)
+        return raw.decode('utf-8', errors='replace') if raw is not None else None
+
+    def feed_raw(self, byte_val: int) -> bytes | None:
+        """Add one byte. Returns the bytes of the chunk when a flush occurs,
+        else None. The chunk travels to the tab both decoded (the monitor) and
+        raw (`b64`, for the UART parts on the canvas: a byte >= 0x80 does not
+        survive a UTF-8 decode, and a framed reply with a 0xAA sync word is
+        exactly that; project board-buses-2026-09, F6)."""
         with self._lock:
             self._buf.append(byte_val)
             # Flush on newline, carriage return, period, EOT, or max size.
@@ -163,9 +172,9 @@ class _UartBuffer:
             # the uploader started waiting for the board instead of pasting
             # blind (see frontend simulation/micropythonSession.ts).
             if byte_val in (ord('\n'), ord('\r'), ord('.'), 0x04) or len(self._buf) >= self.flush_size:
-                text = self._buf.decode('utf-8', errors='replace')
+                raw = bytes(self._buf)
                 self._buf.clear()
-                return text
+                return raw
         return None
 
     def flush(self) -> str | None:
@@ -235,7 +244,7 @@ class EspLibManager:
         sensors:      list | None = None,
         wifi_enabled: bool = False,
         wifi_hostfwd_port: int = 0,
-        sd_card: dict | None = None,
+        bus_map: dict | None = None,
     ) -> None:
         # Stop any existing instance for this client_id first
         if client_id in self._instances:
@@ -255,7 +264,10 @@ class EspLibManager:
             'sensors':           sensors or [],
             'wifi_enabled':      wifi_enabled,
             'wifi_hostfwd_port': wifi_hostfwd_port,
-            **({'sd_card': sd_card} if sd_card else {}),
+            # The board's SPI bus as the tab sees it, in the config rather than
+            # in a command after the start: the guest can clock a byte before a
+            # command would arrive (project board-buses-2026-09, F4).
+            **({'bus_map': bus_map} if bus_map else {}),
         })
 
         logger.info('Launching esp32_worker for %s (machine=%s, script=%s, python=%s)',
@@ -439,12 +451,36 @@ class EspLibManager:
             self._write_cmd(inst, {'cmd': 'set_i2c_response', 'addr': addr,
                                    'response': response_byte & 0xFF})
 
-    def set_spi_response(self, client_id: str, response_byte: int) -> None:
-        """Configure the MISO byte returned during SPI transfers."""
+    def set_bus_map(self, client_id: str, spi: list | None, i2c: list | None = None) -> None:
+        """Replace the worker's view of who is on the board's SPI bus, and,
+        when the tab sends it, which I2C controller each target is on.
+
+        The tab sends the whole map on every membership change, so a device
+        the user deleted is gone by being absent. It replaced
+        set_spi_response, which sent one MISO byte for a byte the guest had
+        already clocked (project board-buses-2026-09, F4). `i2c` is F5's half;
+        None (a tab that predates it) leaves the worker's I2C placement alone,
+        and so does a None `spi` for the SPI half: an I2C membership change
+        does not re-ship every SPI model's artifact and card image."""
         with self._instances_lock:
             inst = self._instances.get(client_id)
         if inst and inst.running and inst.process.returncode is None:
-            self._write_cmd(inst, {'cmd': 'set_spi_response', 'response': response_byte & 0xFF})
+            cmd: dict = {'cmd': 'bus_map'}
+            if spi is not None:
+                cmd['spi'] = spi
+            if i2c is not None:
+                cmd['i2c'] = i2c
+            self._write_cmd(inst, cmd)
+
+    def set_bus_attrs(self, client_id: str, owner: str, attrs: dict) -> None:
+        """One hosted responder's live inputs, between two maps (the finger,
+        the slider, the circuit solve). The model keeps running in the worker;
+        only its attributes move, through the same update_attrs a custom
+        chip's live controls use."""
+        with self._instances_lock:
+            inst = self._instances.get(client_id)
+        if inst and inst.running and inst.process.returncode is None:
+            self._write_cmd(inst, {'cmd': 'bus_attrs', 'owner': owner, 'attrs': attrs})
 
     # ── Generic sensor protocol offloading ──────────────────────────────────
 
@@ -503,40 +539,6 @@ class EspLibManager:
             inst = self._instances.get(client_id)
         if inst and inst.running and inst.process.returncode is None:
             self._write_cmd(inst, {'cmd': 'sensor_detach', 'pin': pin})
-
-    # ── Cross-board I2C proxy ─────────────────────────────────────────────────
-    # Forwards a snapshot of a peer board's virtual I2C device into a
-    # `ProxySlave` registered server-side, so the ESP32 firmware's Wire
-    # master reads succeed synchronously inside QEMU.
-
-    def proxy_i2c_register(self, client_id: str, addr: int, regs_b64: str) -> None:
-        """Install a proxy slave at `addr` initialised with the given dump."""
-        with self._instances_lock:
-            inst = self._instances.get(client_id)
-        if inst and inst.running and inst.process.returncode is None:
-            self._write_cmd(inst, {
-                'cmd': 'proxy_i2c_register', 'addr': addr & 0x7F,
-                'regs_b64': regs_b64,
-            })
-
-    def proxy_i2c_update(self, client_id: str, addr: int, regs_b64: str) -> None:
-        """Refresh the register state of an existing proxy slave at `addr`."""
-        with self._instances_lock:
-            inst = self._instances.get(client_id)
-        if inst and inst.running and inst.process.returncode is None:
-            self._write_cmd(inst, {
-                'cmd': 'proxy_i2c_update', 'addr': addr & 0x7F,
-                'regs_b64': regs_b64,
-            })
-
-    def proxy_i2c_unregister(self, client_id: str, addr: int) -> None:
-        """Remove the proxy slave at `addr`."""
-        with self._instances_lock:
-            inst = self._instances.get(client_id)
-        if inst and inst.running and inst.process.returncode is None:
-            self._write_cmd(inst, {
-                'cmd': 'proxy_i2c_unregister', 'addr': addr & 0x7F,
-            })
 
     # ── ESP32-CAM: OV2640 frame injection ─────────────────────────────────────
     # The QEMU peripheral (hw/misc/esp32_i2s_cam.c) accepts host-pushed
@@ -640,10 +642,12 @@ class EspLibManager:
                     byte_val = event.get('byte', 0)
                     buf = inst.uart_bufs.get(uart_id)
                     if buf:
-                        text = buf.feed(byte_val)
-                        if text:
+                        raw = buf.feed_raw(byte_val)
+                        if raw:
+                            text = raw.decode('utf-8', errors='replace')
                             self._dispatch(inst, 'serial_output', {
                                 'data': text, 'uart': uart_id,
+                                'b64': base64.b64encode(raw).decode('ascii'),
                             })
                             # Parse WiFi/BLE status from UART0 output
                             if uart_id == 0 and inst.wifi_enabled:

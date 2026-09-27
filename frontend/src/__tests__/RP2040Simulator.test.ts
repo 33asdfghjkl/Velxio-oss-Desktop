@@ -9,16 +9,14 @@
  * - Binary loading (base64 decode)
  * - LED_BUILTIN pin (GPIO25)
  * - UART / Serial (onSerialData, serialWrite)
- * - I2C virtual devices (addI2CDevice, removeI2CDevice)
- * - SPI handler (setSPIHandler)
+ * - I2C controllers as bus-fabric ports
+ * - SPI through the bus fabric's controller ports
  * - Bootrom loading
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RP2040Simulator } from '../simulation/RP2040Simulator';
-import type { RP2040I2CDevice } from '../simulation/RP2040Simulator';
 import { PinManager } from '../simulation/PinManager';
-import { VirtualDS1307, VirtualTempSensor, I2CMemoryDevice } from '../simulation/I2CBusManager';
 
 // ─── Mock requestAnimationFrame ──────────────────────────────────────────────
 // No-op mock: returns an ID but never invokes the callback.
@@ -340,10 +338,12 @@ describe('RP2040Simulator — UART / Serial', () => {
     // After reset, onSerialData is still set (assigned on the simulator object)
     expect(sim.onSerialData).toBe(cb);
 
-    // And the new UART0 should fire through it
+    // And the new UART0 should fire through it, tagged with its unit (the
+    // Interconnect fans UART1 out to peer boards by that tag; the monitor
+    // keeps unit 0).
     const mcu = sim.getMCU()!;
     mcu.uart[0].onByte!(0x43); // 'C'
-    expect(cb).toHaveBeenCalledWith('C');
+    expect(cb).toHaveBeenCalledWith('C', 0);
   });
 });
 
@@ -359,34 +359,6 @@ describe('RP2040Simulator — I2C', () => {
     sim.loadBinary(minimalBinary());
   });
   afterEach(() => sim.stop());
-
-  it('addI2CDevice() registers a device on bus 0', () => {
-    const device: RP2040I2CDevice = {
-      address: 0x48,
-      writeByte: () => true,
-      readByte: () => 0x42,
-    };
-    expect(() => sim.addI2CDevice(device)).not.toThrow();
-  });
-
-  it('addI2CDevice() registers a device on bus 1', () => {
-    const device: RP2040I2CDevice = {
-      address: 0x50,
-      writeByte: () => true,
-      readByte: () => 0xff,
-    };
-    expect(() => sim.addI2CDevice(device, 1)).not.toThrow();
-  });
-
-  it('removeI2CDevice() removes a registered device', () => {
-    const device: RP2040I2CDevice = {
-      address: 0x48,
-      writeByte: () => true,
-      readByte: () => 0x42,
-    };
-    sim.addI2CDevice(device);
-    expect(() => sim.removeI2CDevice(0x48)).not.toThrow();
-  });
 
   it('I2C0 event handlers are wired after loadBinary()', () => {
     const mcu = sim.getMCU()!;
@@ -408,37 +380,15 @@ describe('RP2040Simulator — I2C', () => {
     expect(i2c.onStop).toBeDefined();
   });
 
-  it('VirtualDS1307 can be registered as RP2040I2CDevice', () => {
-    const rtc = new VirtualDS1307();
-    expect(() => sim.addI2CDevice(rtc as RP2040I2CDevice)).not.toThrow();
-  });
-
-  it('VirtualTempSensor can be registered as RP2040I2CDevice', () => {
-    const sensor = new VirtualTempSensor();
-    expect(() => sim.addI2CDevice(sensor as RP2040I2CDevice)).not.toThrow();
-  });
-
-  it('I2CMemoryDevice can be registered as RP2040I2CDevice', () => {
-    const eeprom = new I2CMemoryDevice(0x50);
-    expect(() => sim.addI2CDevice(eeprom as RP2040I2CDevice)).not.toThrow();
-  });
-
-  it('I2C devices persist across simulator lifecycle', () => {
-    sim.addI2CDevice({ address: 0x48, writeByte: () => true, readByte: () => 0 });
-    sim.addI2CDevice({ address: 0x50, writeByte: () => true, readByte: () => 0 }, 0);
-
-    // After the I2CBusManager refactor, devices live inside the
-    // per-bus I2CBusManager (exposed via getI2CBus).  The bus
-    // doesn't expose its internal Map directly, but registering
-    // the same address again twice would silently overwrite —
-    // we verify the round-trip by removing and asserting that the
-    // bus returns NACK afterwards on connectToSlave (which the
-    // bus's `handleExternalConnect` mirror lets us observe
-    // without driving the RPI2C peripheral).
-    const bus0 = sim.getI2CBus(0)!;
-    expect(bus0.handleExternalConnect(0x48, true)).toBe(true);
-    expect(bus0.handleExternalConnect(0x50, true)).toBe(true);
-    expect(bus0.handleExternalConnect(0x77, true)).toBe(false);
+  // Devices reach the controllers through the bus fabric by their wiring
+  // (board-buses F5); the engine exposes its two controllers as ports and
+  // nothing else. The firmware's funcsel writes route them (see
+  // board-buses/port-conformance-rp2040-i2c.test.ts for the real thing).
+  it('the binding exposes I2C0 and I2C1 as ports, unrouted until the firmware selects their pads', () => {
+    const ports = sim.getBusBinding().i2c ?? [];
+    expect(ports.map((p) => `${p.unit}:${p.name}`)).toEqual(['0:I2C0', '1:I2C1']);
+    for (const p of ports) expect(p.routing()).toEqual({});
+    expect(sim.getBusBinding().i2c?.[0], 'the same port for the life of the board').toBe(ports[0]);
   });
 });
 
@@ -465,71 +415,74 @@ describe('RP2040Simulator — SPI', () => {
     expect(mcu.spi[1].onTransmit).toBeDefined();
   });
 
-  it('setSPIHandler() replaces the default handler for SPI0', () => {
+  // setSPIHandler was the F2 transition bridge and is gone: a device joins a
+  // bus through the fabric, which binds one frame handler per controller port.
+  it('the fabric port of SPI0 gets every frame the controller clocks', () => {
     const handler = vi.fn((value: number) => value ^ 0xff); // invert bits
-    sim.setSPIHandler(0, handler);
+    sim.getBusBinding().spi.find((p) => p.unit === 0)!.setFrameHandler(handler);
 
     const mcu = sim.getMCU()!;
     // Manually trigger onTransmit to test the handler wiring
     mcu.spi[0].onTransmit(0xaa);
-    // The handler should have been called
-    expect(handler).toHaveBeenCalledWith(0xaa);
+    expect(handler).toHaveBeenCalledWith(0xaa, 8);
   });
 
-  it('setSPIHandler() works for SPI1', () => {
+  it('and SPI1 has a port of its own', () => {
     const handler = vi.fn((_v: number) => 0x42);
-    sim.setSPIHandler(1, handler);
+    sim.getBusBinding().spi.find((p) => p.unit === 1)!.setFrameHandler(handler);
 
     const mcu = sim.getMCU()!;
     mcu.spi[1].onTransmit(0x00);
-    expect(handler).toHaveBeenCalledWith(0x00);
+    expect(handler).toHaveBeenCalledWith(0x00, 8);
   });
 
   // A display and an SD card share SCK/MOSI on every TFT+SD project, so more
   // than one listener sees each byte now. On this SoC completeTransmit PUSHES
   // into the RX FIFO — it is not a register a second writer overwrites — so
   // the bus has to settle on exactly one answer per clocked byte.
-  it('takes the first answer for a clocked byte and ignores a second', () => {
+  it('pushes exactly one byte back per clocked byte, whatever shares the bus', () => {
+    // The bus contract (project board-buses-2026-09): on this SoC
+    // completeTransmit PUSHES into the RX FIFO, so two answers shift the whole
+    // received stream and none hangs the core. The fabric settles the line
+    // (the AND of every selected driver) and the port completes the frame
+    // once. It used to keep the FIRST answer, which let an idle display above
+    // a card mask the card.
     const mcu = sim.getMCU()!;
     const pushed: number[] = [];
     mcu.spi[0].completeTransmit = (v: number) => pushed.push(v);
-    const spi = sim.spi;
-    spi.onByte = () => {
-      spi.completeTransfer(0x5a); // the selected device answers
-      spi.completeTransfer(0xff); // a second listener idles on top of it
-    };
+    sim.getBusBinding().spi.find((p) => p.unit === 0)!.setFrameHandler(() => 0xff & 0x5a);
     mcu.spi[0].onTransmit(0xaa);
     expect(pushed, 'one clocked byte, one byte back').toEqual([0x5a]);
   });
 
-  it('idles the line high when no listener drives MISO', () => {
+  it('idles the line high when nothing selected drives MISO', () => {
     // Every device deselected — the normal state while a card's CS is high.
     // rp2040js keeps `busy` set until completeTransmit runs, so saying
     // nothing here would hang the sketch on its first transfer.
     const mcu = sim.getMCU()!;
     const pushed: number[] = [];
     mcu.spi[0].completeTransmit = (v: number) => pushed.push(v);
-    const spi = sim.spi;
-    spi.onByte = () => {
-      /* not mine: high-Z */
-    };
+    sim.getBusBinding().spi.find((p) => p.unit === 0)!.setFrameHandler(() => 0xff);
     mcu.spi[0].onTransmit(0xaa);
     expect(pushed, 'the pull-up answers').toEqual([0xff]);
   });
 
-  it('keeps the bare loopback when nothing is listening at all', () => {
+  it('reads the idle level, not a loopback, when nothing is bound at all', () => {
+    // No wire from MOSI to MISO means nothing drives MISO: the pull-up wins.
+    // The old bare loopback returned MOSI, which no board does without a jumper.
     const mcu = sim.getMCU()!;
     const pushed: number[] = [];
     mcu.spi[0].completeTransmit = (v: number) => pushed.push(v);
-    sim.spi.onByte = null;
+    sim.getBusBinding().spi.find((p) => p.unit === 0)!.setFrameHandler(null);
     mcu.spi[0].onTransmit(0x42);
-    expect(pushed).toEqual([0x42]);
+    expect(pushed).toEqual([0xff]);
   });
 
-  it('setSPIHandler() does nothing when rp2040 is null', () => {
+  it('a port bound before any firmware load hears the first frame after it', () => {
     const freshSim = new RP2040Simulator(pm);
-    // No loadBinary
-    expect(() => freshSim.setSPIHandler(0, () => 0)).not.toThrow();
+    // No loadBinary: the ports exist with the simulator, so binding cannot throw.
+    const port = freshSim.getBusBinding().spi.find((p) => p.unit === 0)!;
+    expect(() => port.setFrameHandler(() => 0)).not.toThrow();
   });
 });
 

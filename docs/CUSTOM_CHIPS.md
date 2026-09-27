@@ -128,6 +128,12 @@ Inside it the chip:
 1. **Allocates state** — typically one `malloc(sizeof(chip_state_t))` per instance.
 2. **Registers pins** with `vx_pin_register(name, mode)`.
 3. **Attaches peripherals** if needed: `vx_i2c_attach`, `vx_uart_attach`, `vx_spi_attach`.
+   The attach is what puts the chip on a bus: the pins named in the config
+   are walked through the wires to a board, and the chip is on the SPI bus
+   of its SCK net, the I2C bus of its SDA net, the UART wires of its RX and
+   TX legs, on whichever board and controller those reach. A chip wired to
+   nothing is on no bus; a chip with its `cs` wired receives SPI bytes only
+   while selected. See [board buses](./wiki/board-buses.md).
 4. **Subscribes to events** with `vx_pin_watch` and/or `vx_timer_create` + `vx_timer_start`.
 5. Returns. **No event loop.** The chip is purely reactive.
 
@@ -212,6 +218,8 @@ Each is fully explained in
 | Set up the toolchain or write tests | [Build & test guide](./wiki/custom-chips-build-and-test.md) |
 | Run custom chips on ESP32 (backend runtime architecture) | [ESP32 backend runtime](./wiki/custom-chips-esp32-backend-runtime.md) |
 | Wire two chips to each other on ESP32 boards, or across two boards | [Chip-to-chip nets](./wiki/custom-chips-chip-nets.md) |
+| Understand which bus, board and controller a chip lands on, chip select, addresses, the diagnostics | [Board buses](./wiki/board-buses.md) |
+| Write a canvas part (not a chip) that talks SPI, I2C or UART | [Part author guide](./wiki/board-buses-part-authoring.md) |
 | Know which boards support which protocols | [Board support matrix](../test/autosearch/07_multi_board_support.md) |
 
 ### Quick links to source

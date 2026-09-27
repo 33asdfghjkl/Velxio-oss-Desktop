@@ -82,6 +82,9 @@ export class Stm32Bridge {
   readonly boardKind: BoardKind;
 
   onSerialData: ((char: string, uart?: number) => void) | null = null;
+  /** The bytes the guest transmitted on a USART, as they were on the pin, for
+   *  the fabric's UART port (F6); see Esp32Bridge.onUartTxBytes. */
+  onUartTxBytes: ((uart: number, bytes: Uint8Array) => void) | null = null;
   /** gpioPin is the linear pin (port*16+pin). */
   onPinChange: ((gpioPin: number, state: boolean) => void) | null = null;
   onPinChangeWithTime: ((gpioPin: number, state: boolean, timeMs: number) => void) | null = null;
@@ -103,9 +106,6 @@ export class Stm32Bridge {
   /** Full I2C write transaction (addr + bytes) for write-only devices (SSD1306). */
   onI2cTransaction: ((addr: number, data: number[]) => void) | null = null;
   onSpiBatch: ((bytes: Uint8Array) => void) | null = null;
-  onEpaperUpdate:
-    | ((componentId: string, frame: { width: number; height: number; b64: string; refreshMs: number }) => void)
-    | null = null;
 
   private socket: WebSocket | null = null;
   private _connected = false;
@@ -146,6 +146,10 @@ export class Stm32Bridge {
         data: {
           board: this.boardKind,
           sensors: this._pendingSensors,
+          // Who is on the SPI bus, with the firmware rather than after it:
+          // the guest can clock its first byte before a later command would
+          // arrive (project board-buses-2026-09, F4).
+          bus_map: this.startBusMap(),
           ...(this._pendingFirmware ? { firmware_b64: this._pendingFirmware } : {}),
         },
       });
@@ -162,6 +166,14 @@ export class Stm32Bridge {
         case 'serial_output': {
           const text = (msg.data.data as string) ?? '';
           const uart = msg.data.uart as number | undefined;
+          if (this.onUartTxBytes) {
+            const b64 = msg.data.b64;
+            const raw =
+              typeof b64 === 'string'
+                ? Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0))
+                : Uint8Array.from(text, (ch) => ch.charCodeAt(0) & 0xff);
+            this.onUartTxBytes(uart ?? 0, raw);
+          }
           if (this.onSerialData) for (const ch of text) this.onSerialData(ch, uart);
           break;
         }
@@ -234,18 +246,6 @@ export class Stm32Bridge {
           }
           break;
         }
-        case 'epaper_update': {
-          // The STM32 worker nests the frame under data.data (it emits
-          // {type:'epaper_update', data:{...}} and the manager re-wraps once).
-          const f = (msg.data.data as Record<string, unknown>) ?? msg.data;
-          this.onEpaperUpdate?.(f.component_id as string, {
-            width: f.width as number,
-            height: f.height as number,
-            b64: f.frame_b64 as string,
-            refreshMs: (f.refresh_ms as number) ?? 50,
-          });
-          break;
-        }
         case 'error':
           this.onError?.(msg.data.message as string, msg.data.code as string | undefined);
           break;
@@ -300,8 +300,8 @@ export class Stm32Bridge {
    * leaves them alone.
    *
    * Narrower than the ESP32 bridge's, which asks about every registered
-   * record: that worker drives an ePaper panel's BUSY line, and this one does
-   * not — its ePaper branch reads DC, CS and RST only. Claiming BUSY here
+   * record: the only record whose model drives a pad in this worker is the
+   * membrane keypad's. Claiming any other pad (an I2C device's virtual pin)
    * would take it off the solved circuit and leave it driven by nobody.
    */
   ownsSensorPin(gpioPin: number): boolean {
@@ -335,7 +335,7 @@ export class Stm32Bridge {
    * Pre-register devices so they are included in the start_stm32 payload.
    * Sent on connect (the common case: attachEvents fires before Run). Upsert
    * by `pin` so a later setSensors() from startBoard doesn't drop entries an
-   * earlier sendSensorAttach() (e.g. an ePaper SPI slave) already buffered.
+   * earlier sendSensorAttach() (a device registered at mount) already buffered.
    */
   setSensors(sensors: Array<Record<string, unknown>>): void {
     const merged = this._pendingSensors.slice();
@@ -370,6 +370,73 @@ export class Stm32Bridge {
   sendSensorDetach(pin: number): void {
     this._pendingSensors = this._pendingSensors.filter((s) => s['pin'] !== pin);
     this._send({ type: 'stm32_sensor_detach', data: { pin } });
+  }
+
+  /**
+   * Who is on this board's SPI bus and how each one is selected (project
+   * board-buses-2026-09, F4). The whole map travels every time, so a device
+   * the user deleted is gone by being absent; the last one is replayed at the
+   * next start, because the worker begins with an empty bus.
+   */
+  sendBusMap(spi: unknown[], i2c?: unknown[], uart?: unknown[]): void {
+    this._busMap = spi;
+    if (i2c) this._busMapI2c = i2c;
+    if (uart) this._busMapUart = uart;
+    if (this._connected) {
+      this._send({
+        type: 'stm32_bus_map',
+        data: { spi, ...(i2c ? { i2c } : {}), ...(uart ? { uart } : {}) },
+      });
+    }
+  }
+
+  /** The I2C half alone (F5); see Esp32Bridge.sendI2cBusMap. */
+  sendI2cBusMap(i2c: unknown[]): void {
+    this._busMapI2c = i2c;
+    if (this._connected) this._send({ type: 'stm32_bus_map', data: { i2c } });
+  }
+
+  /** The UART half alone (F6); see Esp32Bridge.sendUartBusMap. */
+  sendUartBusMap(uart: unknown[]): void {
+    this._busMapUart = uart;
+    if (this._connected) this._send({ type: 'stm32_bus_map', data: { uart } });
+  }
+
+  /** Asked for the I2C and UART halves as the fabric has them when the start
+   *  config is built; see Esp32Bridge.onBusMapRequest. */
+  onBusMapRequest: (() => { i2c?: unknown[]; uart?: unknown[] } | null) | null = null;
+
+  private _busMap: unknown[] = [];
+  private _busMapI2c: unknown[] | null = null;
+  private _busMapUart: unknown[] | null = null;
+
+  private startBusMap(): { spi: unknown[]; i2c?: unknown[]; uart?: unknown[] } {
+    try {
+      const fresh = this.onBusMapRequest?.();
+      if (fresh?.i2c) this._busMapI2c = fresh.i2c;
+      if (fresh?.uart) this._busMapUart = fresh.uart;
+    } catch (e) {
+      console.warn(`[Stm32Bridge:${this.boardId}] the I2C and UART maps could not be built`, e);
+    }
+    return {
+      spi: this._busMap,
+      ...(this._busMapI2c ? { i2c: this._busMapI2c } : {}),
+      ...(this._busMapUart ? { uart: this._busMapUart } : {}),
+    };
+  }
+
+  /**
+   * One hosted responder's live inputs (project board-buses-2026-09, F4): the
+   * worker applies them to the model it built from the map, through the same
+   * `update_attrs` a custom chip's sliders reach. The stored map takes them
+   * too, so the next start replays what the user sees now and not what the
+   * part showed when the map was built.
+   */
+  sendBusAttrs(owner: string, attrs: Record<string, number>): void {
+    for (const e of this._busMap as Array<{ owner?: string; model?: { attrs?: object } }>) {
+      if (e?.owner === owner && e.model) e.model.attrs = { ...(e.model.attrs ?? {}), ...attrs };
+    }
+    if (this._connected) this._send({ type: 'stm32_bus_attrs', data: { owner, attrs } });
   }
 
   private _send(payload: unknown): void {

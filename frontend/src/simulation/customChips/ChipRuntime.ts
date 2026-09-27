@@ -2,20 +2,22 @@
  * ChipRuntime — TypeScript port of test/test_custom_chips/src/ChipRuntime.js.
  *
  * Loads a Velxio custom-chip WASM, wires its imports to host services
- * (PinManager, I2CBusManager, SPIBus, attribute storage, timer queue), and
- * dispatches its callbacks back into the simulator. One ChipInstance per
- * chip dropped on the canvas.
+ * (PinManager, the SPI, I2C and UART bus fabric, attribute storage, timer
+ * queue), and dispatches its callbacks back into the simulator. One
+ * ChipInstance per chip dropped on the canvas.
  */
 import type { PinManager } from '../PinManager';
-import type { I2CBusManager } from '../I2CBusManager';
-import { SPIBus, SPIDevice } from './SPIBus';
+import { SPIDevice } from './SPIBus';
+import { attachI2cTarget, attachSpiDevice, attachUartEndpoint } from '../buses';
+import type { BusHandle, GuestClock, I2cTarget, SpiMode, UartHandle } from '../buses/types';
 import { WasiShim, type SimNanosFn, type WriteStdoutFn } from './WasiShim';
 import { setChipPinDrive } from './chipPinDrives';
 import { isSyntheticChipPin, isSyntheticNetPin } from './syntheticPins';
 import { requestElectricalResolve } from '../spice/electricalResolveHook';
 import { chipBusEnabled } from './chipNets';
-import { setBusDrive, clearBusDriversForChip } from './busNets';
-import { modeToDrive } from './busLogic';
+import { setBusDrive, setBoardPinDrive, clearBusDriversForChip } from './busNets';
+import { modeToDrive, Strength, HIGHZ_DRIVE } from './busLogic';
+import { padNet, padVolts } from './padVolts';
 
 function readCString(memory: WebAssembly.Memory, ptr: number): string {
   const u8 = new Uint8Array(memory.buffer);
@@ -52,6 +54,8 @@ interface SpiConfig {
   mode: number;
   on_done: number;
   user_data: number;
+  /** velxio-chip.h `on_exchange`: 0 when the chip answers from its buffer. */
+  on_exchange: number;
 }
 
 function readI2CConfig(memory: WebAssembly.Memory, ptr: number): I2CConfig {
@@ -90,6 +94,9 @@ function readSpiConfig(memory: WebAssembly.Memory, ptr: number): SpiConfig {
     mode:      dv.getUint32(ptr + 16, true),
     on_done:   dv.getUint32(ptr + 20, true),
     user_data: dv.getUint32(ptr + 24, true),
+    // The first word of what used to be `reserved[8]`, so a chip built before
+    // the field existed reads 0 here and keeps the buffer contract.
+    on_exchange: dv.getUint32(ptr + 28, true),
   };
 }
 
@@ -100,6 +107,10 @@ interface PinEntry {
   /** Last level written/initialized — used to compute the bus drive on a mode
    *  flip (e.g. OUTPUT -> INPUT releases the bus without forgetting the level). */
   value: 0 | 1;
+  /** A bus drives this pin (the MISO of a vx_spi_attach, the TX of a
+   *  vx_uart_attach, the SDA/SCL of a vx_i2c_attach): the pin's mode is not
+   *  a level on the wire, the bus's protocol is. See _busOwnsPin. */
+  busOwned?: boolean;
 }
 
 interface AttrEntry {
@@ -114,29 +125,112 @@ interface TimerEntry {
   userData: number;
   active: boolean;
   period: bigint;
+  /** The deadline, in the chip's own nanoseconds (see _nowNanos). */
   nextFire: bigint;
   repeat: boolean;
+  /** Cancels the guest clock event armed for the deadline, when one is. */
+  cancel: (() => void) | null;
+}
+
+/** One vx_i2c_attach: an address and the callbacks that serve it. */
+interface I2cDeviceEntry {
+  cfg: I2CConfig;
+  /** The pads its config names, on the chip's canvas component. */
+  scl: string | undefined;
+  sda: string | undefined;
+  /** The chip's side of one addressed phase (see _i2c_attach). */
+  device: ChipI2cDevice;
+}
+
+interface ChipI2cDevice {
+  address: number;
+  connect(addr: number, isRead: boolean): boolean;
+  writeByte(value: number): boolean;
+  readByte(): number;
+  stop(): void;
+}
+
+/**
+ * Every address a chip answers on one pair of pins: ONE target of the bus,
+ * because on the bench they are one chip hanging off one SDA and one SCL.
+ */
+interface I2cGroup {
+  owner: string;
+  scl: string;
+  sda: string;
+  entries: I2cDeviceEntry[];
+  bus: BusHandle | null;
 }
 
 interface SpiEntry {
+  /** The chip's armed buffer for this handle. */
   device: SPIDevice;
   cfg: SpiConfig;
-  onDoneCallback: (buffer: Uint8Array, count: number) => void;
+  /** Registration on the board's SPI bus, disposed with the chip. */
+  bus: BusHandle | null;
+}
+
+/** One vx_uart_attach: its config and, once setup is over, its place on the wires. */
+interface UartEntry {
+  cfg: UartConfig;
+  /** Registration on the bus fabric, disposed with the chip. */
+  bus: UartHandle | null;
+}
+
+/**
+ * The fabric owner of a chip's UART handle: the chip's own component id for
+ * its first UART, which is the identity a QEMU worker's copy of the chip
+ * carries too (uart_bus_table.owner_of), and `<id>:uart<n>` for any further
+ * one. Every host that registers a chip's UART names it this way, so a map
+ * built in the tab and a record hosted in a worker meet on the same word.
+ */
+export function chipUartOwner(componentId: string, handle: number): string {
+  return handle === 0 ? componentId : `${componentId}:uart${handle}`;
 }
 
 export interface ChipInstanceOptions {
   /** Compiled chip.wasm — either bytes, ArrayBuffer, or pre-compiled Module. */
   wasm: Uint8Array | ArrayBuffer | WebAssembly.Module;
   pinManager: PinManager;
-  i2cBus?: I2CBusManager | null;
-  spiBus?: SPIBus | null;
+  /**
+   * The canvas pad each chip pin is, when the two are named apart (a Grove
+   * module whose chip calls its second address's pins SDA2/SCL2, both on the
+   * socket's SDA/SCL). The fabric resolves wires by the component's pads.
+   */
+  busPads?: Record<string, string> | null;
+  /**
+   * The model a backend worker runs for this chip, when the board's guest is
+   * in one (a QEMU ESP32 or STM32): 'custom-chip' when the host shipped the
+   * chip itself to the worker, 'i2c-write-sink' when the worker only ACKs and
+   * echoes a display's writes to this instance. The fabric reports a chip on
+   * a remote bus as missing unless the worker holds one of these for it.
+   */
+  remoteModel?: string | null;
+  /**
+   * Whether this copy of the chip drives what it puts on a wire itself, read
+   * per byte. False while a worker's copy of the same chip answers the guest
+   * (the QEMU fallback of a delegating ESP32 engine): this copy still hears
+   * the bytes, and paints from them, but a second answer on the wire would be
+   * a second driver. Today that is the UART bytes of vx_uart_write; a pin
+   * level reaches the board through the host's own hooks, which gate
+   * themselves. Absent: always.
+   */
+  drivesWires?: () => boolean;
   /** Logical chip pin name → real Arduino pin number (resolved from wires). */
   wires?: Map<string, number>;
   /** User-editable attributes — keyed by name. */
   attrs?: Map<string, number>;
   /** String attribute values (vx_attr_register_string), from chip.json. */
   strAttrs?: Map<string, string>;
-  /** Returns simulation time in nanos (used by vx_sim_now_nanos). */
+  /**
+   * The clock of the board the chip is wired to (its EngineBinding's, the
+   * one the software UART runs on): vx_sim_now_nanos reads it and the chip's
+   * timers fire on its events, at their guest instant. Without one the chip
+   * has no time of its own: the clock stands at whatever the host last
+   * handed tickTimers, and the timers fire from there.
+   */
+  clock?: GuestClock | null;
+  /** A test's clock for vx_sim_now_nanos, in place of `clock`. */
   simNanos?: SimNanosFn;
   /** Callback for chip log/printf output (defaults to console.log). */
   log?: WriteStdoutFn;
@@ -146,6 +240,11 @@ export interface ChipInstanceOptions {
    *  Used by CPU-emulator chips that load their program from a project file
    *  instead of hard-coding it as a C byte array. */
   romBytes?: Uint8Array | null;
+  /** Named byte storage the chip reads and writes (vx_blob_size / _read /
+   *  _write): a microSD model gets its card image here as "card". Copied in,
+   *  so the chip's writes never reach the caller's array behind its back; read
+   *  them back with blobBytes(). */
+  blobs?: Map<string, Uint8Array> | null;
   /** Canvas component id of this chip. Used to key its SPICE pin sources so
    *  the analog engine drives the nets wired to the chip's output pins. */
   componentId?: string;
@@ -155,13 +254,16 @@ export interface ChipInstanceOptions {
 const CHIP_OUTPUT_VCC = 5;
 
 export class ChipInstance {
+  static MODE_INPUT = 0;
+  static MODE_OUTPUT = 1;
   static MODE_OUTPUT_LOW = 16;
   static MODE_OUTPUT_HIGH = 17;
 
   private wasm: ChipInstanceOptions['wasm'];
   private pinManager: PinManager;
-  private i2cBus: I2CBusManager | null;
-  private spiBus: SPIBus | null;
+  private busPads: Record<string, string>;
+  private remoteModel: string | undefined;
+  private drivesWires: (() => boolean) | null;
   private wires: Map<string, number>;
   private attrs: Map<string, number>;
   private strAttrs: Map<string, string>;
@@ -177,11 +279,35 @@ export class ChipInstance {
   private attrHandles: AttrEntry[] = [];
   private _pinWatches = new Map<number, Set<() => void>>();
   private timers: TimerEntry[] = [];
-  private uarts: UartConfig[] = [];
+  // ── The chip's clock ────────────────────────────────────────────────────
+  // The board's guest clock when the host handed one over (see _nowNanos),
+  // else the time the host last handed tickTimers.
+  private clock: GuestClock | null;
+  private simNanosOverride: SimNanosFn | null;
+  /** The last guest time read, to notice the guest's counter starting over. */
+  private _lastGuestNanos = 0n;
+  /** Guest time already counted before the counter last started over: the
+   *  chip's clock never runs backwards across an MCU reset. */
+  private _epochNanos = 0n;
+  /** With no guest clock: the time the host last handed tickTimers. */
+  private _hostNanos = 0n;
+  /** Inside a timer callback: its deadline, which is what the clock answers
+   *  there (the worker's runtime does the same, wasm_chip_runtime.py). */
+  private _timerNow: bigint | null = null;
+  private uarts: UartEntry[] = [];
+  /** A host's ear on what the chip transmits (tests, a part that mirrors the
+   *  bytes). The wire itself is the fabric's, see _uart_write. */
   private _uartTxListener: ((byte: number) => void) | null = null;
   private spiDevices: SpiEntry[] = [];
-  private _currentSpiBufPtr: number = 0;
+  /** chip_setup is running: SPI handles wait for it to finish before joining. */
+  private inSetup = false;
   private _romBytes: Uint8Array;
+  /** Named byte storage, per chip instance. See vx_blob_* in velxio-chip.h. */
+  private _blobs = new Map<string, Uint8Array>();
+  /** Byte span [lo, hi) the chip has written in each blob since the last
+   *  takeBlobDirty(). The host ships those bytes back to whatever owns the
+   *  storage (the SD panel), so it needs the span, not just the fact. */
+  private _blobDirty = new Map<string, [number, number]>();
 
   /** Framebuffer state — created on first vx_framebuffer_init call. */
   private _framebuffer: { rgba: Uint8Array; width: number; height: number } | null = null;
@@ -203,8 +329,10 @@ export class ChipInstance {
    *  simulator's pin-injection API. */
   private _onDigitalWrite: ((pinName: string, value: boolean) => void) | null = null;
 
-  /** I2C device wrapper currently registered on the bus (for disposal). */
-  private _i2cDevice: { address: number } | null = null;
+  /** Every vx_i2c_attach, in call order. */
+  private i2cDevices: I2cDeviceEntry[] = [];
+  /** The same devices by the pins they are on: one bus target each. */
+  private i2cGroups: I2cGroup[] = [];
 
   wasi: WasiShim;
   private _velxioImports: Record<string, (...args: any[]) => any>;
@@ -218,17 +346,26 @@ export class ChipInstance {
   constructor(opts: ChipInstanceOptions) {
     this.wasm = opts.wasm;
     this.pinManager = opts.pinManager;
-    this.i2cBus = opts.i2cBus ?? null;
-    this.spiBus = opts.spiBus ?? null;
+    this.drivesWires = opts.drivesWires ?? null;
+    this.busPads = opts.busPads ?? {};
+    this.remoteModel = opts.remoteModel ?? undefined;
     this.wires = opts.wires ?? new Map();
     this.attrs = opts.attrs ?? new Map();
     this.strAttrs = opts.strAttrs ?? new Map();
     this.display = opts.display ?? null;
     this._romBytes = opts.romBytes ?? new Uint8Array(0);
+    // Copy: the chip owns its blob from here on, and the same copy rule holds
+    // in the Python runtime, so a model cannot behave differently by host.
+    for (const [name, bytes] of opts.blobs ?? []) {
+      this._blobs.set(name, Uint8Array.from(bytes));
+    }
     this.componentId = opts.componentId ?? '';
+    this.clock = opts.clock ?? null;
+    this.simNanosOverride = opts.simNanos ?? null;
 
+    // wasi-libc's clock_time_get is the same clock as vx_sim_now_nanos.
     this.wasi = new WasiShim(
-      opts.simNanos ?? (() => 0n),
+      () => this._nowNanos(),
       opts.log ?? ((s) => console.log(`[chip] ${s.replace(/\n$/, '')}`)),
     );
 
@@ -281,7 +418,26 @@ export class ChipInstance {
     if (!this.exports?.chip_setup) {
       throw new Error('Chip WASM does not export chip_setup');
     }
-    this.exports.chip_setup();
+    this.inSetup = true;
+    try {
+      this.exports.chip_setup();
+    } finally {
+      this.inSetup = false;
+    }
+    // The chip is on the bus once its setup is done, not in the middle of it:
+    // see _joinSpiBus for why the order against its own pin watches matters.
+    for (let i = 0; i < this.spiDevices.length; i++) {
+      const e = this.spiDevices[i];
+      if (!e.bus) e.bus = this._joinSpiBus(e, i);
+    }
+    // And its I2C with every address it attached, in one registration each
+    // pair of pins, rather than one per call while setup is still adding them.
+    for (const g of this.i2cGroups) if (!g.bus) g.bus = this._joinI2cBus(g);
+    // And its UARTs, once the pads they name are registered pins.
+    for (let i = 0; i < this.uarts.length; i++) {
+      const u = this.uarts[i];
+      if (!u.bus) u.bus = this._joinUartBus(u, i);
+    }
     this.wasi.flush();
   }
 
@@ -298,30 +454,120 @@ export class ChipInstance {
    * responsive. budgetMs = 0 (the default, used by headless tests) runs every
    * due fire in one call.
    */
-  tickTimers(nowNanos: bigint | number, budgetMs = 0): void {
-    const now = BigInt(nowNanos);
-    const table = this.exports?.__indirect_function_table as WebAssembly.Table | undefined;
-    if (!table) return;
+  tickTimers(nowNanos?: bigint | number, budgetMs = 0): void {
+    let now: bigint;
+    if (!this.clock && nowNanos !== undefined) {
+      // The host's instant decides what is due, as it always has, whatever
+      // vx_sim_now_nanos answers (a test's own clock may lag it). The host's
+      // time only moves forward: a caller that hands an earlier instant (a
+      // fresh run's zero) does not turn the chip's clock back.
+      now = BigInt(nowNanos);
+      if (now > this._hostNanos) this._hostNanos = now;
+    } else {
+      now = this._nowNanos();
+    }
     const startWall = budgetMs > 0 ? performance.now() : 0;
     for (const t of this.timers) {
       if (!t.active) continue;
       while (t.active && now >= t.nextFire) {
-        const fn = table.get(t.cbIdx) as ((ud: number) => void) | null;
-        if (fn) {
-          try { fn(t.userData); } catch { /* swallow chip errors */ }
-        }
-        if (t.repeat) {
-          t.nextFire += t.period;
-        } else {
-          t.active = false;
-        }
+        this._fireTimer(t);
         if (budgetMs > 0 && performance.now() - startWall > budgetMs) {
           this.wasi.flush();
           return;
         }
       }
+      // On a guest clock every active timer holds a clock event for its
+      // deadline. The event lives on the CPU it was set on, and a rebuilt CPU
+      // (Stop then Run, a reload) drops it without a word, so it is re-armed
+      // here every tick; the engine's own events fire at the exact cycle in
+      // between, this is only the net under them.
+      if (t.active) this._armTimer(t);
     }
     this.wasi.flush();
+  }
+
+  // ── The chip's clock ─────────────────────────────────────────────────────
+
+  /**
+   * The chip's own nanoseconds: what vx_sim_now_nanos (and wasi-libc's
+   * clock_time_get) answer, and the base every timer deadline is in.
+   *
+   * On a board it is the guest's clock, the one the software UART already
+   * runs on (EngineBinding.clock), so a chip measures the 20 ms period a
+   * sketch drives as 20 ms whatever the tab's frame rate, and a 1 ms timer
+   * fires once per ms of the RUN, not once per ms the page has been open
+   * (finding browser-chip-clock-always-zero: it answered 0 here, and the
+   * timers were compared against performance.now()). The guest's counter
+   * starts over when its MCU is rebuilt; the chip is not reset by that (its
+   * data survive a Stop/Run, decisions.md "Stop/Run = reset de la MCU"), so
+   * the time counted before is carried as an epoch and this clock never
+   * runs backwards. A guest that has no time yet (an engine before its SoC
+   * boots reports a 0 Hz clock) stands at the epoch.
+   *
+   * Inside a timer callback the answer is the timer's deadline, as in the
+   * worker's runtime: a periodic timer then sees exact multiples of its
+   * period, whatever the granularity the deadline was reached with.
+   */
+  private _nowNanos(): bigint {
+    if (this._timerNow !== null) return this._timerNow;
+    if (this.simNanosOverride) return BigInt(this.simNanosOverride() as number | bigint);
+    if (!this.clock) return this._hostNanos;
+    const hz = this.clock.clockHz();
+    const guest = hz > 0 ? (BigInt(Math.floor(this.clock.now())) * 1_000_000_000n) / BigInt(Math.floor(hz)) : 0n;
+    if (guest < this._lastGuestNanos) this._epochNanos += this._lastGuestNanos;
+    this._lastGuestNanos = guest;
+    return this._epochNanos + guest;
+  }
+
+  /** The guest cycle a chip instant falls on, for the clock's event queue. */
+  private _cycleOf(nanos: bigint): number {
+    const hz = this.clock ? this.clock.clockHz() : 0;
+    if (hz <= 0) return 0;
+    const guest = nanos > this._epochNanos ? nanos - this._epochNanos : 0n;
+    return Number((guest * BigInt(Math.floor(hz)) + 999_999_999n) / 1_000_000_000n);
+  }
+
+  /** Put the timer's deadline on the guest's event queue (a no-op with no
+   *  clock: the host's tickTimers is the only clock there). */
+  private _armTimer(t: TimerEntry): void {
+    t.cancel?.();
+    t.cancel = null;
+    // A guest with no time yet (0 Hz: an engine before its SoC boots) has no
+    // cycle to put the deadline on; the tick tries again once it runs.
+    if (!this.clock || !t.active || this.clock.clockHz() <= 0) return;
+    t.cancel = this.clock.at(this._cycleOf(t.nextFire), () => {
+      t.cancel = null;
+      if (!t.active) return;
+      // The event is at the deadline's cycle, rounded up: read the clock so
+      // the epoch bookkeeping sees this instant, then fire on the deadline.
+      this._nowNanos();
+      this._fireTimer(t);
+      if (t.active) this._armTimer(t);
+      this.wasi.flush();
+    });
+  }
+
+  private _fireTimer(t: TimerEntry): void {
+    const table = this.exports?.__indirect_function_table as WebAssembly.Table | undefined;
+    const fn = table?.get(t.cbIdx) as ((ud: number) => void) | null;
+    const prev = this._timerNow;
+    // The deadline is the callback's "now" on a guest clock only: a host
+    // that ticks the chip itself answers its own instant there, as before.
+    this._timerNow = this.clock ? t.nextFire : prev;
+    try {
+      if (fn) fn(t.userData);
+    } catch {
+      /* swallow chip errors */
+    } finally {
+      this._timerNow = prev;
+    }
+    if (t.repeat) {
+      t.nextFire += t.period;
+    } else {
+      t.active = false;
+      t.cancel?.();
+      t.cancel = null;
+    }
   }
 
   dispose(): void {
@@ -330,14 +576,15 @@ export class ChipInstance {
       for (const u of set) u();
     }
     this._pinWatches.clear();
+    for (const t of this.timers) t.cancel?.();
     this.timers = [];
-    if (this.i2cBus && this._i2cDevice) {
-      this.i2cBus.removeDevice(this._i2cDevice.address);
-    }
-    if (this.spiBus) {
-      for (const d of this.spiDevices) this.spiBus.removeDevice(d.device);
-    }
+    for (const g of this.i2cGroups) g.bus?.dispose();
+    this.i2cGroups = [];
+    this.i2cDevices = [];
+    for (const e of this.spiDevices) e.bus?.dispose();
     this.spiDevices = [];
+    for (const u of this.uarts) u.bus?.dispose();
+    this.uarts = [];
     // Stop driving any bus nets this chip contributed to, then re-resolve them
     // so a removed chip releases the bus (its drivers no longer count).
     if (this.componentId) clearBusDriversForChip(this.pinManager, this.componentId);
@@ -352,6 +599,7 @@ export class ChipInstance {
       vx_pin_read:        (handle: number) => this._pin_read(handle),
       vx_pin_write:       (handle: number, value: number) => this._pin_write(handle, value),
       vx_pin_read_analog: (handle: number) => this._pin_read_analog(handle),
+      vx_pin_wired: (handle: number) => this._pin_wired(handle),
       vx_pin_dac_write:   (handle: number, voltage: number) => this._pin_dac_write(handle, voltage),
       vx_pin_pwm_write:   (handle: number, duty: number) => this._pin_pwm_write(handle, duty),
       vx_pin_set_mode:    (handle: number, mode: number) => this._pin_set_mode(handle, mode),
@@ -378,7 +626,7 @@ export class ChipInstance {
         this._spi_start(handle, bufPtr, count),
       vx_spi_stop:   (handle: number) => this._spi_stop(handle),
 
-      vx_sim_now_nanos: () => BigInt(this.wasi.simNanos() as number | bigint),
+      vx_sim_now_nanos: () => this._nowNanos(),
       vx_timer_create:  (cbIdx: number, ud: number) => this._timer_create(cbIdx, ud),
       vx_timer_start:   (handle: number, period: bigint, repeat: number) =>
         this._timer_start(handle, period, repeat),
@@ -395,6 +643,12 @@ export class ChipInstance {
       vx_rom_read: (offset: number, dstPtr: number, len: number) =>
         this._rom_read(offset, dstPtr, len),
 
+      vx_blob_size:  (namePtr: number) => this._blob_size(namePtr),
+      vx_blob_read:  (namePtr: number, offset: number, dstPtr: number, len: number) =>
+        this._blob_read(namePtr, offset, dstPtr, len),
+      vx_blob_write: (namePtr: number, offset: number, srcPtr: number, len: number) =>
+        this._blob_write(namePtr, offset, srcPtr, len),
+
       vx_log: (msgPtr: number) => {
         const msg = readCString(this.memory!, msgPtr);
         this.wasi.writeStdout(`[chip] ${msg}\n`);
@@ -409,6 +663,65 @@ export class ChipInstance {
     const end = Math.min(offset + len, max);
     const dst = new Uint8Array(this.memory.buffer, dstPtr, end - offset);
     dst.set(this._romBytes.subarray(offset, end));
+  }
+
+  // ── Named blobs ──────────────────────────────────────────────────────────
+  // The contract these three follow is written out in velxio-chip.h: storage
+  // is per instance, an unknown name has nothing, a blob never grows, and both
+  // directions truncate at the end and return what they moved. The Python
+  // runtime answers the same for the same call, which is the only reason one
+  // model can run next to the CPU on QEMU and in the tab here. It guards its
+  // store with a lock and this does not, because there the chip runs on QEMU's
+  // IO thread while the host drains the spans from another, and here there is
+  // only the one thread.
+
+  /** A NULL pointer is not a name. Python's _read_cstring says the same for
+   *  ptr 0, so both hosts land on "unknown blob" instead of reading address 0. */
+  private _blob_name(namePtr: number): string {
+    if (!this.memory || namePtr === 0) return '';
+    return readCString(this.memory, namePtr);
+  }
+
+  private _blob_size(namePtr: number): number {
+    return this._blobs.get(this._blob_name(namePtr))?.length ?? 0;
+  }
+
+  private _blob_read(namePtr: number, offset: number, dstPtr: number, len: number): number {
+    const blob = this._blobs.get(this._blob_name(namePtr));
+    if (!this.memory || !blob || len <= 0 || offset < 0 || offset >= blob.length) return 0;
+    const n = Math.min(len, blob.length - offset);
+    new Uint8Array(this.memory.buffer, dstPtr, n).set(blob.subarray(offset, offset + n));
+    return n;
+  }
+
+  private _blob_write(namePtr: number, offset: number, srcPtr: number, len: number): number {
+    const name = this._blob_name(namePtr);
+    const blob = this._blobs.get(name);
+    if (!this.memory || !blob || len <= 0 || offset < 0 || offset >= blob.length) return 0;
+    const n = Math.min(len, blob.length - offset);
+    blob.set(new Uint8Array(this.memory.buffer, srcPtr, n), offset);
+    const span = this._blobDirty.get(name);
+    if (span) {
+      span[0] = Math.min(span[0], offset);
+      span[1] = Math.max(span[1], offset + n);
+    } else {
+      this._blobDirty.set(name, [offset, offset + n]);
+    }
+    return n;
+  }
+
+  /** Current bytes of a named blob, or null when the chip has no such blob.
+   *  The live buffer, so a caller that means to keep it copies it. */
+  blobBytes(name: string): Uint8Array | null {
+    return this._blobs.get(name) ?? null;
+  }
+
+  /** The byte spans [lo, hi) the chip wrote since the last call, and clears
+   *  them. The host ships those bytes to whoever owns the storage. */
+  takeBlobDirty(): Map<string, [number, number]> {
+    const out = this._blobDirty;
+    this._blobDirty = new Map();
+    return out;
   }
 
   // ── Pin implementations ──────────────────────────────────────────────────
@@ -439,6 +752,74 @@ export class ChipInstance {
     );
   }
 
+  /** True if this pin is wired to a pin of the board (a numbered GPIO), as
+   *  opposed to a chip-only net or to nothing. */
+  private _isBoardPin(p: PinEntry): boolean {
+    return p.arduinoPin != null && p.arduinoPin >= 0 && !isSyntheticChipPin(p.arduinoPin);
+  }
+
+  /**
+   * Put this pin's current (mode, value) on the board pin it is wired to, as
+   * one driver of that pin's net (busNets.setBoardPinDrive): the resolution
+   * against the MCU's pad and any other chip on the pin decides the level,
+   * and the level reaches the PinManager and, through the host's
+   * digital-write hook, the guest's input register. An INPUT mode is the
+   * release: the chip leaves the net and the pull, or whoever else holds
+   * the line, has it. The three ABI calls that move a pin's drive
+   * (vx_pin_register, vx_pin_write, vx_pin_set_mode) all come through here,
+   * so a pull made with vx_pin_set_mode(VX_OUTPUT_LOW) reaches the board
+   * exactly as one made with vx_pin_write(0) does.
+   *
+   * A pin a bus took (see _busOwnsPin) is the chip's again the moment the
+   * chip writes it or sets its mode: the Grove US5 turns its serial pad
+   * into a plain level in its IO mode with vx_pin_write on the TX it
+   * attached. What the bus withdrew was the registration's mode, never a
+   * write the chip makes.
+   */
+  private _boardDrive(p: PinEntry): void {
+    if (p.arduinoPin == null) return;
+    p.busOwned = false;
+    const name = p.name;
+    const drive = modeToDrive(p.mode, p.value);
+    setBoardPinDrive(
+      this.pinManager,
+      p.arduinoPin,
+      `${this.componentId}::${name}`,
+      // An input's pull is not put on a board pin. The parts on that pin
+      // inject their levels with no strength (a button, a chip select a
+      // test drives), and a pull that counted would beat every one of
+      // them; the worker's runtime models no chip pull either.
+      drive.strength === Strength.PULL ? HIGHZ_DRIVE : drive,
+      (level) => this._onDigitalWrite?.(name, level),
+    );
+  }
+
+  /**
+   * A bus attach named this pin as one the bus drives: from here on the
+   * bus's protocol puts the level on the wire (the fabric answers MISO per
+   * frame and clocks TX bits on the guest's clock) and the pin's own mode
+   * does not. A chip declares its MISO an output, as the datasheet does, and
+   * never writes it; if that declaration stayed on the net as a strong low
+   * it would fight every bit the bus shifts out. Whatever drive the
+   * registration put on the net is withdrawn here, which leaves the line
+   * where it is, as before, until the bus speaks.
+   */
+  private _busOwnsPin(handle: number): void {
+    const p = handle >= 0 ? this.pins[handle] : undefined;
+    if (!p || p.busOwned) return;
+    if (this._isBoardPin(p)) {
+      const name = p.name;
+      setBoardPinDrive(
+        this.pinManager,
+        p.arduinoPin!,
+        `${this.componentId}::${name}`,
+        modeToDrive(ChipInstance.MODE_INPUT, p.value),
+        (level) => this._onDigitalWrite?.(name, level),
+      );
+    }
+    p.busOwned = true;
+  }
+
   private _syncSpiceDrive(p: PinEntry): void {
     // A bus net is served by the digital driver-strength path; emitting a SPICE
     // chip source per chip on the same net would create false analog contention.
@@ -466,15 +847,17 @@ export class ChipInstance {
     this.pins.push(p);
     if (this._isBusPin(p)) {
       this._busDrive(p);
+    } else if (this._isBoardPin(p)) {
+      // VX_OUTPUT_LOW / VX_OUTPUT_HIGH drive their level from here on and a
+      // pulled input puts its pull on the wire. A plain VX_OUTPUT drives
+      // nothing until the chip writes it or sets its mode again: the same
+      // rule as the worker's runtime (wasm_chip_runtime.py), and the one
+      // every chip that declares a bus output (a MISO, a TX) and leaves the
+      // level to its bus relies on.
+      if (mode !== ChipInstance.MODE_OUTPUT) this._boardDrive(p);
     } else if (arduinoPin != null) {
-      if (mode === ChipInstance.MODE_OUTPUT_LOW) {
-        this.pinManager.triggerPinChange(arduinoPin, false);
-        if (!isSyntheticChipPin(arduinoPin)) this._onDigitalWrite?.(name, false);
-      }
-      if (mode === ChipInstance.MODE_OUTPUT_HIGH) {
-        this.pinManager.triggerPinChange(arduinoPin, true);
-        if (!isSyntheticChipPin(arduinoPin)) this._onDigitalWrite?.(name, true);
-      }
+      if (mode === ChipInstance.MODE_OUTPUT_LOW) this.pinManager.triggerPinChange(arduinoPin, false);
+      if (mode === ChipInstance.MODE_OUTPUT_HIGH) this.pinManager.triggerPinChange(arduinoPin, true);
     }
     this._syncSpiceDrive(p);
     return handle;
@@ -492,19 +875,47 @@ export class ChipInstance {
     p.value = value !== 0 ? 1 : 0;
     if (this._isBusPin(p)) {
       this._busDrive(p);
+    } else if (this._isBoardPin(p)) {
+      // The board's own digitalRead sees it through the net's resolution,
+      // which the host's digital-write hook feeds into the guest.
+      this._boardDrive(p);
     } else {
       this.pinManager.triggerPinChange(p.arduinoPin, value !== 0);
-      // A chip output wired to a REAL board pin must reach the board's own
-      // digitalRead too — the host forwards into the simulator.
-      if (!isSyntheticChipPin(p.arduinoPin)) this._onDigitalWrite?.(p.name, value !== 0);
     }
     this._syncSpiceDrive(p);
   }
 
+  /**
+   * The voltage on the pin's pad, as the circuit solve publishes it for the
+   * pad's net (padVolts): what an ADC model samples. 0 for a pad on no net,
+   * or on a net the solve has no number for. It used to answer the pad's PWM
+   * duty times five, which is not a voltage of anything on the canvas, while
+   * the worker answered the digital level times five (finding
+   * vx-pin-read-analog-answers-neither-host-the-solve); both hosts now read
+   * the same published number.
+   */
   private _pin_read_analog(handle: number): number {
     const p = this.pins[handle];
-    if (!p || p.arduinoPin == null) return 0;
-    return this.pinManager.getPwmValue(p.arduinoPin) * 5.0;
+    if (!p) return 0;
+    return padVolts(this.componentId, this._padOf(p)) ?? 0;
+  }
+
+  /**
+   * 1 when a wire reaches the pin's pad: the diagram puts it on a net, or the
+   * host's wiring map resolved it to a board or chip-net pin. A model whose
+   * UI control stands in for a missing wire reads the control only when this
+   * answers 0.
+   */
+  private _pin_wired(handle: number): number {
+    const p = this.pins[handle];
+    if (!p) return 0;
+    if (p.arduinoPin != null) return 1;
+    return padNet(this.componentId, this._padOf(p)) !== undefined ? 1 : 0;
+  }
+
+  /** The component pad a chip pin is (see ChipInstanceOptions.busPads). */
+  private _padOf(p: PinEntry): string {
+    return this.busPads[p.name] ?? p.name;
   }
 
   private _pin_dac_write(handle: number, voltage: number): void {
@@ -562,6 +973,13 @@ export class ChipInstance {
     if (mode === ChipInstance.MODE_OUTPUT_HIGH) p.value = 1;
     if (this._isBusPin(p)) {
       this._busDrive(p);
+    } else if (this._isBoardPin(p)) {
+      // VX_INPUT (and the pulled inputs) is the documented tri-state idiom:
+      // the chip lets go of the board pin and the pull restores the level.
+      // It used to change the mode and nothing else, so the board kept
+      // reading the chip's last level (finding
+      // chip-release-to-input-keeps-board-pin-driven).
+      this._boardDrive(p);
     } else if (p.arduinoPin != null) {
       if (mode === ChipInstance.MODE_OUTPUT_LOW)  this.pinManager.triggerPinChange(p.arduinoPin, false);
       if (mode === ChipInstance.MODE_OUTPUT_HIGH) this.pinManager.triggerPinChange(p.arduinoPin, true);
@@ -646,11 +1064,21 @@ export class ChipInstance {
 
   // ── I2C ──────────────────────────────────────────────────────────────────
 
+  /**
+   * vx_i2c_attach: THIS is where a chip enters an I2C bus, with the SDA and
+   * SCL its config names. The fabric puts it on the bus those pads are wired
+   * to, so a chip on Wire1 answers Wire1, a chip whose SDA/SCL go nowhere
+   * answers nobody (as on the bench), and a chip whose pins go to two GPIOs is
+   * served by the software decoder. Every address a chip attaches on the same
+   * pins is one target: they all answer, and they all leave with the chip.
+   *
+   * Returns 0 like the worker's runtime (wasm_chip_runtime.py), so a chip
+   * reads the same handle in every host.
+   */
   private _i2c_attach(cfgPtr: number): number {
-    if (!this.i2cBus) {
-      throw new Error('Chip called vx_i2c_attach but no I2CBusManager is wired to the host');
-    }
     const cfg = readI2CConfig(this.memory!, cfgPtr);
+    this._busOwnsPin(cfg.sda);
+    this._busOwnsPin(cfg.scl);
     const callFn = (idx: number, ...args: any[]) => {
       const table = this.exports?.__indirect_function_table as WebAssembly.Table | undefined;
       if (!table) return 0;
@@ -663,12 +1091,13 @@ export class ChipInstance {
        addressed for writing or for reading, and it has to know WHICH — a
        display waits for its command byte, a memory stages the bytes it is
        about to hand over.
-       The masters here do not announce that: `I2CBusManager.connectToSlave`
-       picks the device and remembers the direction without telling it, and the
-       engines' buses do the same. So the phase is read off the byte stream,
-       which carries it exactly: the first write after anything else IS the
-       write phase starting, and the first read after a write IS a REPEATED
-       START — the master keeping the bus and turning it around.
+       The bus fabric announces it: every START and repeated START that names
+       this address calls connect(). The byte stream carries it exactly as
+       well, and the phase is read off it too, so no caller of the device can
+       skip it:
+       the first write after anything else IS the write phase starting, and
+       the first read after a write IS a REPEATED START, the master keeping
+       the bus and turning it around.
        That last one was silently missing. Only a STOP used to re-arm the
        announcement, so `Wire.endTransmission(false)` followed by requestFrom()
        — the idiom Adafruit_BusIO's write_then_read() and half the drivers out
@@ -682,7 +1111,7 @@ export class ChipInstance {
       if (cfg.on_connect) callFn(cfg.on_connect, cfg.user_data, cfg.address, isRead ? 1 : 0);
       phase = isRead ? 'read' : 'write';
     };
-    const device = {
+    const device: ChipI2cDevice = {
       address: cfg.address,
       /** Masters that DO announce the phase call this; the rest are covered
        *  by the inference in writeByte / readByte, and this keeps them from
@@ -711,18 +1140,154 @@ export class ChipInstance {
       },
     };
 
-    this.i2cBus.addDevice(device);
-    this._i2cDevice = device;
+    const entry: I2cDeviceEntry = {
+      cfg,
+      scl: this._busPad(cfg.scl),
+      sda: this._busPad(cfg.sda),
+      device,
+    };
+    this.i2cDevices.push(entry);
+    if (!entry.scl || !entry.sda) {
+      // No pad to resolve: nothing on a bench would ever clock it either.
+      this.wasi.writeStdout(
+        `vx_i2c_attach at 0x${cfg.address.toString(16)} names no SDA/SCL pin; the chip is on no bus\n`,
+      );
+      return 0;
+    }
+    let group = this.i2cGroups.find((g) => g.scl === entry.scl && g.sda === entry.sda);
+    if (!group) {
+      // The first pair is the chip itself, under its component id: that is
+      // the identity a QEMU worker's copy of the chip carries too.
+      const owner = this.i2cGroups.length === 0 ? this.componentId : `${this.componentId}:i2c${this.i2cGroups.length}`;
+      group = { owner, scl: entry.scl, sda: entry.sda, entries: [], bus: null };
+      this.i2cGroups.push(group);
+    }
+    group.entries.push(entry);
+    // A later attach replaces the registration with one that has every
+    // address (the registry drops the owner's previous one first).
+    if (!this.inSetup) group.bus = this._joinI2cBus(group);
     return 0;
+  }
+
+  /** The canvas pad of a chip pin handle, for the fabric's wire walk. */
+  private _busPad(handle: number): string | undefined {
+    const p = handle >= 0 ? this.pins[handle] : undefined;
+    if (!p || !p.name) return undefined;
+    return this.busPads[p.name] ?? p.name;
+  }
+
+  /**
+   * Put one pair of pins on the bus. Null when the chip has no canvas
+   * identity to resolve its wires against.
+   *
+   * The target dispatches by address: the fabric only calls it for one of the
+   * addresses it registered, and the device that owns that address takes the
+   * phase. The STOP goes to every device addressed since the last one.
+   */
+  private _joinI2cBus(group: I2cGroup): BusHandle | null {
+    if (!this.componentId) return null;
+    const byAddress = new Map<number, ChipI2cDevice>();
+    // Two attaches at one address: the later one answers, as it did before.
+    for (const e of group.entries) byAddress.set(e.cfg.address & 0x7f, e.device);
+    let current: ChipI2cDevice | null = null;
+    const touched = new Set<ChipI2cDevice>();
+    const target: I2cTarget = {
+      // The chip's own code answers each byte and may refuse one, so a host
+      // that ACKs writes ahead of this tab (the Pi relay) has to ask.
+      mayNak: true,
+      start: (address, read) => {
+        current = byAddress.get(address & 0x7f) ?? null;
+        if (!current) return false;
+        touched.add(current);
+        // on_connect's return is not the ACK, in this host or the worker's.
+        return current.connect(address, read);
+      },
+      write: (byte) => (current ? current.writeByte(byte) : false),
+      read: () => (current ? current.readByte() : 0xff),
+      stop: () => {
+        current = null;
+        const list = Array.from(touched);
+        touched.clear();
+        for (const d of list) d.stop();
+      },
+      // The MCU reset mid-transaction: the chip sees the STOP it will never
+      // get, and nothing else. Its data is its own.
+      boardReset: () => {
+        if (touched.size === 0) return;
+        current = null;
+        const list = Array.from(touched);
+        touched.clear();
+        for (const d of list) d.stop();
+      },
+    };
+    return attachI2cTarget(
+      {
+        owner: group.owner,
+        componentId: this.componentId,
+        pins: { scl: group.scl, sda: group.sda },
+        addresses: Array.from(byAddress.keys()),
+        remoteModel: this.remoteModel,
+      },
+      target,
+    );
   }
 
   // ── UART ─────────────────────────────────────────────────────────────────
 
+  /**
+   * vx_uart_attach: THIS is where a chip gets on a UART wire, with the RX and
+   * TX pads its config names, as vx_spi_attach and vx_i2c_attach do for their
+   * buses. The fabric walks the wires from each pad: the RX pad hears whatever
+   * transmits on the board pin it reaches (a controller's TX, or a GPIO the
+   * sketch bit-bangs on the guest's clock), the TX pad drives the wire it
+   * reaches (a controller's RX, or edges on a plain GPIO), and a pad wired to
+   * nothing is on no wire at all. There is no USART0 or Serial1 to fall back
+   * to. The rate is the chip's own (`baud_rate`): what the fabric checks the
+   * controller against, and the bit time a pad on a plain GPIO is clocked at.
+   *
+   * Until board-buses F6 the part that hosts the chip did this attach, after
+   * start(), from the pads it asked the chip for, and skipped the ESP32 kind
+   * so an overlay extension could do the same job there; two hosts for one
+   * registration, and a third would have been needed for every new one. The
+   * chip's own call is the one place that knows the pads, so it registers.
+   *
+   * The handle is the index, as before: chips key their writes by it.
+   */
   private _uart_attach(cfgPtr: number): number {
     const cfg = readUartConfig(this.memory!, cfgPtr);
+    this._busOwnsPin(cfg.tx);
     const handle = this.uarts.length;
-    this.uarts.push(cfg);
+    const entry: UartEntry = { cfg, bus: null };
+    this.uarts.push(entry);
+    // During chip_setup the pads may not all be registered yet, and the SPI
+    // and I2C joins wait for start() to finish it too; a handle attached
+    // later (from a timer) joins straight away.
+    if (!this.inSetup) entry.bus = this._joinUartBus(entry, handle);
     return handle;
+  }
+
+  /**
+   * Put one UART handle on the wires its pads reach. Null when the chip has
+   * no canvas identity to resolve its wires against, or names no pad at all.
+   */
+  private _joinUartBus(entry: UartEntry, handle: number): UartHandle | null {
+    if (!this.componentId) return null;
+    const rx = this._busPad(entry.cfg.rx);
+    const tx = this._busPad(entry.cfg.tx);
+    if (!rx && !tx) {
+      // No pad to resolve: nothing on a bench would ever reach it either.
+      this.wasi.writeStdout('vx_uart_attach names no RX/TX pin; the chip is on no wire\n');
+      return null;
+    }
+    return attachUartEndpoint(
+      {
+        owner: chipUartOwner(this.componentId, handle),
+        componentId: this.componentId,
+        pins: { ...(rx ? { rx } : {}), ...(tx ? { tx } : {}) },
+        baud: entry.cfg.baud_rate > 0 ? entry.cfg.baud_rate : 9600,
+      },
+      { receive: (byte) => this.feedUart(byte, handle) },
+    );
   }
 
   private _uart_write(handle: number, bufPtr: number, count: number): number {
@@ -730,64 +1295,89 @@ export class ChipInstance {
     if (!u) return 0;
     const u8 = new Uint8Array(this.memory!.buffer);
     const bytes = u8.slice(bufPtr, bufPtr + count);
-    if (this._uartTxListener) {
-      for (const b of bytes) this._uartTxListener(b);
+    for (const b of bytes) {
+      // The wire: the fabric puts the byte on the TX pad's net (into the
+      // controller whose RX is there, or as edges on a plain GPIO), unless
+      // another copy of this chip is the one driving it right now.
+      if (!this.drivesWires || this.drivesWires()) u.bus?.transmit(b);
+      // The host's ear, if it has one.
+      this._uartTxListener?.(b);
     }
-    if (u.on_tx_done) {
+    if (u.cfg.on_tx_done) {
       const table = this.exports?.__indirect_function_table as WebAssembly.Table | undefined;
-      const fn = table?.get(u.on_tx_done) as ((ud: number) => void) | null;
+      const fn = table?.get(u.cfg.on_tx_done) as ((ud: number) => void) | null;
       if (fn) {
-        try { fn(u.user_data); } catch { /* swallow */ }
+        try { fn(u.cfg.user_data); } catch { /* swallow */ }
       }
     }
     this.wasi.flush();
     return 1;
   }
 
+  /** A byte arriving at the chip's RX pad (the fabric's delivery; tests feed it directly). */
   feedUart(byte: number, handle = 0): void {
     const u = this.uarts[handle];
-    if (!u || !u.on_rx_byte) return;
+    if (!u || !u.cfg.on_rx_byte) return;
     const table = this.exports?.__indirect_function_table as WebAssembly.Table | undefined;
-    const fn = table?.get(u.on_rx_byte) as ((ud: number, byte: number) => void) | null;
+    const fn = table?.get(u.cfg.on_rx_byte) as ((ud: number, byte: number) => void) | null;
     if (fn) {
-      try { fn(u.user_data, byte & 0xff); } catch { /* swallow */ }
+      try { fn(u.cfg.user_data, byte & 0xff); } catch { /* swallow */ }
     }
     this.wasi.flush();
   }
 
+  /**
+   * Hear every byte the chip transmits, on any handle, after the fabric has
+   * had it. An observer: it does not stand in for the wire, and a host that
+   * puts what it hears back on a bus of its own sends every byte twice.
+   */
   onUartTx(cb: (byte: number) => void): void {
     this._uartTxListener = cb;
   }
 
   /**
    * Where a declared UART's TX physically goes: the board pin its TX chip-pin
-   * is wired to (null when unwired/synthetic) and the configured baud. Lets
-   * the part route TX to the hardware USART vs a bit-banged GPIO.
+   * is wired to (null when unwired/synthetic) and the configured baud.
    */
   getUartTxRoute(handle = 0): { txArduinoPin: number | null; baud: number } | null {
     const u = this.uarts[handle];
     if (!u) return null;
-    const pin = this.pins[u.tx];
+    const pin = this.pins[u.cfg.tx];
     return {
       txArduinoPin: pin?.arduinoPin ?? null,
-      baud: u.baud_rate > 0 ? u.baud_rate : 9600,
+      baud: u.cfg.baud_rate > 0 ? u.cfg.baud_rate : 9600,
     };
   }
 
   /**
-   * The chip pad names a UART was attached with (`vx_uart_config.rx/.tx`),
-   * so a host can route each direction by the board pin the user wired to
-   * that pad. Null pads for handles the chip never registered. The names,
-   * not the pin numbers: the host owns the wire map and the board's pin
-   * table, and a pad wired to nothing still has a name to log.
+   * The chip pad names a UART was attached with (`vx_uart_config.rx/.tx`).
+   * Null pads for handles the chip never registered. The names, not the pin
+   * numbers: a host that cannot run the chip beside its guest (a QEMU board)
+   * reads them off an inert copy and places them on the fabric itself.
    */
   getUartPads(handle = 0): { rxPad: string | null; txPad: string | null } | null {
     const u = this.uarts[handle];
     if (!u) return null;
     return {
-      rxPad: this.pins[u.rx]?.name ?? null,
-      txPad: this.pins[u.tx]?.name ?? null,
+      rxPad: this.pins[u.cfg.rx]?.name ?? null,
+      txPad: this.pins[u.cfg.tx]?.name ?? null,
     };
+  }
+
+  /**
+   * Hand the chip one write phase it did not see on a bus: a QEMU worker that
+   * only ACKs a display's writes echoes them, and this copy of the chip draws
+   * from them. Addressed, written and stopped exactly as the bus would. False
+   * when the chip attached no device at that address.
+   */
+  replayI2cWrite(address: number, data: readonly number[]): boolean {
+    let dev: ChipI2cDevice | undefined;
+    for (const e of this.i2cDevices) if ((e.cfg.address & 0x7f) === (address & 0x7f)) dev = e.device;
+    if (!dev) return false;
+    dev.connect(address, false);
+    for (const b of data) dev.writeByte(b & 0xff);
+    dev.stop();
+    return true;
   }
 
   /** True if the chip declared at least one UART (post-chip_setup). */
@@ -797,36 +1387,175 @@ export class ChipInstance {
 
   // ── SPI ──────────────────────────────────────────────────────────────────
 
+  /**
+   * vx_spi_attach: THIS is where a chip joins an SPI bus, not where its part
+   * mounts. A model that never calls it (every UART-only and I2C-only Grove
+   * module) now takes no part in SPI at all, which is what issue #355 was
+   * about (findings grove-chip-takes-spi-on-rp-and-xiao-arm,
+   * customchip-setspihandler-steals-bus0).
+   *
+   * The pins of the chip's own config decide which bus it lands on and when it
+   * is selected: the fabric resolves them through the circuit's nets and only
+   * clocks the chip while its chip select is active. `cs = NO_PIN` (-1) means
+   * the chip has no select line, like a 74HC595 whose SER/SRCLK shift whatever
+   * the bus carries. Handles are independent devices: a chip with two of them
+   * is two owners on the bus, each with its own buffer and its own select.
+   */
   private _spi_attach(cfgPtr: number): number {
-    if (!this.spiBus) {
-      throw new Error('Chip called vx_spi_attach but no SPIBus is wired to the host');
-    }
     const cfg = readSpiConfig(this.memory!, cfgPtr);
+    this._busOwnsPin(cfg.miso);
     const handle = this.spiDevices.length;
-    const device = new SPIDevice();
-
-    const onDoneCallback = (_buffer: Uint8Array, count: number) => {
-      if (cfg.on_done) {
+    // The completion is handed THIS handle's buffer pointer. It used to be an
+    // instance-wide field, so the last vx_spi_start of any handle decided what
+    // every on_done saw (finding spi-done-bufptr-shared).
+    const device = new SPIDevice(
+      () => new Uint8Array(this.memory!.buffer),
+      (bufPtr, count) => {
+        if (!cfg.on_done) return;
         const table = this.exports?.__indirect_function_table as WebAssembly.Table | undefined;
         const fn = table?.get(cfg.on_done) as ((ud: number, buf: number, c: number) => void) | null;
         if (fn) {
-          try { fn(cfg.user_data, this._currentSpiBufPtr, count); } catch { /* swallow */ }
+          try { fn(cfg.user_data, bufPtr, count); } catch { /* swallow */ }
         }
         this.wasi.flush();
-      }
-    };
-
-    this.spiDevices.push({ device, cfg, onDoneCallback });
-    this.spiBus.addDevice(device);
+      },
+    );
+    const entry: SpiEntry = { device, cfg, bus: null };
+    this.spiDevices.push(entry);
+    // During chip_setup the join waits for start() to finish it (see
+    // _joinSpiBus); a handle attached later joins straight away.
+    if (!this.inSetup) entry.bus = this._joinSpiBus(entry, handle);
     return handle;
+  }
+
+  /**
+   * Put one SPI handle on the bus its pins are wired to. Null when the chip has
+   * no clock pin, or no canvas identity to resolve its wires against.
+   *
+   * Called after chip_setup, never inside it, so the chip's own CS watch is
+   * registered on that pin BEFORE the bus's. The order is what a real chip
+   * does: it puts its first MISO bit on the wire as CS falls, so it has to have
+   * armed its answer by the time the bus asks what it will shift out (a
+   * bit-banged master reads that bit before the first clock edge).
+   */
+  private _joinSpiBus(entry: SpiEntry, handle: number): BusHandle | null {
+    const { cfg } = entry;
+    const pinName = (h: number): string | undefined => {
+      const p = h >= 0 ? this.pins[h] : undefined;
+      return p && p.name ? p.name : undefined;
+    };
+    const sck = pinName(cfg.sck);
+    if (!this.componentId || !sck) return null;
+    const drivesMiso = pinName(cfg.miso) !== undefined;
+    return attachSpiDevice(
+      {
+        owner: `${this.componentId}:spi${handle}`,
+        componentId: this.componentId,
+        pins: { sck, mosi: pinName(cfg.mosi), miso: pinName(cfg.miso), cs: pinName(cfg.cs) },
+        // The mode the chip was written for, and the order it shifts in: the
+        // ABI has no bit-order field (velxio-chip.h: a chip exchanges bytes
+        // MSB first, the way every part datasheet the gallery models does), so
+        // the order is stated here rather than left to the bus's default. The
+        // bus compares both with the controller's and reports a mismatch
+        // (`spi-mode`, `spi-bit-order`, D-011) instead of exchanging bytes
+        // that would come out shifted on hardware. The clock rate has no
+        // chip-side counterpart either: a controller reports its rate in its
+        // config (`SpiControllerConfig.hz`) and a chip has nothing to hold
+        // against it, so nothing is dropped here.
+        modes: [(cfg.mode & 3) as SpiMode],
+        bitOrder: 'msb',
+      },
+      {
+        // The bus only calls a device while it is selected; what gates the
+        // bytes on this side is the chip's own arming (vx_spi_start /
+        // vx_spi_stop), the documented Wokwi-compatible contract, which the
+        // chip drives from its own pin watch. The bus's select edges are put
+        // on that pin so the watch fires under a hardware chip select too.
+        select: () => this._mirrorSelect(entry, true),
+        deselect: () => this._mirrorSelect(entry, false),
+        transfer: (mosi) =>
+          drivesMiso
+            ? this._spiExchange(entry, mosi) ?? entry.device.transfer(mosi)
+            : this._spiSink(entry, mosi),
+        peekMiso: () => (drivesMiso ? entry.device.peek() : null),
+        // The MCU reset: the transaction in flight is over, as it is when CS
+        // is released. Protocol state only: the chip's own data is its own.
+        boardReset: () => entry.device.stopTransfer(),
+      },
+    );
+  }
+
+  /**
+   * The bus's select edge, put on the chip's own CS pin when the pad does not
+   * carry it.
+   *
+   * The ABI tells a chip about its select in one way: the pin watch it puts
+   * on its CS pin (velxio-chip.h). A controller that drives its select in
+   * hardware never moves that pad (the PL022 of the RP2040 and RP2350 raises
+   * CSn inside the peripheral; the Pi's controller mirrors CE0 onto the pad,
+   * which is why the header path never showed this), so the bus knew the
+   * transaction boundary and the chip did not: a frame-oriented model was
+   * right for one transaction and out of step for every one after
+   * (mcp3008-portable "reads the same code on the next hardware-chip-select
+   * transaction"). Silicon sees its CS leg move whichever block of the MCU
+   * drives it, and so does the chip now.
+   *
+   * A no-op when the PinManager already carries the level: a GPIO select
+   * reaches it through the engine's own level channel, and a pad it has
+   * already moved must not move twice (the watch counts edges). A select that
+   * was never driven idles high, the pull-up of every breakout, so the first
+   * assertion of a hardware select is a falling edge for the chip, as it is
+   * on the bench.
+   */
+  private _mirrorSelect(entry: SpiEntry, active: boolean): void {
+    const p = entry.cfg.cs >= 0 ? this.pins[entry.cfg.cs] : undefined;
+    if (!p || p.arduinoPin == null) return;
+    // The ABI's select is active low: the bus clocks the chip while the pin is low.
+    const level = !active;
+    const current = this.pinManager.peekPinState(p.arduinoPin);
+    if (current === level) return;
+    if (current === undefined && !level) this.pinManager.triggerPinChange(p.arduinoPin, true);
+    this.pinManager.triggerPinChange(p.arduinoPin, level);
+  }
+
+  /**
+   * A chip that answers each byte as it arrives (velxio-chip.h `on_exchange`)
+   * is asked here, with the whole byte, and its answer is the MISO for THAT
+   * byte. Undefined when the chip has no such callback, so the buffer contract
+   * applies. The armed buffer is left alone on purpose: it is the look-ahead
+   * `peekMiso` serves a bit-banged master, and the chip refreshes it itself.
+   * The Python host does the same (wasm_chip_runtime.spi_transfer_byte), so a
+   * chip answers the same bytes in the tab, in a QEMU worker and beside a
+   * Linux guest.
+   */
+  private _spiExchange(entry: SpiEntry, mosi: number): number | undefined {
+    const idx = entry.cfg.on_exchange;
+    if (!idx) return undefined;
+    const table = this.exports?.__indirect_function_table as WebAssembly.Table | undefined;
+    const fn = table?.get(idx) as ((ud: number, b: number) => number) | null;
+    if (!fn) return undefined;
+    let miso = 0xff;
+    try {
+      miso = fn(entry.cfg.user_data, mosi & 0xff) & 0xff;
+    } catch {
+      /* a chip that traps leaves the line at its idle level */
+    }
+    this.wasi.flush();
+    return miso;
+  }
+
+  /** A handle with no MISO pin receives the master's bytes and drives nothing. */
+  private _spiSink(entry: SpiEntry, mosi: number): null {
+    // A chip that takes its bytes through `on_exchange` takes them that way
+    // whether or not its MISO leg is wired; only the answer is dropped.
+    if (this._spiExchange(entry, mosi) === undefined) entry.device.transfer(mosi);
+    return null;
   }
 
   private _spi_start(handle: number, bufPtr: number, count: number): void {
     const entry = this.spiDevices[handle];
     if (!entry) return;
-    const buf = new Uint8Array(this.memory!.buffer, bufPtr, count);
-    this._currentSpiBufPtr = bufPtr;
-    entry.device.startTransfer(buf, count, (b, c) => entry.onDoneCallback(b, c));
+    entry.device.startTransfer(bufPtr, count);
   }
 
   private _spi_stop(handle: number): void {
@@ -914,21 +1643,40 @@ export class ChipInstance {
 
   private _timer_create(cbIdx: number, userData: number): number {
     const handle = this.timers.length;
-    this.timers.push({ cbIdx, userData, active: false, period: 0n, nextFire: 0n, repeat: false });
+    this.timers.push({
+      cbIdx,
+      userData,
+      active: false,
+      period: 0n,
+      nextFire: 0n,
+      repeat: false,
+      cancel: null,
+    });
     return handle;
   }
 
+  /**
+   * The deadline is one period from the chip's clock now (a timer started
+   * from a timer callback counts from that callback's deadline, so a chain
+   * of one-shots keeps an exact cadence), and it is armed on the guest's
+   * event queue so the callback runs at that cycle, between the guest's
+   * instructions, not at the next animation frame.
+   */
   private _timer_start(handle: number, periodNanos: bigint, repeat: number): void {
     const t = this.timers[handle];
     if (!t) return;
     t.period = BigInt(periodNanos);
     t.repeat = !!repeat;
-    t.nextFire = BigInt(this.wasi.simNanos() as number | bigint) + t.period;
+    t.nextFire = this._nowNanos() + t.period;
     t.active = true;
+    this._armTimer(t);
   }
 
   private _timer_stop(handle: number): void {
     const t = this.timers[handle];
-    if (t) t.active = false;
+    if (!t) return;
+    t.active = false;
+    t.cancel?.();
+    t.cancel = null;
   }
 }

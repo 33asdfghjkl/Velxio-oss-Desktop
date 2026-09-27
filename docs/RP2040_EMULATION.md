@@ -424,14 +424,26 @@ this.rp2040.spi[0].onTransmit = (value: number) => {
 | SCK | GPIO18 |
 | MOSI | GPIO19 |
 
-### Custom SPI Handler
+### SPI peripherals on the canvas
 
-A custom handler can replace the loopback for simulating specific SPI peripherals (displays, sensors):
+SPI0 and SPI1 are controller ports of the bus fabric (`RP2040Simulator.getBusBinding()`,
+routed live through funcsel), and a display, a card or a sensor is put on the bus by
+its wiring, from the part's own `attachEvents`:
 
 ```typescript
-simulator.setSPIHandler(bus: 0 | 1, handler: (value: number) => number): void
-// handler receives TX byte, returns RX byte
+import { attachSpiDevice } from '../buses';
+const handle = attachSpiDevice(
+  { owner: componentId, pins: { sck: 'SCK', mosi: 'MOSI', miso: 'MISO', cs: 'CS' } },
+  { transfer: (mosi, bits) => answer, boardReset: () => {} },
+);
+// cleanup: handle.dispose()
 ```
+
+The fabric hands the device a frame only while its chip select is active, and answers
+MISO for the frame, once. There is no per-engine handler to install any more
+(`setSPIHandler` was removed in board-buses F3); see
+[board-buses.md](./wiki/board-buses.md) and the
+[part author guide](./wiki/board-buses-part-authoring.md).
 
 ---
 

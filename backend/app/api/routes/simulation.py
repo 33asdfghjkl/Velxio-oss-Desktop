@@ -89,11 +89,11 @@ async def simulation_websocket(websocket: WebSocket, client_id: str):
             if msg_type in (
                 'start_pi', 'stop_pi', 'serial_input', 'gpio_in', 'pin_change',
                 'pi_sensor_state', 'pi_uart_rx', 'pi_attach_slave', 'pi_detach_slave',
-                'pi_bus_reply', 'pi_bus_topology', 'pi_bus_regs',
+                'pi_bus_reply', 'pi_bus_topology', 'pi_bus_regs', 'pi_bus_attrs',
                 'pi_sensor_attach', 'pi_sensor_update', 'pi_sensor_detach',
                 'start_stm32', 'stop_stm32', 'stm32_load_firmware', 'stm32_gpio_in',
                 'stm32_serial_input', 'stm32_sensor_attach', 'stm32_sensor_update',
-                'stm32_sensor_detach',
+                'stm32_sensor_detach', 'stm32_bus_map', 'stm32_bus_attrs',
             ):
                 handled = await dispatch_ws_sim_message(
                     websocket, client_id, msg_type, msg_data, qemu_callback,
@@ -112,22 +112,24 @@ async def simulation_websocket(websocket: WebSocket, client_id: str):
                 firmware_b64 = msg_data.get('firmware_b64')
                 sensors      = msg_data.get('sensors', [])
                 wifi_enabled = bool(msg_data.get('wifi_enabled', False))
-                sd_card      = msg_data.get('sd_card')  # {'image_b64': ...} when a microSD is wired
+                # Who is on the board's SPI bus and how each one is selected
+                # (project board-buses-2026-09, F4). It rides with the start so
+                # the worker knows the bus before the guest clocks a byte.
+                bus_map      = msg_data.get('bus_map') or {}
                 fw_size_kb   = round(len(firmware_b64) * 0.75 / 1024) if firmware_b64 else 0
                 lib_available = _use_lib()
 
                 # Allocate a host port for WiFi hostfwd if WiFi is enabled
                 wifi_hostfwd_port = _find_free_port() if wifi_enabled else 0
 
-                sd_kb = round(len(sd_card['image_b64']) * 0.75 / 1024) if sd_card and sd_card.get('image_b64') else 0
-                logger.info('[%s] start_esp32 board=%s firmware=%dKB lib_available=%s sensors=%d wifi=%s hostfwd=%d sd=%dKB',
+                logger.info('[%s] start_esp32 board=%s firmware=%dKB lib_available=%s sensors=%d wifi=%s hostfwd=%d spi_map=%d',
                             client_id, board, fw_size_kb, lib_available, len(sensors),
-                            wifi_enabled, wifi_hostfwd_port, sd_kb)
+                            wifi_enabled, wifi_hostfwd_port, len(bus_map.get('spi') or []))
                 if lib_available:
                     await esp_lib_manager.start_instance(
                         client_id, board, qemu_callback, firmware_b64, sensors,
                         wifi_enabled=wifi_enabled, wifi_hostfwd_port=wifi_hostfwd_port,
-                        sd_card=sd_card)
+                        bus_map=bus_map)
                 else:
                     logger.warning('[%s] libqemu-xtensa not available — using subprocess fallback', client_id)
                     esp_qemu_manager.start_instance(
@@ -218,12 +220,28 @@ async def simulation_websocket(websocket: WebSocket, client_id: str):
                 if _use_lib():
                     esp_lib_manager.set_i2c_response(client_id, addr, resp)
 
-            # ── ESP32 SPI device simulation ───────────────────────────────
-            elif msg_type == 'esp32_spi_response':
-                # {response: int} — byte to return as MISO
-                resp = int(msg_data.get('response', 0xFF))
+            # ── ESP32 SPI bus membership ──────────────────────────────────
+            elif msg_type == 'esp32_bus_map':
+                # {spi: [{owner, bus_id, cs, model}, ...]}: the tab's whole
+                # view of the board's SPI bus, resent on every membership
+                # change (project board-buses-2026-09, F4). It replaced
+                # esp32_spi_response, one socket message per MISO byte for a
+                # byte the guest had already clocked.
+                # F5 adds `i2c`: which controller each I2C target is on.
+                # A half that is absent is left as the worker has it.
                 if _use_lib():
-                    esp_lib_manager.set_spi_response(client_id, resp)
+                    spi_map, i2c_map = msg_data.get('spi'), msg_data.get('i2c')
+                    esp_lib_manager.set_bus_map(client_id,
+                                                spi_map if isinstance(spi_map, list) else None,
+                                                i2c_map if isinstance(i2c_map, list) else None)
+
+            elif msg_type == 'esp32_bus_attrs':
+                # {owner, attrs}: one hosted responder's live inputs between
+                # two maps. A map carries every model's artifact, so a finger
+                # dragged across a touch panel cannot travel as maps.
+                if _use_lib():
+                    esp_lib_manager.set_bus_attrs(
+                        client_id, str(msg_data.get('owner') or ''), msg_data.get('attrs') or {})
 
             # ── ESP32 UART 1 / 2 input ────────────────────────────────────
             elif msg_type == 'esp32_uart1_input':
@@ -282,29 +300,6 @@ async def simulation_websocket(websocket: WebSocket, client_id: str):
                     esp_lib_manager.sensor_detach(client_id, pin)
                 else:
                     esp_qemu_manager.sensor_detach(client_id, pin)
-
-            # ── Cross-board I2C proxy: register a peer board's device on QEMU ──
-            # Used when an ESP32 is wired to another board's I2C bus (Uno, Pico,
-            # …) and that peer board has a virtual device the ESP32 firmware
-            # should be able to read.  The frontend snapshots the device's
-            # register state and pushes it here; the worker installs a
-            # ProxySlave at the address.
-            elif msg_type == 'esp32_proxy_i2c_register':
-                addr = int(msg_data.get('addr', 0)) & 0x7F
-                regs_b64 = msg_data.get('regs_b64', '')
-                if _use_lib():
-                    esp_lib_manager.proxy_i2c_register(client_id, addr, regs_b64)
-
-            elif msg_type == 'esp32_proxy_i2c_update':
-                addr = int(msg_data.get('addr', 0)) & 0x7F
-                regs_b64 = msg_data.get('regs_b64', '')
-                if _use_lib():
-                    esp_lib_manager.proxy_i2c_update(client_id, addr, regs_b64)
-
-            elif msg_type == 'esp32_proxy_i2c_unregister':
-                addr = int(msg_data.get('addr', 0)) & 0x7F
-                if _use_lib():
-                    esp_lib_manager.proxy_i2c_unregister(client_id, addr)
 
             # ── ESP32-CAM camera frame injection ───────────────────────────
             # Browser pushes JPEGs from getUserMedia. Backend forwards to the

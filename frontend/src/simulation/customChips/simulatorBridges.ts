@@ -2,36 +2,40 @@
  * Per-simulator bridge state for custom chips.
  *
  * Each simulator family exposes its peripherals differently:
- *   - AVR (avr8js)   — `simulator.usart` / `simulator.spi` / `simulator.i2cBus`
- *   - RP2040 (rp2040js) — `simulator.serialWriteByte` / `simulator.setSPIHandler` /
- *                         `simulator.addI2CDevice` (per-bus indexing)
- *   - ESP32 (bridge shim) — `simulator.sendPinEvent`. The shim wraps either
+ *   - AVR (avr8js): `simulator.usart` / `simulator.i2cBus`
+ *   - ESP32 (bridge shim): `simulator.sendPinEvent`. The shim wraps either
  *     the backend QEMU bridge, which hosts custom chips in its worker
  *     (CustomChipPart hands the WASM over and no browser instance exists),
  *     or an overlay's in-browser engine, which answers `hostsCustomChips()`
- *     false so the chip runs here: GPIO through the shim's PinManager, I2C
- *     through `addI2CDevice` (synchronous on the engine bus), SPI through
- *     the shim's `spi` adapter, UART on CHIP_UART.
+ *     false so the chip runs here, GPIO through the shim's PinManager.
+ *   - RP2040 family (rp2040js, rp2350js, the XIAO ARM engines, the Pi shim):
+ *     `simulator.getBusBinding` and nothing of the two above.
  *
- * The bridges in this module install a single dispatcher per simulator that
- * fans out to every chip subscribed, regardless of family.
+ * What is left here is the family fingerprint and the worker question. No
+ * bus dispatcher lives here any more: a chip joins a bus from vx_spi_attach,
+ * vx_i2c_attach and vx_uart_attach, and the fabric (simulation/buses) routes
+ * it by its wiring.
  */
-import { SPIBus } from './SPIBus';
-import { spiChainAttach } from '../parts/spiChannel';
-
-/** The custom chips' place in a board's SPI chain (one per simulator: every
- *  chip on it sits behind the same SPIBus). */
-const CHIP_SPI_OWNER = 'custom-chips';
-
 export type SimulatorKind = 'avr' | 'rp2040' | 'esp32' | 'unknown';
 
+/**
+ * Which family a simulator belongs to, from the shape of its surface. These
+ * are FINGERPRINTS of the family, never a place to hang a chip: a chip's SPI,
+ * I2C and UART bytes all come from the bus fabric.
+ *
+ * The fingerprint is the fabric's way in, `getBusBinding`, which every engine
+ * of the product exposes: the shims are told apart first by `sendPinEvent`,
+ * the AVR by its peripherals, and everything else that exposes its buses is
+ * the RP family (rp2040js, rp2350js, the XIAO ARM engines, the Pi shim),
+ * which for a chip host means "runs in the browser, hosts nothing in a
+ * worker". It sniffs no bus method on purpose: those come and go with the
+ * bus model, the binding is the contract.
+ */
 export function detectSimulatorKind(simulator: any): SimulatorKind {
   if (!simulator) return 'unknown';
-  if (simulator.usart && simulator.spi && simulator.i2cBus) return 'avr';
-  if (typeof simulator.addI2CDevice === 'function' && typeof simulator.setSPIHandler === 'function') {
-    return 'rp2040';
-  }
+  if (simulator.usart && simulator.i2cBus) return 'avr';
   if (typeof simulator.sendPinEvent === 'function') return 'esp32';
+  if (typeof simulator.getBusBinding === 'function') return 'rp2040';
   return 'unknown';
 }
 
@@ -53,252 +57,32 @@ export function hostsChipsInWorker(simulator: any): boolean {
   }
 }
 
-export interface SimulatorBridges {
-  /** Set of UART RX listeners (one per UART chip). */
-  uartListeners: Set<(byte: number) => void>;
-  /** Whether the UART dispatcher has already been wired to the simulator. */
-  uartInstalled: boolean;
-  /** Original onByteTransmit so non-chip listeners still receive bytes. */
-  uartPreviousOnByteTransmit: ((byte: number) => void) | null;
-  /** Pending bytes to inject into the AVR/RP2040 RX register, drained at
-   *  ~baud rate by `uartDrainHandle`. Without this queue, chips that emit
-   *  bursts (e.g. an i8080 printing a banner) overflow the 2-byte USART
-   *  RX register and most bytes get silently dropped. */
-  uartRxQueue: number[];
-  /** setTimeout handle for the queue drainer (0 if not active). */
-  uartDrainHandle: number;
-
-  /** Shared SPI bus across all custom chips on this simulator. */
-  spiBus: SPIBus;
-  /** Whether the SPI dispatcher has already been wired. */
-  spiInstalled: boolean;
-}
-
-const SIM_BRIDGES = new WeakMap<object, SimulatorBridges>();
-
-/** Hard cap on the AVR RX FIFO (see avrUartTx) — at the 1 byte/ms drain
- *  rate this is ~4 s of backlog, plenty for bursts, bounded for firehoses. */
-const MAX_UART_RX_QUEUE = 4096;
-
-export function getSimulatorBridges(simulator: any): SimulatorBridges {
-  let b = SIM_BRIDGES.get(simulator);
-  if (!b) {
-    b = {
-      uartListeners: new Set(),
-      uartInstalled: false,
-      uartPreviousOnByteTransmit: null,
-      uartRxQueue: [],
-      uartDrainHandle: 0,
-      spiBus: new SPIBus(),
-      spiInstalled: false,
-    };
-    SIM_BRIDGES.set(simulator, b);
-  }
-  return b;
-}
-
 // ── UART ────────────────────────────────────────────────────────────────────
-
-/**
- * Install the UART TX-out dispatcher idempotently. Whatever family the
- * simulator belongs to, the dispatcher fans bytes out to every listener in
- * `uartListeners` (one per UART chip).
- */
-/**
- * The UART a chip talks on when the board has more than one. UART0 is the
- * serial monitor on every ESP32 family, so a chip on UART0 would babble
- * into the console and read the sketch's own prints back.
- */
-export const CHIP_UART = 1;
-
-export function ensureUartBridge(simulator: any): void {
-  const b = getSimulatorBridges(simulator);
-  if (b.uartInstalled) return;
-  const kind = detectSimulatorKind(simulator);
-
-  if (kind === 'avr' && simulator.usart) {
-    b.uartPreviousOnByteTransmit = simulator.usart.onByteTransmit ?? null;
-    const previous = b.uartPreviousOnByteTransmit;
-    simulator.usart.onByteTransmit = (byte: number) => {
-      if (previous) { try { previous(byte); } catch { /* swallow */ } }
-      for (const listener of b.uartListeners) {
-        try { listener(byte); } catch { /* swallow */ }
-      }
-    };
-    b.uartInstalled = true;
-    return;
-  }
-
-  if (kind === 'rp2040') {
-    // RP2040 emits each TX byte through `onSerialData(char)` (a string).
-    const previous = simulator.onSerialData;
-    simulator.onSerialData = (charStr: string) => {
-      if (previous) { try { previous(charStr); } catch { /* swallow */ } }
-      const code = typeof charStr === 'string' ? charStr.charCodeAt(0) : Number(charStr);
-      if (!Number.isFinite(code)) return;
-      for (const listener of b.uartListeners) {
-        try { listener(code & 0xff); } catch { /* swallow */ }
-      }
-    };
-    b.uartInstalled = true;
-    return;
-  }
-  // esp32: nothing to install. The shim's `onSerialData` is a property the
-  // store never calls for an ESP32 board (the bridge's own handler feeds the
-  // monitor), so a dispatcher hung on it would never fire; a version of it
-  // lived here and silently did nothing. A chip hosted in the browser next
-  // to an overlay engine gets its UART from that overlay's attach extension
-  // (the engines publish every TX byte on the overlay's uart bus), and a
-  // chip on the OSS QEMU bridge is hosted in the worker, not here.
-  // unknown: no client-side UART bridge (QEMU has its own path).
-}
-
-/**
- * Inject a byte into the simulator's RX path so the sketch's `Serial.read()`
- * returns it.
- *
- * For AVR we go through a JS-level FIFO + setTimeout drainer instead of
- * calling `simulator.usart.writeByte` directly. Two reasons:
- *
- *  1. The non-immediate form silently returns `false` for bytes that arrive
- *     while `rxBusyValue` is still set from the previous one — so chips
- *     that emit bursts (e.g. an i8080 print_string sequence) lose ~99% of
- *     their bytes.
- *  2. The immediate form overwrites `rxByte` directly without waiting for
- *     the AVR sketch to drain it — same outcome, only the last byte of
- *     each burst survives.
- *
- * The drainer attempts one non-immediate write per tick (1 ms apart). On
- * RXC busy / RXEN off it leaves the byte at the head of the queue and
- * retries on the next tick. RP2040 has its own internal buffering, so we
- * just forward to `serialWriteByte`.
- */
-export function avrUartTx(simulator: any, byte: number): void {
-  const kind = detectSimulatorKind(simulator);
-  if (kind === 'avr') {
-    // ATtiny85 has no hardware USART — silently drop instead of queueing
-    // forever. Users wiring a UART chip to a tiny85 need SoftwareSerial,
-    // which is a different bridge entirely (TODO).
-    if (!simulator.usart || typeof simulator.usart.writeByte !== 'function') return;
-    const b = getSimulatorBridges(simulator);
-    // Bound the FIFO: a chip streaming while the sketch never reads (RX busy
-    // forever) grew this array without limit — the browser tab died of
-    // memory, not of CPU. Beyond the cap, drop new bytes and keep the oldest
-    // so a sketch that starts reading late still sees the stream's head.
-    if (b.uartRxQueue.length >= MAX_UART_RX_QUEUE) return;
-    b.uartRxQueue.push(byte & 0xff);
-    if (!b.uartDrainHandle) {
-      const drain = () => {
-        const b2 = getSimulatorBridges(simulator);
-        if (b2.uartRxQueue.length === 0) {
-          b2.uartDrainHandle = 0;
-          return;
-        }
-        const next = b2.uartRxQueue[0];
-        let accepted = false;
-        try {
-          accepted = simulator.usart?.writeByte?.(next) ?? false;
-        } catch {
-          accepted = false;
-        }
-        if (accepted) b2.uartRxQueue.shift();
-        b2.uartDrainHandle = (setTimeout(drain, 1) as unknown) as number;
-      };
-      b.uartDrainHandle = (setTimeout(drain, 0) as unknown) as number;
-    }
-    return;
-  }
-  if (kind === 'rp2040' && typeof simulator.serialWriteByte === 'function') {
-    try { simulator.serialWriteByte(byte); } catch { /* swallow */ }
-    return;
-  }
-  if (kind === 'esp32' && typeof simulator.sendSerialByte === 'function') {
-    // Straight into the guest's UART1 FIFO — the ESP32 worker/engine does
-    // its own buffering, so there is nothing to drain here.
-    try { simulator.sendSerialByte(byte & 0xff, CHIP_UART); } catch { /* swallow */ }
-  }
-}
+//
+// There is no UART bridge any more either. A chip is on a board's UART wires
+// from vx_uart_attach, by the pads of its own config (ChipRuntime puts it on
+// the bus fabric of simulation/buses in that very call, on every engine
+// kind), and the fabric decides from the nets which controller of which board
+// each pad reaches, or follows a plain GPIO on the guest's clock. A chip a
+// QEMU worker hosts is placed the same way by its part, from the pads read
+// off an inert copy (chipUartPads.ts). What stood here installed ONE dispatcher per
+// SIMULATOR on its USART0 (rebuilt by every reset and reload, so the chip
+// went deaf: findings avr-uart-dispatcher-lost-after-recompile-or-stop and
+// avr-uart-dispatcher-lost-on-reload), made a chip on RP2040-family hosts
+// hear every UART through the console callback and answer on UART0 only
+// (rp2040-uart-lumped-and-uart0-only-rx), and drained the chip's replies into
+// the AVR through a wall-clock timer FIFO shared per simulator that outlived
+// Stop (avr-rx-queue-stale-and-throttled).
 
 // ── SPI ─────────────────────────────────────────────────────────────────────
-
-/**
- * Install the SPI master TX → SPIBus dispatcher idempotently. The chip's
- * SPIDevice (created in `vx_spi_attach`) ends up on `b.spiBus` and is picked
- * up automatically — no per-chip wiring needed beyond `bridges.spiBus`.
- */
-export function ensureSpiBridge(simulator: any): void {
-  const b = getSimulatorBridges(simulator);
-  const kind = detectSimulatorKind(simulator);
-
-  // The ESP32 shim exposes the same `{ onByte, completeTransfer }` adapter
-  // (completeTransfer hands MISO to the bridge's setSpiResponse), so a chip
-  // hosted in the browser next to an in-browser engine gets SPI the AVR way.
-  if ((kind === 'avr' || kind === 'esp32') && simulator.spi) {
-    // A chip shares the board's bus with every other SPI part (a display, its
-    // touch panel, a card), so it joins the chain instead of taking the
-    // channel: it answers only while one of its chips is selected, and
-    // otherwise idles and passes the byte along. Taking the channel used to
-    // deafen whatever had attached first — a Grove sensor model on the board
-    // killed the ILI9488's touch panel (issue #355).
-    //
-    // Joined on EVERY call, not once: attaching under the same owner replaces
-    // the previous incarnation, so a part that dropped the chain on its way
-    // out cannot leave the chips off the bus for the rest of the run.
-    spiChainAttach(simulator.spi, CHIP_SPI_OWNER, (mosi, next) => {
-      if (b.spiBus.active) {
-        simulator.spi.completeTransfer(b.spiBus.transferByte(mosi));
-        return;
-      }
-      simulator.spi.completeTransfer(0xff);
-      next?.(mosi);
-    });
-    b.spiInstalled = true;
-    return;
-  }
-
-  if (kind === 'rp2040' && typeof simulator.setSPIHandler === 'function') {
-    if (b.spiInstalled) return;
-    // RP2040 has SPI0 and SPI1; we route both through the same bus so
-    // CS-gated chips can live on either.
-    for (const bus of [0, 1] as const) {
-      try {
-        simulator.setSPIHandler(bus, (mosi: number) => b.spiBus.transferByte(mosi));
-      } catch { /* this bus may not be in use; ignore */ }
-    }
-    b.spiInstalled = true;
-    return;
-  }
-}
-
-// ── I2C adapter ─────────────────────────────────────────────────────────────
-
-/**
- * Pick the right I2C bus object for the chip runtime to call `addDevice`/
- * `removeDevice` on. AVR exposes `simulator.i2cBus` directly; RP2040 needs
- * a tiny adapter to forward to its `addI2CDevice` (per-bus) API.
- *
- * Returns `null` if the simulator doesn't expose any I2C bus (ESP32 today).
- */
-export function getI2CBus(simulator: any, bus: 0 | 1 = 0): {
-  addDevice: (device: any) => void;
-  removeDevice: (address: number) => void;
-} | null {
-  const kind = detectSimulatorKind(simulator);
-  if (kind === 'avr' && simulator.i2cBus) {
-    return simulator.i2cBus;
-  }
-  if (
-    (kind === 'rp2040' || kind === 'esp32') &&
-    typeof simulator.addI2CDevice === 'function'
-  ) {
-    // ESP32: the shim's addI2CDevice puts the device on an in-browser
-    // engine's synchronous bus (attachSyncI2cDevice). On the QEMU bridge the
-    // call is a no-op, but a chip on that bridge never reaches this path:
-    // CustomChipPart hands it to the worker (see hostsChipsInWorker).
-    return {
-      addDevice: (device) => simulator.addI2CDevice(device, bus),
-      removeDevice: (address) => simulator.removeI2CDevice?.(address, bus),
-    };
-  }
-  return null;
-}
+//
+// There is no SPI bridge any more. A chip joins a board's SPI bus from
+// vx_spi_attach, with the pins of its own config (ChipRuntime._joinSpiBus),
+// and the fabric in simulation/buses decides which bus that is and when the
+// chip is selected. What stood here installed one dispatcher per SIMULATOR,
+// whatever the chip was wired to and whatever bus it spoke: on AVR and the
+// ESP32 shim it joined the part chain, and on RP2040, RP2350 and the XIAO it
+// replaced the SPI handler on both buses. A UART-only Grove module took the
+// board's SPI with it (issue #355 and findings
+// grove-chip-takes-spi-on-rp-and-xiao-arm, customchip-setspihandler-steals-bus0,
+// rp2-sethandler-clobbers-spi-chain).

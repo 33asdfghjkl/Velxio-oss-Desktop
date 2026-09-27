@@ -17,15 +17,6 @@ import { ExternalPinScopeFeed } from '../simulation/externalPinScope';
 import { SignalRouter } from '../simulation/SignalRouter';
 import { requestElectricalResolve } from '../simulation/spice/electricalResolveHook';
 import { ledcSignalForChannel } from '../simulation/esp32-signals';
-import {
-  VirtualDS1307,
-  VirtualTempSensor,
-  I2CMemoryDevice,
-  I2CBusManager,
-  nullI2CMaster,
-} from '../simulation/I2CBusManager';
-import type { I2CDevice } from '../simulation/I2CBusManager';
-import type { RP2040I2CDevice } from '../simulation/RP2040Simulator';
 import type { Wire, WireInProgress, WireEndpoint } from '../types/wire';
 import type { BoardKind, BoardInstance, LanguageMode, WifiStatus } from '../types/board';
 import {
@@ -51,7 +42,7 @@ import { STM32_LED } from '../components/velxio-components/Stm32BluePillElement'
 import { useEditorStore } from './useEditorStore';
 import { fingerprintSources } from '../utils/sourceFingerprint';
 import { useVfsStore } from './useVfsStore';
-import { buildProjectSdImage, decodeSdFiles, bytesToB64 } from '../utils/sdCardFiles';
+import { b64ToBytes, buildProjectSdImage, decodeSdFiles, bytesToB64 } from '../utils/sdCardFiles';
 import {
   autoWireColor,
   DEFAULT_WIRE_COLOR,
@@ -93,6 +84,22 @@ import {
 import { SINGLE_WIRE_SENSOR_MODELS } from '../simulation/sensorModels';
 import type { LineSupport } from '../simulation/line/LineHost';
 import { traceBoardGpio } from '../simulation/PinTrace';
+import {
+  attachSpiDevice,
+  busRegistry,
+  createStoreNetResolver,
+  RemoteSpiLane,
+} from '../simulation/buses';
+import { RemoteI2cLane } from '../simulation/buses/remoteI2c';
+import { RemoteUartLane } from '../simulation/buses/remoteUart';
+import { i2cPartWorkerPin } from '../simulation/parts/i2cPart';
+import {
+  loadSdBusChip,
+  SdSpiCard,
+  sdCardRemoteBlobWrite,
+  sdCardRemoteModel,
+  sdSpiFabricDevice,
+} from '../simulation/parts/sdSpiCard';
 import { dispatchSensorUpdate } from '../simulation/SensorUpdateRegistry';
 
 // ── Sensor pre-registration ──────────────────────────────────────────────────
@@ -103,8 +110,9 @@ import { dispatchSensorUpdate } from '../simulation/SensorUpdateRegistry';
 const SENSOR_COMPONENT_MAP = SINGLE_WIRE_SENSOR_MODELS;
 
 // ── I2C sensor pre-registration ───────────────────────────────────────────────
-// I2C sensors use virtual pins (200 + i2c_addr) instead of real GPIO pins.
-// They are identified by I2C address and do not need wire-resolution.
+// An I2C sensor's worker record is keyed by a slot of its own component
+// (i2cPartWorkerPin), not by a GPIO, and carries the component as its owner:
+// the bus map the tab sends names the controller each owner is wired to.
 // `addrProp` is the component property that overrides the default address.
 const I2C_SENSOR_MAP: Record<
   string,
@@ -177,22 +185,6 @@ export class Esp32BridgeShim {
   private bridge: Esp32Bridge;
 
   /**
-   * Cross-board I2C surface — see AVRSimulator / RP2040Simulator for
-   * the canonical pattern.  ESP32 sketches run in backend QEMU, so the
-   * "primary" I2C path goes through the backend's libqemu-xtensa I2C
-   * slaves and reaches the frontend as `i2c_event` / `i2c_transaction`
-   * WebSocket messages.  But virtual devices attached to the ESP32
-   * board on the canvas also live frontend-side as I2CDevice instances
-   * — and Interconnect's bridge mechanism needs to reach them when a
-   * peer board's master tries to read across an SDA+SCL wire.  So we
-   * expose an I2CBusManager whose local devices mirror what
-   * ProtocolParts registers via `registerSensor`.  The peer-master
-   * direction works through this bus; the ESP32-master direction
-   * still flows through the backend (where the firmware runs).
-   */
-  private i2cBusInstance: I2CBusManager;
-
-  /**
    * Canvas parts waiting for a decoded WS2812 frame, keyed by their DIN pin.
    *
    * A NeoPixel part normally recovers its colours by timing the edges on DIN
@@ -209,28 +201,78 @@ export class Esp32BridgeShim {
    */
   private ws2812Sinks = new Map<number, (pixels: Ws2812Pixel[]) => void>();
 
+  /**
+   * The board's SPI lane when the firmware runs in a backend worker (project
+   * board-buses-2026-09, F4): the controller port the worker's bytes arrive
+   * on, and the bus map that goes the other way. Built for every ESP32 board
+   * and used only when the bridge has no ports of its own, which is exactly
+   * when the CPU is not in this tab.
+   */
+  private readonly remoteLane: RemoteSpiLane;
+  /**
+   * The same board's I2C, for the same worker (F5): its controllers as ports
+   * for the fabric, and the half of the bus map that says which controller
+   * each I2C target is on. It travels with the SPI half on the same message.
+   */
+  private readonly i2cLane: RemoteI2cLane;
+  /**
+   * The same board's UART, for the same worker (F6): its controllers as
+   * ports, fed with the bytes the worker relays and carrying what a part
+   * answers back, and the half of the map that says which controller each
+   * UART endpoint's legs are wired to.
+   */
+  private readonly uartLane: RemoteUartLane;
+  /**
+   * The owners of the sensor records this shim sent its worker, by the
+   * worker's pin. The UART half of the map names, among them, the ones the
+   * fabric put on no wire of this board, so the worker keeps those silent
+   * instead of leaving them on the UART their record alone named.
+   */
+  private readonly sensorOwners = new Map<number, string>();
+
   constructor(bridge: Esp32Bridge, pm: PinManager) {
     this.bridge = bridge;
     this.pinManager = pm;
-    this.i2cBusInstance = new I2CBusManager(nullI2CMaster());
-
-    // Wire the write-forwarding path: when the backend ProxySlave emits
-    // a completed write transaction (one full STOP-bounded master phase
-    // from the ESP32 firmware), look up the peer device on the local
-    // device lookup map and replay the bytes through its writeByte()
-    // contract.  Peer `I2CDevice` implementations (I2CMemoryDevice,
-    // VirtualPCF8574, VirtualSSD1306, …) already encode the
-    // pointer-byte + data semantics; we just hand off the sequence.
-    bridge.onProxyI2cComplete = (addr: number, data: number[]) => {
-      const dev = this._peerDeviceLookup.get(addr);
-      if (!dev) return;
-      try {
-        for (const b of data) dev.writeByte(b);
-        dev.stop?.();
-      } catch (e) {
-        console.warn(`[Esp32BridgeShim] proxy write replay failed for 0x${addr.toString(16)}`, e);
-      }
-    };
+    this.i2cLane = new RemoteI2cLane(bridge.boardId, bridge.boardKind);
+    this.uartLane = new RemoteUartLane(bridge.boardId, bridge.boardKind, (unit, bytes) =>
+      bridge.sendSerialBytes(bytes, unit),
+    );
+    this.remoteLane = new RemoteSpiLane(
+      bridge.boardId,
+      bridge.boardKind,
+      (spi) =>
+        (
+          bridge as unknown as {
+            sendBusMap?: (m: unknown[], i2c?: unknown[], uart?: unknown[]) => void;
+          }
+        ).sendBusMap?.(spi, this.i2cLane.poll().i2c, this.uartLane.poll(this.sensorOwners.values()).uart),
+      (owner, attrs) =>
+        (
+          bridge as unknown as {
+            sendBusAttrs?: (o: string, a: Record<string, number>) => void;
+          }
+        ).sendBusAttrs?.(owner, attrs),
+    );
+    // The worker's MOSI bytes, and the chip selects the SPI peripheral drives
+    // itself. They arrive in order with the pin edges around them, so the
+    // fabric arbitrates them with the same information a local engine gives
+    // it. What a device here answers goes nowhere: see RemoteSpiPort.
+    bridge.onSpiBatch = (mosi) => this.remoteLane.port?.deliver(mosi);
+    bridge.onSpiCsChange = (csIdx, low) => this.remoteLane.port?.hardwareCs(csIdx, low);
+    // What a hosted model wrote (the guest saved to the card) comes back as a
+    // span, because the worker keeps the bytes no sink here can see.
+    bridge.onBusBlob = (owner, name, offset, data, blobId) =>
+      this.remoteLane.applyBlob(owner, name, offset, data, blobId);
+    // The bytes the guest transmitted on each UART, into that controller's
+    // port; what an endpoint here answers goes back through sendSerialBytes.
+    bridge.onUartTxBytes = (uart, bytes) => this.uartLane.deliver(uart, bytes);
+    // The start config asks for the I2C and UART halves as they are when the
+    // socket opens: a first Run may come before any membership change pushed
+    // one.
+    (bridge as unknown as { onBusMapRequest?: unknown }).onBusMapRequest = () => ({
+      i2c: this.i2cLane.poll().i2c,
+      uart: this.uartLane.poll(this.sensorOwners.values()).uart,
+    });
   }
 
   setPinState(pin: number, state: boolean): void {
@@ -256,6 +298,13 @@ export class Esp32BridgeShim {
     // sticky "has driven this session" set — the same gate the connector uses
     // to decide what to inject in the first place.
     if (this.pinManager.getOutputPins().has(pin)) return;
+    // The wire's level channel hears it too: a chip in this tab watching the
+    // pin (an in-browser ESP32 engine hosts chips here) reads the
+    // PinManager's level, and the injection only moved the guest's GPIO_IN
+    // (finding chip-board-pin-read-blind-to-other-parts; the AVR's
+    // setPinState is the model). Same gates as the scope: not for a pad the
+    // guest drives, nor for a line a backend sensor owns.
+    this.pinManager.triggerPinChange(pin, state, 'external');
     // The store hands the scope callback to the BRIDGE (that is where the
     // engine's own edges arrive), so that is the sink to reach for; the
     // shim's own slot is honoured first for the tests that fill it.
@@ -287,8 +336,172 @@ export class Esp32BridgeShim {
     return typeof b.hostsCustomChips === 'function' ? b.hostsCustomChips() !== false : true;
   }
 
-  /** One byte into the guest's UART RX; the custom-chip bridge (avrUartTx)
-   *  calls this for a browser-hosted chip's vx_uart_write on CHIP_UART. */
+  /** Send the worker the board's SPI bus map, for a board whose firmware runs
+   *  there. A board running in this tab has no worker and its bridge has no
+   *  sendBusMap, so this is a no-op for it. */
+  pushBusMap(): void {
+    this.remoteLane.pushMap();
+  }
+
+  /**
+   * Send the I2C half of the map alone when it changed since the last one
+   * (F5). It runs whenever the registry says this board's I2C membership may
+   * have changed (onI2cMapChange: a target placed or gone, a wire moved
+   * mid-run) and after a part registers or drops a sensor record; the lane
+   * compares, so a call that changes nothing sends nothing. Same no-op rule
+   * as pushBusMap.
+   */
+  pushI2cMap(): void {
+    const { i2c, changed } = this.i2cLane.poll();
+    if (!changed) return;
+    (this.bridge as unknown as { sendI2cBusMap?: (m: unknown[]) => void }).sendI2cBusMap?.(i2c);
+  }
+
+  /**
+   * The UART half of the map alone when it changed since the last one (F6):
+   * an endpoint placed, moved or gone, a controller rerouted, a sensor record
+   * sent or withdrawn. Same compare-then-send rule as the I2C half.
+   */
+  pushUartMap(): void {
+    const { uart, changed } = this.uartLane.poll(this.sensorOwners.values());
+    if (!changed) return;
+    (this.bridge as unknown as { sendUartBusMap?: (m: unknown[]) => void }).sendUartBusMap?.(uart);
+  }
+
+  /** A responder's live inputs, for the worker that hosts its model. Same
+   *  no-op rule as pushBusMap for a board running in this tab. */
+  pushBusAttrs(owner: string, attrs: Record<string, number>): void {
+    this.remoteLane.pushAttrs(owner, attrs);
+  }
+
+  /**
+   * The board's OWN microSD slot, on the bus fabric (project
+   * board-buses-2026-09, F4).
+   *
+   * A slot soldered to the board is a device of the bus like any canvas card:
+   * it is on the bus its clock pin is on, and it only answers while its own
+   * chip select is low, which is what lets the panel and the card share the
+   * other three wires. Until F4 the QEMU worker was handed the image in its
+   * start config and served it from a Python card of its own
+   * (`esp32_sd_slave.py`), a third hand-kept copy of the same protocol; now
+   * the slot travels in the bus map like everything else and the portable
+   * model answers beside the guest.
+   *
+   * The card object stays here regardless, because it is what the SD panel
+   * lists: the worker sends back every span the hosted model writes
+   * (`bus_blob`), so this copy follows the guest's writes.
+   */
+  syncBuiltinSdCard(): void {
+    // Only for a board whose CPU is NOT in this tab. An in-browser engine puts
+    // the same slot on the bus itself, under the same owner, and two cards
+    // built from two images racing for one owner is precisely the attach-order
+    // bug this project exists to remove.
+    if (this.bridgeHasOwnPorts()) {
+      this.sdHandle?.();
+      this.sdHandle = null;
+      this.sdCard = null;
+      this.sdImageBytes = 0;
+      return;
+    }
+    const slot = getProBoard(this.bridge.boardKind)?.builtInSd;
+    const pins =
+      slot && slot.bus === 'spi' && slot.sck !== undefined
+        ? { sck: slot.sck, mosi: slot.mosi, miso: slot.miso, cs: slot.csPin }
+        : null;
+    const b64 = this.bridge.sdImageB64;
+    if (!pins || !b64) {
+      this.sdHandle?.();
+      this.sdHandle = null;
+      this.sdCard = null;
+      this.sdImageBytes = 0;
+      return;
+    }
+    if (!this.sdCard) {
+      try {
+        const image = b64ToBytes(b64);
+        this.sdImageBytes = image.length;
+        this.sdCard = new SdSpiCard(image);
+      } catch (e) {
+        console.warn('[microsd] the board slot image could not be read', e);
+        return;
+      }
+      this.sdCard.setCs(false);
+    }
+    const card = this.sdCard;
+    const bytes = this.sdImageBytes;
+    const boardId = this.bridge.boardId;
+    loadSdBusChip();
+    this.sdHandle?.();
+    const unpublish = registerSdImageReader(boardId, () => {
+      const image = card.dumpImage(bytes);
+      return image.length > 0 ? image : null;
+    });
+    // The owner is the one the overlay's own built-in registration uses, so a
+    // board that switches between the in-browser engine and QEMU replaces the
+    // slot instead of ending up with two cards answering one bus.
+    const handle = attachSpiDevice(
+      {
+        owner: `builtin:${boardId}:sd`,
+        pins: {
+          sck: { kind: 'board', boardId, pin: pins.sck },
+          ...(pins.mosi === undefined
+            ? {}
+            : { mosi: { kind: 'board' as const, boardId, pin: pins.mosi } }),
+          ...(pins.miso === undefined
+            ? {}
+            : { miso: { kind: 'board' as const, boardId, pin: pins.miso } }),
+          cs: { kind: 'board', boardId, pin: pins.cs },
+        },
+        // SD cards clock on modes 0 and 3, and CS (DAT3) carries the card's
+        // own pull-up: a slot whose select the guest has not driven yet reads
+        // as deselected and stays quiet.
+        modes: [0, 3],
+        csWhenFloating: 'deselected',
+        remoteModel: () => {
+          const model = sdCardRemoteModel(card, bytes);
+          if (!model) return null;
+          // A built-in names BOARD pins, not pad names, so the map the model's
+          // own chip-select watch needs is spelled out here.
+          const pinMap: Record<string, number> = { SCK: pins.sck, CS: pins.cs };
+          if (pins.mosi !== undefined) pinMap.DI = pins.mosi;
+          if (pins.miso !== undefined) pinMap.DO = pins.miso;
+          return { ...model, pinMap };
+        },
+        remoteBlobWrite: sdCardRemoteBlobWrite(card),
+      },
+      sdSpiFabricDevice(card),
+    );
+    this.sdHandle = () => {
+      handle.dispose();
+      unpublish();
+    };
+  }
+
+  /** True when the engine behind this shim runs in the tab and publishes its
+   *  own controller ports; false for the QEMU lane. */
+  private bridgeHasOwnPorts(): boolean {
+    const bridge = this.bridge as unknown as {
+      getBusBinding?: (pins: unknown) => unknown | null;
+    };
+    if (typeof bridge.getBusBinding !== 'function') return false;
+    try {
+      return bridge.getBusBinding({
+        onPinChange: () => () => {},
+        peekPinState: () => null,
+        driveInput: () => {},
+      }) != null;
+    } catch {
+      return false;
+    }
+  }
+
+  private sdCard: SdSpiCard | null = null;
+  private sdHandle: (() => void) | null = null;
+  private sdImageBytes = 0;
+
+  /** One byte into the guest's RX of UART `uart`. What a part on the fabric
+   *  answers arrives through its controller port; this is the byte-sized form
+   *  of sendSerialBytes for callers that already hold one byte. */
   sendSerialByte(byte: number, uart = 0): void {
     this.sendSerialBytes([byte & 0xff], uart);
   }
@@ -488,7 +701,21 @@ export class Esp32BridgeShim {
 
   registerSensor(type: string, pin: number, properties: Record<string, unknown>): boolean {
     this.bridge.sendSensorAttach(type, pin, properties);
+    this.noteSensorOwner(pin, properties);
+    // An I2C or UART part registers with the fabric in the same attach,
+    // before or after this call: look once both are done.
+    queueMicrotask(() => {
+      this.pushI2cMap();
+      this.pushUartMap();
+    });
     return true; // backend handles the protocol
+  }
+
+  /** The identity the worker's record carries for the bus map (uart_bus_table.owner_of). */
+  private noteSensorOwner(pin: number, properties: Record<string, unknown>): void {
+    const owner = properties['owner'] ?? properties['component_id'];
+    if (typeof owner === 'string' && owner) this.sensorOwners.set(pin, owner);
+    else this.sensorOwners.delete(pin);
   }
 
   /** Pins a backend-emulated single-wire sensor drives itself. The generic
@@ -506,60 +733,68 @@ export class Esp32BridgeShim {
 
   /**
    * Expose the underlying Esp32Bridge so simulation parts can subscribe to
-   * board-specific WS events (e.g. `onEpaperUpdate` for the ePaper backend
-   * rendering path). Hooks should restore any handler they overwrite.
+   * board-specific WS events (a worker-hosted chip's framebuffer, a camera
+   * frame). Hooks should restore any handler they overwrite.
    */
   getBridge(): Esp32Bridge {
     return this.bridge;
   }
 
+  // The shim has no SPI channel of its own (project board-buses-2026-09, F3).
+  // A part is on this board's SPI because its pins are on a controller's nets,
+  // and the in-browser engines answer each frame from their fabric port. A
+  // QEMU board answers from the worker's own copy of the same bus (F4), fed by
+  // the map this shim sends.
+
   /**
-   * Generic SPI bus adapter — same shape as AVRSimulator.spi so SPI-driven
-   * parts (ILI9341, SD cards, custom chips…) can hook the bus without
-   * caring whether they're on AVR, RP2040, or any of the ESP32 variants.
-   * The MOSI byte arrives via the QEMU worker's spi_event WS message
-   * (decoded in Esp32Bridge); MISO is driven by the worker's
-   * `_spi_response` global, so `completeTransfer` is a no-op on ESP32.
-   *
-   * Lazy-initialised so the bridge subscription only happens once a part
-   * actually accesses `.spi`.
+   * The bus fabric's binding for this board (project board-buses-2026-09).
+   * The pins are this shim's PinManager. The SPI controller ports come from
+   * the bridge when it has them: the in-browser engines, through the overlay's
+   * delegating bridge, which keeps the same ports across every run. A QEMU
+   * bridge has none of its own, so it gets the REMOTE port instead (F4): the
+   * worker's bytes reach the tab's devices through it, and the responders that
+   * have to answer travel the other way, as the bus map. An MCU reset the bridge reports reaches the fabric after
+   * the board's pins were reset, so a chip select reads as undriven until the
+   * rebooted firmware drives it again.
    */
-  private _spiAdapter: {
-    onByte: ((mosi: number) => void) | null;
-    completeTransfer: (miso: number) => void;
-  } | null = null;
-  get spi(): { onByte: ((mosi: number) => void) | null; completeTransfer: (miso: number) => void } {
-    if (!this._spiAdapter) {
-      const adapter = {
-        onByte: null as ((mosi: number) => void) | null,
-        // MISO goes back through the bridge's setSpiResponse — every bridge
-        // has it (QEMU forwards to the worker's _spi_response; the JS engines
-        // set the byte their SpiForwarder returns for THIS transfer, since the
-        // whole onByte chain runs synchronously inside the engine's transfer).
-        // This used to be a no-op "because the worker drives MISO", which was
-        // only true for QEMU-era parts: any SPI part that ANSWERS (an SD card
-        // reponding to CMD0) was talking to nobody in js mode — measured as
-        // SD.begin()=0 with sd_diskio retrying CMD0 forever.
-        completeTransfer: (miso: number) => {
-          (this.bridge as unknown as { setSpiResponse?: (b: number) => void }).setSpiResponse?.(
-            miso,
-          );
-        },
-      };
-      // Forward every per-byte WS event into whichever handler the part
-      // installed. Single-listener channel — last writer wins.
-      this.bridge.onSpiByte = (mosi: number) => {
-        adapter.onByte?.(mosi);
-      };
-      this._spiAdapter = adapter;
+  getBusBinding(): import('../simulation/buses').EngineBinding {
+    const pins: import('../simulation/buses').BoardPins = {
+      onPinChange: (pin, cb) => this.pinManager.onPinChange(pin, cb),
+      peekPinState: (pin) => this.pinManager.peekPinState(pin),
+      driveInput: (pin, level) => this.setPinState(pin, level),
+    };
+    const bridge = this.bridge as unknown as {
+      getBusBinding?: (
+        pins: import('../simulation/buses').BoardPins,
+      ) => import('../simulation/buses').EngineBinding | null;
+    };
+    const binding = typeof bridge.getBusBinding === 'function' ? bridge.getBusBinding(pins) : null;
+    if (!binding) {
+      return { ...this.remoteLane.binding(pins), i2c: this.i2cLane.ports, uart: this.uartLane.ports };
     }
-    return this._spiAdapter;
+    return {
+      ...binding,
+      setResetHandler: (handler) =>
+        binding.setResetHandler?.(
+          handler
+            ? () => {
+                this.pinManager.hardResetPinStates();
+                handler();
+              }
+            : null,
+        ),
+    };
   }
   updateSensor(pin: number, properties: Record<string, unknown>): void {
     this.bridge.sendSensorUpdate(pin, properties);
   }
   unregisterSensor(pin: number): void {
     this.bridge.sendSensorDetach(pin);
+    this.sensorOwners.delete(pin);
+    queueMicrotask(() => {
+      this.pushI2cMap();
+      this.pushUartMap();
+    });
   }
 
   // ── I2C write-only device relay (SSD1306, PCF8574) ───────────────────────
@@ -579,69 +814,24 @@ export class Esp32BridgeShim {
     }
   }
 
-  // ── Cross-board I2C bus surface ─────────────────────────────────────────
-
-  /**
-   * Expose the I2CBusManager so Interconnect can install cross-board
-   * bridges and ProtocolParts can register frontend-side virtual
-   * devices.  ESP32 has 2 hardware I2C buses but we collapse them
-   * onto a single front-end bus for now — the bus index is ignored.
-   * Splitting per-bus would require teaching the backend to tag
-   * `i2c_event` payloads with the originating bus number, which
-   * the lib worker already does (`bus` field) but the frontend
-   * shim doesn't yet route on.
-   */
-  getI2CBus(_bus: 0 | 1 = 0): I2CBusManager {
-    return this.i2cBusInstance;
-  }
-
-  /**
-   * Register a frontend-side virtual I2C device.  This mirrors the
-   * backend's QEMU-side slave (kept in sync via `registerSensor` /
-   * `updateSensor`) so peer boards reading across the I2C bridge
-   * find the device.  ProtocolParts calls this on the ESP32 path
-   * alongside the existing `registerSensor` + `addI2CTransactionListener`.
-   */
-  /** Sync-attached part devices, kept so a bridge REBUILD can adopt them.
-   *  The overlay loads async: a deep-linked example attaches its parts to the
-   *  shim wired around the stock QEMU bridge (whose attachSyncI2cDevice is
-   *  missing — a silent no-op), and only then does the overlay's factory
-   *  rebuild the board. Without this record the part's device existed
-   *  nowhere: the C6 gesture example booted with an EMPTY engine I2C bus and
-   *  arduino's i2c-ng driver failed every transaction (ESP_ERR_INVALID_STATE)
-   *  — whether it broke depended on a chunk-load race the pro bundle's growth
-   *  turned into a sure loss. */
-  private syncI2cParts = new Map<number, I2CDevice>();
-
-  addI2CDevice(device: I2CDevice, _bus: 0 | 1 = 0): void {
-    this.i2cBusInstance.addDevice(device);
-    this.syncI2cParts.set(device.address, device);
-    // An in-browser JS-emulator substitute bridge (velxio-prod overlay) plugs
-    // the part's real device model straight onto the engine's synchronous I2C
-    // bus, so the firmware's own reads hit it (sensors answer, displays
-    // render). The QEMU WebSocket bridge has no such method — reads there are
-    // served by the backend slave from registerSensor — so this is a no-op.
-    (this.bridge as { attachSyncI2cDevice?: (d: I2CDevice) => void }).attachSyncI2cDevice?.(device);
-  }
-
   /** A rebuilt board gets a fresh shim; the parts on the canvas do NOT
    *  re-attach (their closures hold the old shim), so the new shim re-plays
-   *  everything the old one had. Runs through addI2CDevice so the new bridge
-   *  (a pre-connect-buffering Delegating bridge) hears about each device. */
+   *  what the old one had. */
   adoptPartsFrom(prev: Esp32BridgeShim): void {
-    for (const dev of prev.syncI2cParts.values()) this.addI2CDevice(dev);
-    // Same reason as the I2C devices: a NeoPixel part subscribed to the OLD
-    // shim and will not re-attach for a bridge rebuild, so without this the
-    // pixel goes black on the first recompile and never comes back.
+    // A NeoPixel part subscribed to the OLD shim and will not re-attach for a
+    // bridge rebuild, so without this the pixel goes black on the first
+    // recompile and never comes back.
     for (const [pin, sink] of prev.ws2812Sinks) this.ws2812Sinks.set(pin, sink);
+    // SPI and I2C need nothing here: a device is on the board's bus because
+    // its pins are on a controller's nets, and the fabric holds that binding
+    // across every rebuild of the shim (project board-buses-2026-09).
   }
 
   /**
    * Attach (or clear, with null) the microphone sample source feeding the
-   * board's I2S RX path: one signed 16-bit sample per call. Same forwarding
-   * pattern as addI2CDevice — the in-browser JS-engine bridges implement
-   * setMicrophoneSource (velxio-prod overlay); everywhere else it's a no-op,
-   * which reads as a silent mic.
+   * board's I2S RX path: one signed 16-bit sample per call. The in-browser
+   * JS-engine bridges implement setMicrophoneSource (velxio-prod overlay);
+   * everywhere else it's a no-op, which reads as a silent mic.
    */
   setMicrophoneSource(source: (() => number) | null): boolean {
     const b = this.bridge as { setMicrophoneSource?: (s: (() => number) | null) => void };
@@ -680,189 +870,6 @@ export class Esp32BridgeShim {
     (this.bridge as { setSpeakerMuted?: (m: boolean) => void }).setSpeakerMuted?.(muted);
   }
 
-  /** Remove a previously-registered virtual device. */
-  removeI2CDevice(addr: number, _bus: 0 | 1 = 0): void {
-    this.i2cBusInstance.removeDevice(addr);
-    this.syncI2cParts.delete(addr);
-    (this.bridge as { detachSyncI2cDevice?: (a: number) => void }).detachSyncI2cDevice?.(addr);
-  }
-
-  /**
-   * Push register snapshots of a peer board's I2C devices into a
-   * backend `ProxySlave` per address.  Called by Interconnect after a
-   * cross-board I2C bridge is installed so the ESP32 firmware's Wire
-   * master reads can find the peer's devices inside QEMU.
-   *
-   * Walks the peer bus AND its transitive bridges (BFS).  Each device
-   * found at any reachable hop gets a ProxySlave on the backend.  All
-   * addresses discovered through `peerBus` are tracked under that key,
-   * so `clearProxiesForPeer(peerBus)` cleans up exactly what this call
-   * installed without disturbing proxies from concurrent bridges
-   * (e.g. when another wire pair also connects to this same ESP32).
-   *
-   * Devices that don't expose `dumpRegisters` (PCF8574, SSD1306,
-   * LCD-I2C) are skipped — they receive state through the
-   * write-forwarding path (proxy_i2c_complete event from the backend
-   * ProxySlave) instead.
-   */
-  syncProxyFromPeer(peerBus: I2CBusManager): void {
-    const ownedAddrs = this._proxiedByPeer.get(peerBus) ?? new Set<number>();
-
-    // BFS over the peer's bridge graph.  Skip our own bus so we don't
-    // mirror ourselves back via the return edge.
-    const visited = new Set<I2CBusManager>([this.i2cBusInstance, peerBus]);
-    const queue: I2CBusManager[] = [peerBus];
-
-    while (queue.length > 0) {
-      const bus = queue.shift()!;
-      if (typeof bus.listDevices === 'function') {
-        for (const device of bus.listDevices()) {
-          // Track the live device reference for write-forwarding and
-          // periodic resync.  Last writer wins on address collisions
-          // (rare; the user wired two devices to the same address).
-          this._peerDeviceLookup.set(device.address, device);
-          if (typeof device.dumpRegisters !== 'function') continue;
-          try {
-            const regs = device.dumpRegisters();
-            this.bridge.registerProxyI2c(device.address, regs);
-            ownedAddrs.add(device.address);
-            // Prime the resync hash so the first tick doesn't push a
-            // redundant identical dump.
-            this._lastDumpHash.set(device.address, Esp32BridgeShim._hashRegs(regs));
-          } catch (e) {
-            console.warn(
-              `[Esp32BridgeShim] syncProxyFromPeer dump failed for 0x${device.address.toString(16)}`,
-              e,
-            );
-          }
-        }
-      }
-      if (typeof bus.getBridges === 'function') {
-        for (const next of bus.getBridges()) {
-          if (visited.has(next)) continue;
-          visited.add(next);
-          queue.push(next);
-        }
-      }
-    }
-
-    if (ownedAddrs.size > 0) {
-      this._proxiedByPeer.set(peerBus, ownedAddrs);
-      this._ensureResyncTimer();
-    }
-  }
-
-  /**
-   * Tear down only the proxies that `syncProxyFromPeer(peerBus)`
-   * installed.  Safe to call multiple times; idempotent.  Other
-   * concurrent bridges (different peer buses) retain their proxies.
-   */
-  clearProxiesForPeer(peerBus: I2CBusManager): void {
-    const owned = this._proxiedByPeer.get(peerBus);
-    if (!owned) return;
-    for (const addr of owned) {
-      // Only unregister if no other peer also claims this address.
-      let claimedElsewhere = false;
-      for (const [other, set] of this._proxiedByPeer) {
-        if (other !== peerBus && set.has(addr)) {
-          claimedElsewhere = true;
-          break;
-        }
-      }
-      if (!claimedElsewhere) {
-        this.bridge.unregisterProxyI2c(addr);
-        this._peerDeviceLookup.delete(addr);
-        this._lastDumpHash.delete(addr);
-      }
-    }
-    this._proxiedByPeer.delete(peerBus);
-    this._stopResyncTimerIfIdle();
-  }
-
-  /**
-   * Tear down EVERY proxy slave we've installed.  Used on full board
-   * stop / disconnect — `clearProxiesForPeer` is preferred for
-   * single-wire-pair teardowns.
-   */
-  clearAllProxies(): void {
-    for (const set of this._proxiedByPeer.values()) {
-      for (const addr of set) this.bridge.unregisterProxyI2c(addr);
-    }
-    this._proxiedByPeer.clear();
-    this._peerDeviceLookup.clear();
-    this._lastDumpHash.clear();
-    this._stopResyncTimerIfIdle();
-  }
-
-  /** Per-peer set of addresses we've mirrored.  Cleanup keyed by peer bus. */
-  private _proxiedByPeer = new Map<I2CBusManager, Set<number>>();
-  /** Address → live frontend device, for write-forwarding & periodic resync. */
-  private _peerDeviceLookup = new Map<number, I2CDevice>();
-  /** Periodic resync timer — runs while any proxy is live. */
-  private _resyncTimer: ReturnType<typeof setInterval> | null = null;
-  /** Cheap hash of the last dumped register set per address, to skip WS pushes when unchanged. */
-  private _lastDumpHash = new Map<number, number>();
-
-  /**
-   * Periodic resync interval in ms.  250 ms strikes the balance
-   * between WS bandwidth and human-perceivable RTC freshness; see
-   * the architecture rationale in the plan file.  Exposed for tests
-   * that want a faster cadence via fake timers.
-   */
-  static RESYNC_INTERVAL_MS = 250;
-
-  private _ensureResyncTimer(): void {
-    if (this._resyncTimer !== null) return;
-    if (this._proxiedByPeer.size === 0) return;
-    this._resyncTimer = setInterval(() => this._resyncTick(), Esp32BridgeShim.RESYNC_INTERVAL_MS);
-  }
-
-  private _stopResyncTimerIfIdle(): void {
-    if (this._proxiedByPeer.size === 0 && this._resyncTimer !== null) {
-      clearInterval(this._resyncTimer);
-      this._resyncTimer = null;
-      this._lastDumpHash.clear();
-    }
-  }
-
-  /**
-   * FNV-1a over EVERY byte of a register dump. The previous hash sampled one
-   * byte in sixteen plus the first eight, so a change anywhere else — the
-   * BMP280 measurement registers at 0xF7-0xFC, an MPU-6050 axis the slider
-   * moved — left the hash equal and the proxy never refreshed: the ESP32 read
-   * a stale value for as long as the run lasted. 256 bytes every 250 ms per
-   * proxied device costs nothing.
-   */
-  static _hashRegs(regs: Uint8Array): number {
-    let h = 0x811c9dc5;
-    for (let i = 0; i < regs.length; i++) {
-      h ^= regs[i];
-      h = Math.imul(h, 0x01000193);
-    }
-    return h >>> 0;
-  }
-
-  private _resyncTick(): void {
-    // Union of all proxied addresses across peers.
-    const seen = new Set<number>();
-    for (const set of this._proxiedByPeer.values()) {
-      for (const addr of set) seen.add(addr);
-    }
-    for (const addr of seen) {
-      const device = this._peerDeviceLookup.get(addr);
-      if (!device || typeof device.dumpRegisters !== 'function') continue;
-      let regs: Uint8Array;
-      try {
-        regs = device.dumpRegisters();
-      } catch {
-        continue;
-      }
-      const h = Esp32BridgeShim._hashRegs(regs);
-      if (this._lastDumpHash.get(addr) === h) continue;
-      this._lastDumpHash.set(addr, h);
-      this.bridge.updateProxyI2c(addr, regs);
-    }
-  }
 }
 
 // ── LEDC duty handler ───────────────────────────────────────────────────
@@ -991,13 +998,41 @@ class Stm32BridgeShim {
   /** Levels the circuit applies; the worker only reports the ones it drives. */
   private externalScope = new ExternalPinScopeFeed(() => performance.now());
   private bridge: Stm32Bridge;
-  private i2cBusInstance: I2CBusManager;
   private _i2cTransactionListeners = new Map<number, (data: number[]) => void>();
+
+  /** The board's SPI lane: the STM32 runs in a backend QEMU worker, so its
+   *  controller port is fed by the worker's batches and its responders travel
+   *  there as a bus map (project board-buses-2026-09, F4). */
+  private readonly remoteLane: RemoteSpiLane;
+  /** Its I2C controllers and the I2C half of the same map (F5); see
+   *  Esp32BridgeShim.i2cLane. */
+  private readonly i2cLane: RemoteI2cLane;
+  /** Its USARTs as ports and the UART half of the map (F6); see
+   *  Esp32BridgeShim.uartLane. */
+  private readonly uartLane: RemoteUartLane;
+  /** The owners of the records the worker holds, by pin; see Esp32BridgeShim.sensorOwners. */
+  private readonly sensorOwners = new Map<number, string>();
 
   constructor(bridge: Stm32Bridge, pm: PinManager) {
     this.bridge = bridge;
     this.pinManager = pm;
-    this.i2cBusInstance = new I2CBusManager(nullI2CMaster());
+    this.i2cLane = new RemoteI2cLane(bridge.boardId, bridge.boardKind);
+    this.uartLane = new RemoteUartLane(bridge.boardId, bridge.boardKind, (unit, bytes) =>
+      bridge.sendSerialBytes(bytes, unit),
+    );
+    this.remoteLane = new RemoteSpiLane(
+      bridge.boardId,
+      bridge.boardKind,
+      (spi) =>
+        bridge.sendBusMap(spi, this.i2cLane.poll().i2c, this.uartLane.poll(this.sensorOwners.values()).uart),
+      (owner, attrs) => bridge.sendBusAttrs(owner, attrs),
+    );
+    bridge.onSpiBatch = (mosi) => this.remoteLane.port?.deliver(mosi);
+    bridge.onUartTxBytes = (uart, bytes) => this.uartLane.deliver(uart, bytes);
+    bridge.onBusMapRequest = () => ({
+      i2c: this.i2cLane.poll().i2c,
+      uart: this.uartLane.poll(this.sensorOwners.values()).uart,
+    });
   }
 
   // ── Lifecycle stubs (the store drives the real bridge via getStm32Bridge) ──
@@ -1022,6 +1057,9 @@ class Stm32BridgeShim {
     // bridge, where the worker's own edges arrive, and carries the same
     // `performance.now()` clock they are stamped with.
     if (this.pinManager.getOutputPins().has(pin)) return;
+    // And the wire's level channel, as on every other board (see the ESP32
+    // shim above): a chip in this tab watching the pin reads it there.
+    this.pinManager.triggerPinChange(pin, state, 'external');
     this.externalScope.emit(this.onPinChangeWithTime ?? this.bridge.onPinChangeWithTime, pin, state);
   }
 
@@ -1078,6 +1116,14 @@ class Stm32BridgeShim {
   // ── Generic sensor registration (delegated to the backend QEMU worker) ──
   registerSensor(type: string, pin: number, properties: Record<string, unknown>): boolean {
     this.bridge.sendSensorAttach(type, pin, properties);
+    // See Esp32BridgeShim.registerSensor.
+    const owner = properties['owner'] ?? properties['component_id'];
+    if (typeof owner === 'string' && owner) this.sensorOwners.set(pin, owner);
+    else this.sensorOwners.delete(pin);
+    queueMicrotask(() => {
+      this.pushI2cMap();
+      this.pushUartMap();
+    });
     return true;
   }
   updateSensor(pin: number, properties: Record<string, unknown>): void {
@@ -1085,11 +1131,63 @@ class Stm32BridgeShim {
   }
   unregisterSensor(pin: number): void {
     this.bridge.sendSensorDetach(pin);
+    this.sensorOwners.delete(pin);
+    queueMicrotask(() => {
+      this.pushI2cMap();
+      this.pushUartMap();
+    });
   }
 
-  /** Expose the bridge so SPI/ePaper parts can subscribe to backend frames. */
+  /** Send the worker the board's SPI bus map (project board-buses-2026-09). */
+  pushBusMap(): void {
+    this.remoteLane.pushMap();
+  }
+
+  /** The I2C half alone, when it changed (F5); see Esp32BridgeShim.pushI2cMap. */
+  pushI2cMap(): void {
+    const { i2c, changed } = this.i2cLane.poll();
+    // Optional for the same reason as on the ESP32 shim: this runs from a
+    // microtask after a sensor attach, so a bridge without the seam (an older
+    // bridge, or a test double) must not turn into an uncaught exception there.
+    if (changed)
+      (this.bridge as unknown as { sendI2cBusMap?: (m: unknown[]) => void }).sendI2cBusMap?.(i2c);
+  }
+
+  /** The UART half alone, when it changed (F6); see Esp32BridgeShim.pushUartMap. */
+  pushUartMap(): void {
+    const { uart, changed } = this.uartLane.poll(this.sensorOwners.values());
+    if (changed)
+      (this.bridge as unknown as { sendUartBusMap?: (m: unknown[]) => void }).sendUartBusMap?.(uart);
+  }
+
+  /** A responder's live inputs, for the worker that hosts its model. */
+  pushBusAttrs(owner: string, attrs: Record<string, number>): void {
+    this.remoteLane.pushAttrs(owner, attrs);
+  }
+
+  /** Expose the bridge so a part can subscribe to the worker's own events. */
   getBridge(): Stm32Bridge {
     return this.bridge;
+  }
+
+  /**
+   * The bus fabric's binding for this board (project board-buses-2026-09):
+   * its pins, and the remote SPI port the backend worker feeds (F4). The
+   * bytes the guest clocked arrive as batches and are pushed into the fabric
+   * here; a device that has to ANSWER travels the other way instead, as a
+   * portable model in the bus map, because nothing in this tab can answer a
+   * byte the guest clocked before the batch was even sent.
+   */
+  getBusBinding(): import('../simulation/buses').EngineBinding {
+    return {
+      ...this.remoteLane.binding({
+        onPinChange: (pin, cb) => this.pinManager.onPinChange(pin, cb),
+        peekPinState: (pin) => this.pinManager.peekPinState(pin),
+        driveInput: (pin, level) => this.setPinState(pin, level),
+      }),
+      i2c: this.i2cLane.ports,
+      uart: this.uartLane.ports,
+    };
   }
 
   // ── I2C write-only device relay (SSD1306, PCF8574) ────────────────────────
@@ -1106,47 +1204,32 @@ class Stm32BridgeShim {
     }
   }
 
-  // ── Cross-board I2C bus surface (for Interconnect bridges) ────────────────
-  getI2CBus(_bus: 0 | 1 = 0): I2CBusManager {
-    return this.i2cBusInstance;
-  }
-  addI2CDevice(device: I2CDevice, _bus: 0 | 1 = 0): void {
-    this.i2cBusInstance.addDevice(device);
-  }
-  removeI2CDevice(addr: number, _bus: 0 | 1 = 0): void {
-    this.i2cBusInstance.removeDevice(addr);
-  }
-
-  // ── Generic SPI bus adapter (same shape as AVRSimulator.spi) ──────────────
-  // SPI panels (ILI9341, SSD1306-SPI) hook `.spi.onByte`; STM32 runs SPI in
-  // the backend, so the MOSI bytes arrive batched over `spi_batch` and we
-  // replay them one at a time. MISO is driven by the worker, so
-  // `completeTransfer` is a no-op (mirrors the ESP32 adapter).
-  private _spiAdapter: {
-    onByte: ((mosi: number) => void) | null;
-    completeTransfer: (miso: number) => void;
-  } | null = null;
-  get spi(): {
-    onByte: ((mosi: number) => void) | null;
-    completeTransfer: (miso: number) => void;
-  } {
-    if (!this._spiAdapter) {
-      const adapter = {
-        onByte: null as ((mosi: number) => void) | null,
-        completeTransfer: (_miso: number) => {},
-      };
-      this.bridge.onSpiBatch = (bytes: Uint8Array) => {
-        for (const b of bytes) adapter.onByte?.(b);
-      };
-      this._spiAdapter = adapter;
-    }
-    return this._spiAdapter;
-  }
 }
 
 // ── Runtime Maps (outside Zustand — not serialisable) ─────────────────────
-const simulatorMap = new Map<
-  string,
+
+/**
+ * Every path that gives a board its simulator (addBoard, setBoardType,
+ * initSimulator, rebuilds, project loads...) goes through this map, so it is
+ * the one place that tells the bus fabric a board's engine changed. A new
+ * simulator object is bound; a removed one is unbound. The fabric keeps its
+ * devices either way (project board-buses-2026-09).
+ */
+class BusBoundSimulatorMap<V> extends Map<string, V> {
+  set(id: string, sim: V): this {
+    super.set(id, sim);
+    busRegistry.bindBoard(id, sim);
+    return this;
+  }
+
+  delete(id: string): boolean {
+    const had = super.delete(id);
+    if (had) busRegistry.unbindBoard(id);
+    return had;
+  }
+}
+
+const simulatorMap = new BusBoundSimulatorMap<
   | AVRSimulator
   | RP2040Simulator
   | RiscVSimulator
@@ -1216,6 +1299,71 @@ export async function piRerunScript(boardId: string, boardKind: string): Promise
   await new Promise((r) => setTimeout(r, 400));
   await piSyncAndRunScript(boardId, boardKind);
 }
+/**
+ * Live microSD contents, by owner.
+ *
+ * The card the guest talks to is the one on the bus fabric, and it belongs to
+ * whoever registered it: the `microsd-card` part on the canvas (owner = its
+ * component id, on every engine family), or a board's own slot built by the
+ * board's built-ins (owner = the board id). Whoever holds the model publishes
+ * a reader here, and the SD panel's live listing asks for it by owner instead
+ * of going through an engine bridge - which only ever had a card for the ESP32
+ * families, and now only for a board that declares a built-in slot.
+ *
+ * `fromPart` marks a card that is a component on the canvas, which is what
+ * lets a panel opened on the card itself find it without being told which
+ * component it belongs to (see readCanvasSdCardImage).
+ */
+export type SdImageReader = () => Uint8Array | null;
+
+interface SdImageEntry {
+  read: SdImageReader;
+  fromPart: boolean;
+}
+
+const sdImageReaders = new Map<string, SdImageEntry>();
+
+/** Publish a card's contents under `ownerId`. Returns the unregister; calling
+ *  it again for the same owner replaces the previous reader, so a re-attach
+ *  never leaves a dead card answering the panel. */
+export function registerSdImageReader(
+  ownerId: string,
+  read: SdImageReader,
+  opts: { fromPart?: boolean } = {},
+): () => void {
+  const entry: SdImageEntry = { read, fromPart: opts.fromPart ?? false };
+  sdImageReaders.set(ownerId, entry);
+  return () => {
+    if (sdImageReaders.get(ownerId) === entry) sdImageReaders.delete(ownerId);
+  };
+}
+
+/** Current contents of the card owned by `ownerId`, or null when nothing of
+ *  that name holds one. */
+export function readSdCardImage(ownerId: string | null | undefined): Uint8Array | null {
+  if (!ownerId) return null;
+  try {
+    return sdImageReaders.get(ownerId)?.read() ?? null;
+  } catch (e) {
+    console.warn('[microsd] reading the card failed:', e);
+    return null;
+  }
+}
+
+/** The canvas card, when the project has exactly one. The property dialog
+ *  opens on a card without telling the panel which component it is; with a
+ *  single card on the canvas there is no ambiguity to resolve. Two cards and
+ *  this answers null rather than guess. */
+export function readCanvasSdCardImage(): Uint8Array | null {
+  let only: string | null = null;
+  for (const [id, entry] of sdImageReaders) {
+    if (!entry.fromPart) continue;
+    if (only !== null) return null;
+    only = id;
+  }
+  return readSdCardImage(only);
+}
+
 export const getEsp32Bridge = (id: string) => esp32BridgeMap.get(id);
 export const getStm32Bridge = (id: string) => stm32BridgeMap.get(id);
 
@@ -1794,22 +1942,11 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
     // can call setPinState / access pinManager on ESP32 boards.
     const shim = new Esp32BridgeShim(bridge, pm);
     shim.onSerialData = serialCallback;
-    // If a shim already exists for this id (e.g. tests recreate the
-    // same kind after reset, or the pro overlay rebuilds the bridge),
-    // dispose any active proxies / timers so the orphaned instance
-    // doesn't keep firing.
+    // A shim may already exist for this id (tests recreate the same kind
+    // after reset, or the pro overlay rebuilds the bridge). The parts on the
+    // canvas subscribed to the OLD shim (their attach closures hold it) and
+    // will not re-attach for a bridge rebuild: carry over what they gave it.
     const existingShim = simulatorMap.get(id) as any;
-    if (existingShim?.clearAllProxies) {
-      try {
-        existingShim.clearAllProxies();
-      } catch {
-        /* ignore */
-      }
-    }
-    // The parts on the canvas attached their I2C device models to the OLD
-    // shim (their attach closures hold it) and will not re-attach for a
-    // bridge rebuild — carry them over, or the rebuilt engine boots with an
-    // empty I2C bus and every Wire transaction fails.
     if (existingShim instanceof Esp32BridgeShim) {
       try {
         shim.adoptPartsFrom(existingShim);
@@ -2009,6 +2146,7 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
         // prints it at Run, exactly like one the browser made itself.
         bridge.onSystemEvent = (event, data) => {
           if (event === 'sensor_refused') shim.noteSensorRefused(data);
+          else if (event === 'bus_blob') shim.applyBusBlob(data);
         };
         const disconnected = bridge.onDisconnected;
         bridge.onDisconnected = () => {
@@ -2404,19 +2542,18 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
         const sim = getBoardSimulator(boardId);
         if (sim && !isPiBoardKind(board.boardKind)) {
           try {
+            // Only the firmware goes in. The I2C bus holds what the canvas
+            // wires to it and nothing else: a bus with no parts does not
+            // answer, and nothing is put on it that a real part at the same
+            // address, on this board or another, could collide with
+            // (board-buses D-010).
             if (sim instanceof AVRSimulator) {
               sim.loadHex(program);
-              sim.addI2CDevice(new VirtualDS1307());
-              sim.addI2CDevice(new VirtualTempSensor());
-              sim.addI2CDevice(new I2CMemoryDevice(0x50));
             } else if (sim instanceof RP2040Simulator) {
               sim.loadBinary(program);
-              sim.addI2CDevice(new VirtualDS1307() as RP2040I2CDevice);
-              sim.addI2CDevice(new VirtualTempSensor() as RP2040I2CDevice);
-              sim.addI2CDevice(new I2CMemoryDevice(0x50) as RP2040I2CDevice);
             } else if (isProBoardSimulator(sim)) {
               // Overlay-registered board: the overlay owns the whole load
-              // sequence (PIO/peripheral attach, binary format, demo devices).
+              // sequence (PIO/peripheral attach, binary format, board devices).
               getProBoard(board.boardKind)?.loadFirmware?.(sim, program, {
                 boardKind: board.boardKind,
                 boardId,
@@ -2897,8 +3034,16 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
             sensors.push(props);
           }
 
-          // Pre-register I2C sensors (virtual pin = 200 + i2c_addr, no wire resolution needed)
-          for (const comp of components) {
+          // Pre-register I2C sensors under the record each part registers
+          // (its own worker slot, its owner), so the two merge into one and
+          // the worker places it by the bus map. Only for a worker: an
+          // in-browser engine answers the part from the bus fabric, and a
+          // record there would add a responder at the address whatever the
+          // wiring says.
+          const workerI2c =
+            (esp32Bridge as unknown as { hostsCustomChips?: () => boolean }).hostsCustomChips?.() !==
+            false;
+          for (const comp of workerI2c ? components : []) {
             const i2cDef = I2C_SENSOR_MAP[comp.metadataId];
             if (!i2cDef) continue;
             // Resolve I2C address from component property or use default
@@ -2922,11 +3067,11 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
                 }
               }
             }
-            const virtualPin = 200 + addr;
             const props: Record<string, unknown> = {
               sensor_type: i2cDef.sensorType,
-              pin: virtualPin,
+              pin: i2cPartWorkerPin(comp.id),
               addr,
+              owner: comp.id,
             };
             for (const key of i2cDef.propertyKeys ?? []) {
               const val = comp.properties[key];
@@ -2956,33 +3101,20 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
           const hasWifi = (board.hasWifi ?? false) || sketchUsesWifi(boardFiles);
           esp32Bridge.wifiEnabled = hasWifi;
 
-          // microSD — if a card is on the canvas, build a FAT16 image (project
-          // files, plus any paid binary uploads stored on the part) and hand
-          // it to the bridge so the QEMU worker can attach it as an SD-over-SPI
-          // slave. No card -> clear any stale image from a previous run.
+          // microSD: the BOARD's own slot gets its image here, because it has
+          // no component on the canvas to carry one. A card the user dropped
+          // on the canvas builds its own image in the part and reaches its bus
+          // through its own wires, so nothing about it belongs on the bridge.
+          //
+          // Until F4 this also shipped the image to the QEMU worker (`sd_card`
+          // in the start config) so a Python card of its own could serve it -
+          // a third hand-kept copy of the SD protocol. It does not any more:
+          // the slot is a device of the bus fabric like everything else and
+          // travels in the bus map, where ONE portable model answers beside
+          // the guest (project board-buses-2026-09, D-004).
           const sdCard = components.find((c) => c.metadataId === 'microsd-card');
-          // Overlay-registered boards can declare a BUILT-IN microSD slot:
-          // attach it even without a card component. A slot on the chip's own
-          // SDMMC controller (the P4's) has no chip select — only a slot that
-          // shares an SPI bus needs one, and only that one can be gated.
           const builtInSd = getProBoard(board.boardKind)?.builtInSd;
-          const builtInSdCs = builtInSd?.bus === 'spi' ? builtInSd.csPin : undefined;
-          // Which GPIO deselects the card. A card on the canvas is gated by
-          // the CS pin the user WIRED — the same walk the sensors above use,
-          // so a CS that reaches the board through a breadboard strip counts.
-          // Chip select is not a formality on this bus: a real card holds MISO
-          // in high-Z until its CS goes low, which is the only reason a
-          // display and a card can share SCK/MOSI/MISO at all. Leaving a
-          // standalone card permanently selected made it answer the display's
-          // pixel stream, and the screen went blank the moment a card was
-          // dropped on the canvas (issue #343) — with no wiring that could
-          // avoid it.
-          // An unwired CS keeps the old always-selected behaviour: on real
-          // hardware that pin would float and nothing would work, but there
-          // are saved projects that never wired it and do work here, and a
-          // card nobody shares a bus with is harmed by nothing.
-          const wiredSdCs = sdCard ? traceBoardGpio(traceState, sdCard.id, 'CS', boardId) : null;
-          if (sdCard || builtInSd !== undefined) {
+          if (builtInSd !== undefined) {
             try {
               // Uploads come from the card component when one is on the
               // canvas, else from the BOARD's own slot (board.sdFiles - the
@@ -2992,16 +3124,18 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
                 : decodeSdFiles(board.sdFiles);
               const image = buildProjectSdImage(useEditorStore.getState().files, uploaded);
               esp32Bridge.sdImageB64 = bytesToB64(image);
-              esp32Bridge.sdCsPin = sdCard ? (wiredSdCs ?? undefined) : builtInSdCs;
             } catch (e) {
               console.warn('[microsd] SD image build failed:', e);
               esp32Bridge.sdImageB64 = undefined;
-              esp32Bridge.sdCsPin = undefined;
             }
           } else {
             esp32Bridge.sdImageB64 = undefined;
-            esp32Bridge.sdCsPin = undefined;
           }
+          // The slot only reaches the bus through the shim, which owns the
+          // card object the panel lists and the model the worker runs.
+          (
+            simulatorMap.get(boardId) as { syncBuiltinSdCard?: () => void } | undefined
+          )?.syncBuiltinSdCard?.();
 
           // Ensure firmware is loaded into the bridge (handles page-refresh case
           // where _pendingFirmware is lost but compiledProgram is still in store).
@@ -3016,8 +3150,8 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
         if (stm32Bridge) {
           // Pre-register I2C devices (BMP280, MPU6050, SSD1306, …) so the QEMU
           // worker builds each slave on the bus BEFORE the firmware's Wire
-          // master starts probing. Address-based — no wire resolution needed
-          // (virtual pin = 200 + i2c_addr). Mirrors the ESP32 path.
+          // master starts probing. Keyed like the part's own record (see the
+          // ESP32 path); the bus map says which controller each is on.
           const { components } = get();
           const sensors: Array<Record<string, unknown>> = [];
           for (const comp of components) {
@@ -3044,8 +3178,9 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
             }
             const props: Record<string, unknown> = {
               sensor_type: i2cDef.sensorType,
-              pin: 200 + addr,
+              pin: i2cPartWorkerPin(comp.id),
               addr,
+              owner: comp.id,
             };
             for (const key of i2cDef.propertyKeys ?? []) {
               const val = comp.properties[key];
@@ -3478,10 +3613,7 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
       const sim = getBoardSimulator(boardId);
       if (sim && sim instanceof AVRSimulator) {
         try {
-          sim.loadHex(hex);
-          sim.addI2CDevice(new VirtualDS1307());
-          sim.addI2CDevice(new VirtualTempSensor());
-          sim.addI2CDevice(new I2CMemoryDevice(0x50));
+          sim.loadHex(hex); // only the firmware: see compileBoardProgram
           set((s) => ({ compiledHex: hex, hexEpoch: s.hexEpoch + 1 }));
           console.log('HEX file loaded successfully');
         } catch (error) {
@@ -3498,10 +3630,7 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
       const sim = getBoardSimulator(boardId);
       if (sim && sim instanceof RP2040Simulator) {
         try {
-          sim.loadBinary(base64);
-          sim.addI2CDevice(new VirtualDS1307() as RP2040I2CDevice);
-          sim.addI2CDevice(new VirtualTempSensor() as RP2040I2CDevice);
-          sim.addI2CDevice(new I2CMemoryDevice(0x50) as RP2040I2CDevice);
+          sim.loadBinary(base64); // only the firmware: see compileBoardProgram
           set((s) => ({ compiledHex: base64, hexEpoch: s.hexEpoch + 1 }));
           console.log('Binary loaded into RP2040 successfully');
         } catch (error) {
@@ -4538,4 +4667,73 @@ useSimulatorStore.subscribe((state) => {
     lastWiresRef = state.wires;
     icUpdateWires(state.wires);
   }
+});
+
+// ── Bus fabric (project board-buses-2026-09) ────────────────────────────────
+// The fabric reads the circuit from the store and recomputes which bus every
+// device sits on whenever the wiring, the parts or the boards change. Changes
+// are coalesced into one recompute per task: a drag emits dozens of updates.
+busRegistry.setResolver(createStoreNetResolver(() => useSimulatorStore.getState()));
+{
+  let lastWires = useSimulatorStore.getState().wires;
+  let lastBoards = useSimulatorStore.getState().boards;
+  let lastComponents = useSimulatorStore.getState().components;
+  let pending = false;
+  useSimulatorStore.subscribe((state) => {
+    if (
+      state.wires === lastWires &&
+      state.boards === lastBoards &&
+      state.components === lastComponents
+    ) {
+      return;
+    }
+    lastWires = state.wires;
+    lastBoards = state.boards;
+    lastComponents = state.components;
+    if (pending) return;
+    pending = true;
+    queueMicrotask(() => {
+      pending = false;
+      busRegistry.netlistChanged();
+    });
+  });
+}
+// A board whose firmware runs in a backend worker has to tell it who is on
+// its SPI bus, and again whenever that changes (project board-buses-2026-09,
+// F4). One listener for the page, resolved through the simulator map, because
+// a shim is rebuilt whenever the bridge behind it is and a subscription taken
+// by each one would outlive every one of them.
+busRegistry.onSpiMapChange((boardId) => {
+  const sim = simulatorMap.get(boardId) as { pushBusMap?: () => void } | undefined;
+  sim?.pushBusMap?.();
+});
+// The same for I2C (F5): a target placed, moved or gone, and a wire edited
+// mid-run, reach a QEMU board's worker as a new I2C half of its map. The
+// registry coalesces the calls to one per board and task; the shim sends only
+// when the published list really changed. A board with no worker has no
+// pushI2cMap, and the Pi publishes its own topology on its bus tick.
+busRegistry.onI2cMapChange((boardId) => {
+  const sim = simulatorMap.get(boardId) as { pushI2cMap?: () => void } | undefined;
+  sim?.pushI2cMap?.();
+});
+// And for UART (F6): an endpoint placed, moved or gone, or a controller
+// rerouted, reaches a QEMU board's worker as a new UART half of its map. A
+// board with no worker has no pushUartMap.
+busRegistry.onUartMapChange((boardId) => {
+  const sim = simulatorMap.get(boardId) as { pushUartMap?: () => void } | undefined;
+  sim?.pushUartMap?.();
+});
+// Between maps, a hosted responder's live inputs (a finger, a slider, the
+// circuit solve) go to the same host on their own, keyed by owner. A board
+// running in this tab has no pushBusAttrs: its devices read those inputs
+// directly.
+busRegistry.onSpiAttrsChange((boardId, owner, attrs) => {
+  const sim = simulatorMap.get(boardId) as
+    | { pushBusAttrs?: (o: string, a: Record<string, number>) => void }
+    | undefined;
+  sim?.pushBusAttrs?.(owner, attrs);
+});
+busRegistry.onDiagnostic((d) => {
+  const st = useSimulatorStore.getState();
+  appendSimulatorNote(d.boardId ?? st.activeBoardId ?? INITIAL_BOARD_ID, d.message);
 });
