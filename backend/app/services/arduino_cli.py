@@ -237,6 +237,21 @@ def _has_prelude(content: str, prelude: str) -> bool:
     return all(ln in code for ln in lines)
 
 
+def _skip_startup_index() -> bool:
+    """True when the launcher asked us to defer the startup index refresh.
+
+    Opt-in: the desktop wrapper sets VELXIO_SKIP_STARTUP_INDEX=1 because the
+    refresh otherwise blocks the backend for up to ~150s before it can
+    serve anything. See ArduinCliService.__init__ for how the deferred pass
+    is picked up again on demand.
+    """
+    return os.environ.get("VELXIO_SKIP_STARTUP_INDEX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def _extra_core_for_fqbn(fqbn: str) -> dict | None:
     for core_id, entry in _EXTRA_CORES.items():
         if entry["match"] in fqbn:
@@ -285,7 +300,18 @@ class ArduinoCLIService:
         # Cached `core list` output; see _is_core_installed. Invalidated
         # wherever a core is installed so a fresh install is seen immediately.
         self._installed_cores: str | None = None
-        self._ensure_board_urls()
+        # The URL/index pass is a network round-trip (`core update-index`)
+        # and it runs before uvicorn binds, so it delays the WHOLE backend.
+        # Measured 44s-150s depending on the network. VELXIO_SKIP_STARTUP_INDEX=1
+        # defers it: ensure_core_for_board() runs the same pass on demand, the
+        # first time a board actually needs a core that is not installed yet.
+        # An already-installed core (arduino:avr) never triggers it, so AVR
+        # sketches compile immediately and nothing is lost.
+        # Unset (the default) keeps the original startup behaviour untouched.
+        if _skip_startup_index():
+            print("[arduino-cli] Skipping the startup index refresh (VELXIO_SKIP_STARTUP_INDEX)")
+        else:
+            self._ensure_board_urls()
         self._ensure_core_installed()
 
     def _all_core_urls(self) -> dict[str, str]:

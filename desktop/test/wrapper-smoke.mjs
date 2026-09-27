@@ -218,6 +218,29 @@ async function main() {
     'status=' + downRes.status,
   );
 
+  // 8. The 502 used to say "not reachable" even while the backend was still
+  //    warming up (~50s on a first launch), which sent users hunting for a
+  //    broken install. It must report the real phase instead.
+  const warming = await startAppServer({
+    distDir: DIST,
+    backendBase: 'http://127.0.0.1:1', // nothing is listening there
+    host: '127.0.0.1',
+    port: 0,
+    backendStatus: () => ({ phase: 'starting', elapsedMs: 12000 }),
+  });
+  const warmRes = await get(warming.url + 'api/echo');
+  let warmBody = null;
+  try { warmBody = JSON.parse(warmRes.text); } catch { /* not json */ }
+  check(
+    '502 during warm-up reports "still starting" rather than "not reachable"',
+    warmRes.status === 502 &&
+      warmBody &&
+      warmBody.backend === 'starting' &&
+      /still starting \(12s/.test(String(warmBody.detail)),
+    JSON.stringify(warmBody).slice(0, 200),
+  );
+  await warming.close();
+
   await server.close();
   console.log('\n' + (failures === 0 ? 'ALL CHECKS PASSED' : failures + ' CHECK(S) FAILED'));
   process.exitCode = failures === 0 ? 0 : 1;

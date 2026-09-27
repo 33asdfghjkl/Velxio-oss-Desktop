@@ -87,7 +87,46 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
-function proxyHttp(req, res, backendBase) {
+/**
+ * Body returned when the proxy cannot reach the backend.
+ *
+ * "Not reachable" was misleading: on a first launch the backend IS coming up,
+ * it just needs ~50s to sync its board package indexes before it binds.
+ * Reporting that as a hard failure sent users hunting for a broken install.
+ */
+function backendUnavailableBody(err, backendStatus) {
+  const s = (typeof backendStatus === 'function' ? backendStatus() : null) || {};
+  const detail = String((err && err.message) || err);
+  if (s.phase === 'starting') {
+    const secs = Math.round((s.elapsedMs || 0) / 1000);
+    return {
+      detail:
+        'The local Velxio backend is still starting (' + secs + 's so far). ' +
+        'On a first run it syncs its board package indexes before it can serve ' +
+        'requests, which takes about a minute. Wait for it to finish, then compile again.',
+      backend: 'starting',
+      error: detail,
+    };
+  }
+  if (s.phase === 'failed') {
+    return {
+      detail:
+        'The local Velxio backend is not running: ' + (s.reason || 'unknown reason') + '. ' +
+        'Editing and the in-browser AVR / RP2040 simulation still work; compiling needs it.',
+      backend: 'failed',
+      error: detail,
+    };
+  }
+  return {
+    detail:
+      'Velxio backend is not reachable. The desktop app runs it locally; ' +
+      'see the README "Backend" section.',
+    backend: s.phase || 'unknown',
+    error: detail,
+  };
+}
+
+function proxyHttp(req, res, backendBase, backendStatus) {
   let target;
   try {
     target = new URL(backendBase + req.url);
@@ -113,12 +152,7 @@ function proxyHttp(req, res, backendBase) {
 
   upstream.on('error', (err) => {
     if (res.headersSent) return res.destroy();
-    sendJson(res, 502, {
-      detail:
-        'Velxio backend is not reachable. The desktop app runs it locally; ' +
-        'see the README "Backend" section.',
-      error: String(err && err.message ? err.message : err),
-    });
+    sendJson(res, 502, backendUnavailableBody(err, backendStatus));
   });
 
   req.pipe(upstream);
@@ -158,7 +192,7 @@ function proxyUpgrade(req, socket, head, backendBase, track) {
  * @returns {Promise<{url: string, port: number, close: () => Promise<void>}>}
  */
 function startAppServer(opts) {
-  const { distDir, backendBase, host, port } = opts;
+  const { distDir, backendBase, host, port, backendStatus } = opts;
   const indexTemplate = readIndexHtml(distDir);
   // opts.port may be 0 ("pick any free port"), so the bootstrap cannot be
   // built until the socket is actually bound - otherwise the injected API
@@ -176,7 +210,7 @@ function startAppServer(opts) {
       return sendJson(res, 400, { detail: 'bad request url' });
     }
 
-    if (isBackendPath(pathname)) return proxyHttp(req, res, backendBase);
+    if (isBackendPath(pathname)) return proxyHttp(req, res, backendBase, backendStatus);
 
     // Resolve inside distDir only - reject traversal.
     const rel = pathname.replace(/^\/+/, '');
@@ -247,4 +281,4 @@ function startAppServer(opts) {
   });
 }
 
-module.exports = { startAppServer, injectBootstrap, isBackendPath };
+module.exports = { startAppServer, injectBootstrap, isBackendPath, backendUnavailableBody };

@@ -35,9 +35,36 @@ let state = {
   backendChild: null,
   backendOk: false,
   backendReason: '',
+  /** starting | ready | failed | disabled. Surfaced to the UI through the
+   *  proxy 502 body so a compile during warm-up says "still starting"
+   *  instead of the misleading "not reachable". */
+  backendPhase: 'starting',
+  backendStartedAt: 0,
 };
 
-const log = (msg) => console.log('[' + new Date().toISOString() + '] ' + msg);
+/**
+ * Log to stdout AND to <userData>/desktop.log. A packaged GUI app has no
+ * visible stdout, so without the file there is nothing to inspect when the
+ * backend misbehaves on someone else's machine.
+ */
+let logFilePath = null;
+function writeLogLine(line) {
+  try {
+    if (!logFilePath) {
+      const dir = app.getPath('userData');
+      fs.mkdirSync(dir, { recursive: true });
+      logFilePath = path.join(dir, 'desktop.log');
+    }
+    fs.appendFileSync(logFilePath, line + '\n');
+  } catch {
+    /* logging must never break the app */
+  }
+}
+const log = (msg) => {
+  const line = '[' + new Date().toISOString() + '] ' + msg;
+  console.log(line);
+  writeLogLine(line);
+};
 
 /**
  * Packaged builds put resources under process.resourcesPath; a dev run uses
@@ -223,6 +250,11 @@ async function boot() {
     backendBase: 'http://' + HOST + ':' + backendPort,
     host: HOST,
     port: appPort,
+    backendStatus: () => ({
+      phase: state.backendPhase,
+      reason: state.backendReason,
+      elapsedMs: state.backendStartedAt ? Date.now() - state.backendStartedAt : 0,
+    }),
   });
   log('serving frontend at ' + state.appServer.url + ' (backend ' + HOST + ':' + backendPort + ')');
 
@@ -230,17 +262,29 @@ async function boot() {
 
   // 2. Backend, in the background (best effort).
   if (process.argv.includes('--no-backend')) {
+    state.backendPhase = 'disabled';
     state.backendReason = 'disabled with --no-backend';
     log('backend disabled with --no-backend');
   } else {
+    state.backendStartedAt = Date.now();
+    state.backendPhase = 'starting';
+    log('backend starting (about a minute on a first run)');
+
     startBackend({ repoRoot, port: backendPort, log })
       .then((result) => {
         state.backendOk = result.ok;
         state.backendChild = result.child;
         state.backendReason = result.reason || '';
-        log(result.ok ? 'backend ready' : 'backend unavailable: ' + state.backendReason);
+        state.backendPhase = result.ok ? 'ready' : 'failed';
+        log(
+          result.ok
+            ? 'backend ready after ' +
+                Math.round((Date.now() - state.backendStartedAt) / 1000) + 's'
+            : 'backend unavailable: ' + state.backendReason,
+        );
       })
       .catch((err) => {
+        state.backendPhase = 'failed';
         state.backendReason = String((err && err.message) || err);
         log('backend failed: ' + state.backendReason);
       });

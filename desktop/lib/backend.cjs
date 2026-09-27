@@ -89,6 +89,14 @@ async function startBackend(opts) {
 
   const extra = toolDirs(repoRoot);
   const env = Object.assign({}, process.env);
+
+  // Defer the backend's startup board-index refresh. It is a network
+  // round-trip that otherwise blocks the backend for 44s-150s before it can
+  // answer anything (measured), which looks like a broken install. The
+  // backend re-runs the same pass on demand, the first time a board needs a
+  // core that is not installed, so only the wait moves - nothing is lost.
+  // See backend/app/services/arduino_cli.py.
+  if (!env.VELXIO_SKIP_STARTUP_INDEX) env.VELXIO_SKIP_STARTUP_INDEX = '1';
   if (extra.length) {
     const joined = extra.join(path.delimiter);
     env.PATH = joined + path.delimiter + (env.PATH || '');

@@ -82,6 +82,18 @@ made, as required by AGPLv3 section 5(a).
             belong to the upstream author; this wrapper cannot grant a
             commercial licence for Velxio.
 
+2026-09-27  backend/app/services/arduino_cli.py
+            Added an OPT-IN guard, VELXIO_SKIP_STARTUP_INDEX, around the
+            board-index refresh that the CLI service performs on startup.
+            Unset (the default) the upstream behaviour is unchanged. The
+            desktop wrapper sets it to 1 because that refresh is a network
+            round-trip that runs BEFORE uvicorn binds, blocking the whole
+            backend for 44s-150s (measured) and making the app look broken.
+            The deferred pass is not lost: ensure_core_for_board() already
+            re-runs the same method on demand when a board needs a core
+            that is not installed, and an already-installed core
+            (arduino:avr) never triggers it.
+
 2026-09-27  .gitignore
             Added ignore rules for the desktop wrapper's build output
             (desktop/node_modules, desktop/release, desktop/build/icon.png).
