@@ -55,6 +55,43 @@ function toolDirs(repoRoot) {
   );
 }
 
+/**
+ * Environment for the backend process.
+ *
+ * Two things happen here and BOTH have bitten us:
+ *
+ *   1. The repo-local tool dirs are prepended to PATH so a portable
+ *      arduino-cli works with no system install.
+ *   2. VELXIO_SKIP_STARTUP_INDEX defers the backend's startup board-index
+ *      refresh, a network round-trip that otherwise blocks the backend for
+ *      44s-150s (measured) before it can answer anything.
+ *
+ * The PATH prepend must PRESERVE the existing value. process.env is
+ * case-insensitive on Windows while a plain copy is not, and the real key is
+ * normally `Path`: reading env.PATH returned undefined, and assigning that
+ * back to env.Path replaced the entire system PATH with just the tool dirs.
+ * arduino-cli then died with `exec: "cmd": executable file not found in
+ * %PATH%` because C:\Windows\System32 had vanished. Find the key
+ * case-insensitively and prepend to what is already there.
+ *
+ * Exported so desktop/test/wrapper-smoke.mjs can assert the preservation.
+ */
+function buildBackendEnv(repoRoot, baseEnv, log) {
+  const env = Object.assign({}, baseEnv);
+
+  if (!env.VELXIO_SKIP_STARTUP_INDEX) env.VELXIO_SKIP_STARTUP_INDEX = '1';
+
+  const extra = toolDirs(repoRoot);
+  if (extra.length) {
+    const joined = extra.join(path.delimiter);
+    const pathKey = Object.keys(env).find((k) => k.toLowerCase() === 'path') || 'Path';
+    env[pathKey] = joined + path.delimiter + (env[pathKey] || '');
+    if (log) log('prepended to PATH: ' + joined + ' (key ' + pathKey + ')');
+  }
+
+  return env;
+}
+
 function probeHealth(port, timeoutMs) {
   return new Promise((resolve) => {
     const req = http.get(
@@ -87,22 +124,7 @@ async function startBackend(opts) {
 
   log('starting backend: ' + python + ' -m uvicorn app.main:app --port ' + port);
 
-  const extra = toolDirs(repoRoot);
-  const env = Object.assign({}, process.env);
-
-  // Defer the backend's startup board-index refresh. It is a network
-  // round-trip that otherwise blocks the backend for 44s-150s before it can
-  // answer anything (measured), which looks like a broken install. The
-  // backend re-runs the same pass on demand, the first time a board needs a
-  // core that is not installed, so only the wait moves - nothing is lost.
-  // See backend/app/services/arduino_cli.py.
-  if (!env.VELXIO_SKIP_STARTUP_INDEX) env.VELXIO_SKIP_STARTUP_INDEX = '1';
-  if (extra.length) {
-    const joined = extra.join(path.delimiter);
-    env.PATH = joined + path.delimiter + (env.PATH || '');
-    env.Path = env.PATH; // Windows stores this one under a different casing
-    log('prepended to PATH: ' + joined);
-  }
+  const env = buildBackendEnv(repoRoot, process.env, log);
 
   let child;
   try {
@@ -159,4 +181,4 @@ function stopBackend(child) {
   } catch { /* best effort */ }
 }
 
-module.exports = { startBackend, stopBackend };
+module.exports = { startBackend, stopBackend, buildBackendEnv };

@@ -17,12 +17,15 @@
  */
 import http from 'node:http';
 import net from 'node:net';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { startAppServer } = require('../lib/server.cjs');
+const { buildBackendEnv } = require('../lib/backend.cjs');
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.resolve(HERE, '..', '..', 'frontend', 'dist');
@@ -240,6 +243,36 @@ async function main() {
     JSON.stringify(warmBody).slice(0, 200),
   );
   await warming.close();
+
+  // 9. Regression: the PATH prepend must PRESERVE what was already there.
+  //    The earlier version read env.PATH on Windows - undefined after a plain
+  //    copy, because the real key is `Path` - and then assigned that back to
+  //    env.Path, replacing the whole system PATH with just the tool dirs.
+  //    arduino-cli then died with
+  //    `exec: "cmd": executable file not found in %PATH%`.
+  const fakeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'velxio-env-'));
+  fs.mkdirSync(path.join(fakeRoot, '.tools', 'arduino-cli'), { recursive: true });
+  const pathKeyIn = 'Path' in process.env ? 'Path' : 'PATH';
+  const sentinel = 'C:\\Windows\\System32';
+  const built = buildBackendEnv(fakeRoot, { [pathKeyIn]: sentinel }, () => {});
+  const builtPath = built[pathKeyIn] || '';
+  check(
+    'PATH prepend keeps the original entries',
+    builtPath.startsWith(path.join(fakeRoot, '.tools', 'arduino-cli')) &&
+      builtPath.includes(sentinel),
+    JSON.stringify(builtPath),
+  );
+  check(
+    'PATH prepend creates no duplicate path key',
+    Object.keys(built).filter((k) => k.toLowerCase() === 'path').length === 1,
+    JSON.stringify(Object.keys(built).filter((k) => k.toLowerCase() === 'path')),
+  );
+  check(
+    'backend env still sets VELXIO_SKIP_STARTUP_INDEX',
+    built.VELXIO_SKIP_STARTUP_INDEX === '1',
+    JSON.stringify(built.VELXIO_SKIP_STARTUP_INDEX),
+  );
+  fs.rmSync(fakeRoot, { recursive: true, force: true });
 
   await server.close();
   console.log('\n' + (failures === 0 ? 'ALL CHECKS PASSED' : failures + ' CHECK(S) FAILED'));
