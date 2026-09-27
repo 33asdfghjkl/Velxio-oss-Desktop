@@ -97,8 +97,12 @@ immediately. Clear it first:
 $env:ELECTRON_RUN_AS_NODE=''; npx electron .
 ```
 
-**The backend is slow on first run.** See `VELXIO_BACKEND_TIMEOUT_MS`
-above. Pre-warm once with `arduino-cli core update-index`.
+**The backend is slow on first run.** It used to be: the startup board-index
+refresh blocked uvicorn for 44-150s, so every compile in that window failed
+with a misleading "backend is not reachable". `VELXIO_SKIP_STARTUP_INDEX`
+(set by the wrapper) defers that refresh, and the backend now answers in
+~6s. If you start the backend by hand, outside the wrapper, either set that
+variable or pre-warm once with `arduino-cli core update-index`.
 
 **The editor shows "Loading..." forever.** Monaco's runtime is not part of
 the repository: `frontend/public/monaco/` is produced by the frontend's
